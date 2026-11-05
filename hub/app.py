@@ -1204,7 +1204,7 @@ def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
                 if quota_error: raise RuntimeError(quota_error)
                 request=CellTranslateRequest(source_text=source_text,source_store='ES',source_locale=source_locale,target_store=store_code,target_locale=locale,field_key=edit['key'],metafield_type=edit.get('metafield_type'),html=field['key']=='descriptionHtml' or edit.get('metafield_type')=='html')
                 translated=translate_cell(request,user)
-                proposed=translated['translation']; error=None
+                proposed=enforce_choices(store_code,field['key'],edit.get('metafield_type'),source_text,translated['translation'],locale); error=None
                 quality=assess_translation(source_text,proposed,is_html=request.html)
                 # Every non-empty translation is approved: the integrity score is only recorded on the item.
                 state='APPROVED' if (proposed or '').strip() else 'PENDING_REVIEW'
@@ -1297,6 +1297,44 @@ def shopify_stores_by_code(code):
     if not store: raise HTTPException(404,f'La tienda {code} no tiene dominio y token configurados')
     return store
 
+_DEFINITIONS_CACHE={}
+def metafield_definitions(store_code):
+    """Definiciones de metacampos (tipo y opciones permitidas) de una tienda, en caché 5 minutos."""
+    cached=_DEFINITIONS_CACHE.get(store_code)
+    if cached and time.time()-cached[0]<300: return cached[1]
+    store=shopify_stores_by_code(store_code); definitions={}
+    for owner in ('PRODUCT','PRODUCTVARIANT'):
+        try:
+            for d in shopify_graphql(store['domain'],store['token'],TARGET_DEFINITIONS_QUERY,{'ownerType':owner}).get('metafieldDefinitions',{}).get('nodes',[]):
+                choices=next((json.loads(v['value']) for v in d.get('validations') or [] if v.get('name')=='choices'),None)
+                definitions[(owner,d['namespace'],d['key'])]={'type':(d.get('type') or {}).get('name'),'choices':choices}
+        except (HTTPException,ValueError) as exc:
+            raise HTTPException(502,f'No se pudieron leer las definiciones de metacampos de {store_code}: {getattr(exc,"detail",exc)}')
+    _DEFINITIONS_CACHE[store_code]=(time.time(),definitions)
+    return definitions
+
+def enforce_choices(store_code,field_key,kind,source_text,proposed,locale):
+    """Si el metacampo de la tienda tiene una lista cerrada de opciones, devuelve valores válidos o lanza error claro."""
+    if not field_key.startswith('metafield.'): return proposed
+    parts=field_key.split('.')
+    definition=metafield_definitions(store_code).get(('PRODUCT' if parts[1]=='product' else 'PRODUCTVARIANT',parts[-2],parts[-1]))
+    choices=definition['choices'] if definition else None
+    if not choices: return proposed
+    from .worker import choose_option
+    def resolve(source,candidate):
+        if source in choices: return source
+        if candidate in choices: return candidate
+        return choose_option(source,choices,locale)
+    fail=lambda: RuntimeError(f'El valor no coincide con las opciones de {store_code}: {", ".join(choices)}'[:480])
+    if (kind or '').startswith('list.'):
+        sources=json.loads(source_text); candidates=json.loads(proposed)
+        picked=[resolve(src,candidates[i] if i<len(candidates) else '') for i,src in enumerate(sources)]
+        if None in picked: raise fail()
+        return json.dumps(picked,ensure_ascii=False)
+    picked=resolve(source_text,proposed)
+    if picked is None: raise fail()
+    return picked
+
 def build_product_creation(store_code,source_gid,locale,source_locale,allowed_skus):
     """Prepara (sin escribir nada) la creación del producto de ES en otra tienda, traducida a su idioma principal."""
     source_store=shopify_stores_by_code('ES')
@@ -1320,15 +1358,7 @@ def build_product_creation(store_code,source_gid,locale,source_locale,allowed_sk
         if cache_key not in cache:
             cache[cache_key]=translate_cell(CellTranslateRequest(source_text=text,source_locale=source_locale,target_store=store_code,target_locale=locale,field_key=key,metafield_type=mf_type,html=html),'local')['translation']
         return cache[cache_key]
-    target_store=shopify_stores_by_code(store_code)
-    definitions={}
-    for owner in ('PRODUCT','PRODUCTVARIANT'):
-        try:
-            for d in shopify_graphql(target_store['domain'],target_store['token'],TARGET_DEFINITIONS_QUERY,{'ownerType':owner}).get('metafieldDefinitions',{}).get('nodes',[]):
-                choices=next((json.loads(v['value']) for v in d.get('validations') or [] if v.get('name')=='choices'),None)
-                definitions[(owner,d['namespace'],d['key'])]={'type':(d.get('type') or {}).get('name'),'choices':choices}
-        except (HTTPException,ValueError) as exc:
-            raise HTTPException(502,f'No se pudieron leer las definiciones de metacampos de {store_code}: {getattr(exc,"detail",exc)}')
+    definitions=metafield_definitions(store_code)
     def convert_metafields(nodes,owner='PRODUCT'):
         out=[]
         for mf in nodes:
@@ -1345,7 +1375,9 @@ def build_product_creation(store_code,source_gid,locale,source_locale,allowed_sk
                     def pick(text):
                         if text in choices: return text
                         candidate=tr(text,'metafield.'+ident)
-                        return candidate if candidate in choices else None
+                        if candidate in choices: return candidate
+                        from .worker import choose_option
+                        return choose_option(text,choices,locale)
                     if kind.startswith('list.'):
                         picked=[pick(t) for t in json.loads(value)]
                         if None in picked: warnings.append(f'Metacampo {ident}: algún valor no coincide con las opciones de {store_code} y se omitió')
