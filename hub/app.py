@@ -1285,6 +1285,7 @@ def reopen_translation_batch_items(batch_id:int,x:TranslationBatchItemIds,user=D
 CREATE_ITEM_KEY='__create_product__'
 CREATE_TRANSLATE_TYPES={'single_line_text_field','multi_line_text_field','rich_text_field','list.single_line_text_field','list.multi_line_text_field'}
 CREATE_COPY_TYPES={'number_integer','number_decimal','boolean','date','date_time','dimension','weight','volume','rating','color','url','json','money','link'}
+TARGET_DEFINITIONS_QUERY='query TargetDefinitions($ownerType: MetafieldOwnerType!) { metafieldDefinitions(ownerType: $ownerType, first: 250) { nodes { namespace key type { name } validations { name value } } pageInfo { hasNextPage } } }'
 SOURCE_COMMERCIAL_QUERY='query SourceCommercial($id: ID!, $after: String) { product(id: $id) { options { name position values } variants(first: 100, after: $after) { nodes { id sku price compareAtPrice } pageInfo { hasNextPage endCursor } } } }'
 CREATE_PRODUCT_MUTATION='mutation CreateArchivedProduct($product: ProductCreateInput!, $media: [CreateMediaInput!]) { productCreate(product: $product, media: $media) { product { id status variants(first: 1) { nodes { id } } } userErrors { field message } } }'
 CREATE_VARIANTS_MUTATION='mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy) { productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) { productVariants { id } userErrors { field message } } }'
@@ -1311,23 +1312,54 @@ def build_product_creation(store_code,source_gid,locale,source_locale,allowed_sk
         if not page.get('hasNextPage') or not page.get('endCursor'): break
         after=page['endCursor']
     warnings=[]; cache={}
+    same_language=locale.split('-')[0].lower()==source_locale.split('-')[0].lower()
     def tr(text,key,html=False,mf_type=None):
-        if not (text or '').strip(): return text or ''
+        # Si el idioma principal de la tienda es el de ES (p. ej. UK en español), se copia tal cual.
+        if same_language or not (text or '').strip(): return text or ''
         cache_key=(text,key,html,mf_type)
         if cache_key not in cache:
             cache[cache_key]=translate_cell(CellTranslateRequest(source_text=text,source_locale=source_locale,target_store=store_code,target_locale=locale,field_key=key,metafield_type=mf_type,html=html),'local')['translation']
         return cache[cache_key]
-    def convert_metafields(nodes):
+    target_store=shopify_stores_by_code(store_code)
+    definitions={}
+    for owner in ('PRODUCT','PRODUCTVARIANT'):
+        try:
+            for d in shopify_graphql(target_store['domain'],target_store['token'],TARGET_DEFINITIONS_QUERY,{'ownerType':owner}).get('metafieldDefinitions',{}).get('nodes',[]):
+                choices=next((json.loads(v['value']) for v in d.get('validations') or [] if v.get('name')=='choices'),None)
+                definitions[(owner,d['namespace'],d['key'])]={'type':(d.get('type') or {}).get('name'),'choices':choices}
+        except (HTTPException,ValueError) as exc:
+            raise HTTPException(502,f'No se pudieron leer las definiciones de metacampos de {store_code}: {getattr(exc,"detail",exc)}')
+    def convert_metafields(nodes,owner='PRODUCT'):
         out=[]
         for mf in nodes:
             ns,key,kind,value=mf.get('namespace') or '',mf.get('key') or '',mf.get('type') or '',mf.get('value')
             ident=f'{ns}.{key}'
             if not value or 'yotpo' in ident.casefold() or ns.startswith(('shopify--','reviews')): continue
+            definition=definitions.get((owner,ns,key))
+            if definition and definition['type']!=kind:
+                warnings.append(f'Metacampo {ident} no copiado: en {store_code} está definido como {definition["type"]} y en ES como {kind}'); continue
+            choices=definition['choices'] if definition else None
             try:
-                if kind in CREATE_TRANSLATE_TYPES: value=tr(value,'metafield.'+ident,mf_type=kind)
+                if choices:
+                    # Valores permitidos por la definición de la tienda: se usa el de ES si es válido; si no, su traducción.
+                    def pick(text):
+                        if text in choices: return text
+                        candidate=tr(text,'metafield.'+ident)
+                        return candidate if candidate in choices else None
+                    if kind.startswith('list.'):
+                        picked=[pick(t) for t in json.loads(value)]
+                        if None in picked: warnings.append(f'Metacampo {ident}: algún valor no coincide con las opciones de {store_code} y se omitió')
+                        picked=[t for t in picked if t is not None]
+                        if not picked: continue
+                        value=json.dumps(picked,ensure_ascii=False)
+                    else:
+                        value=pick(value)
+                        if value is None:
+                            warnings.append(f'Metacampo {ident} no copiado: el valor de ES no coincide con las opciones de {store_code}'); continue
+                elif kind in CREATE_TRANSLATE_TYPES: value=tr(value,'metafield.'+ident,mf_type=kind)
                 elif kind not in CREATE_COPY_TYPES:
                     warnings.append(f'Metacampo {ident} no copiado (tipo {kind or "desconocido"}: referencias o archivos son propios de cada tienda)'); continue
-            except (HTTPException,RuntimeError) as exc:
+            except (HTTPException,RuntimeError,ValueError) as exc:
                 warnings.append(f'Metacampo {ident} no copiado: {str(exc.detail if isinstance(exc,HTTPException) else exc)[:150]}'); continue
             out.append({'namespace':ns,'key':key,'type':kind,'value':value})
         return out
@@ -1349,7 +1381,7 @@ def build_product_creation(store_code,source_gid,locale,source_locale,allowed_sk
     variants=[]
     for v in chosen:
         price=commercial.get(v['id'],{})
-        item={'price':price.get('price'),'compareAtPrice':price.get('compareAtPrice'),'barcode':v.get('barcode') or None,'inventoryItem':{'sku':v.get('sku')} if v.get('sku') else None,'metafields':convert_metafields(v.get('metafields',{}).get('nodes',[])) or None}
+        item={'price':price.get('price'),'compareAtPrice':price.get('compareAtPrice'),'barcode':v.get('barcode') or None,'inventoryItem':{'sku':v.get('sku')} if v.get('sku') else None,'metafields':convert_metafields(v.get('metafields',{}).get('nodes',[]),'PRODUCTVARIANT') or None}
         if not default_variant: item['optionValues']=[{'optionName':tr(sel['name'],'option_name'),'name':tr(sel['value'],'option_value')} for sel in v.get('selectedOptions',[])]
         variants.append({k:val for k,val in item.items() if val is not None})
     media=[{'originalSource':i['url'],'alt':tr(i.get('altText') or '','image_alt'),'mediaContentType':'IMAGE'} for i in source.get('images',{}).get('nodes',[]) if i.get('url')]
