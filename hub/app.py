@@ -156,10 +156,40 @@ def shopify_graphql(domain, token, query, variables=None):
 
 PRODUCT_SELECTION='''id title descriptionHtml handle vendor productType status tags createdAt updatedAt seo { title description } featuredMedia { preview { image { url altText } } } images(first:50) { nodes { id url altText } } variants(first:100) { nodes { id title sku barcode position selectedOptions { name value } } pageInfo { hasNextPage endCursor } } metafields(first:100) { nodes { id namespace key type value compareDigest description } pageInfo { hasNextPage endCursor } }'''
 
+_TOKEN_CACHE={}
+_TOKEN_LOCK=threading.Lock()
+
+def env_credentials(config):
+    """(client_id, secret) de una tienda con `credentials_env` en su configuración, o None."""
+    prefix=(config or {}).get('credentials_env')
+    if not prefix: return None
+    client_id=os.getenv(f'{prefix}_CLIENT_ID','').strip(); secret=os.getenv(f'{prefix}_CLIENT_SECRET','').strip()
+    return (client_id,secret) if client_id and secret else None
+
+def store_token(domain,config):
+    """Token de Admin API de una tienda. Si tiene `credentials_env`, se pide con client credentials y se
+    renueva solo antes de caducar (duran 24 h); si no hay credenciales o falla, se usa `admin_token`."""
+    static=(config or {}).get('admin_token') or ''
+    credentials=env_credentials(config)
+    if not credentials or not domain: return static
+    with _TOKEN_LOCK:
+        cached=_TOKEN_CACHE.get(domain)
+        if cached and cached[1]>time.time(): return cached[0]
+        try:
+            request=urllib.request.Request(f'https://{domain}/admin/oauth/access_token',data=json.dumps({'client_id':credentials[0],'client_secret':credentials[1],'grant_type':'client_credentials'}).encode(),headers={'Content-Type':'application/json'},method='POST')
+            with urllib.request.urlopen(request,timeout=20) as response: data=json.loads(response.read())
+            token=data['access_token']
+            # Se renueva 10 minutos antes de que caduque.
+            _TOKEN_CACHE[domain]=(token,time.time()+max(int(data.get('expires_in',86400))-600,60))
+            return token
+        except Exception as exc:
+            logging.getLogger('hub.shopify').warning('No se pudo renovar el token de %s: %s',domain,type(exc).__name__)
+            return static
+
 def shopify_stores():
     with pool.connection() as c:
-        rows=c.execute("SELECT s.code,s.domain,s.config->>'admin_token',COALESCE(array_agg(l.locale) FILTER (WHERE l.locale IS NOT NULL),'{}') FROM stores s LEFT JOIN store_locales l ON l.store_code=s.code WHERE s.active GROUP BY s.code ORDER BY s.code").fetchall()
-    return [{'code':r[0],'domain':r[1],'token':r[2] or '', 'locales':r[3]} for r in rows]
+        rows=c.execute("SELECT s.code,s.domain,s.config,COALESCE(array_agg(l.locale) FILTER (WHERE l.locale IS NOT NULL),'{}') FROM stores s LEFT JOIN store_locales l ON l.store_code=s.code WHERE s.active GROUP BY s.code ORDER BY s.code").fetchall()
+    return [{'code':r[0],'domain':r[1],'token':store_token(r[1],r[2]) or '', 'locales':r[3]} for r in rows]
 
 def shopify_search(store, term, limit=12):
     if not store['domain'] or not store['token']: return []
@@ -457,8 +487,8 @@ def reopen_glossary_candidate(candidate_id:int,x:CandidateDecision|None=None,use
 @app.get('/api/stores')
 def list_stores():
     with pool.connection() as c:
-        rows=c.execute("SELECT s.code,s.domain,s.active,COALESCE(s.config->>'admin_token','')<>'',COALESCE(array_agg(l.locale) FILTER (WHERE l.locale IS NOT NULL),'{}') FROM stores s LEFT JOIN store_locales l ON l.store_code=s.code GROUP BY s.code ORDER BY s.code").fetchall()
-    return [{'code':r[0],'domain':r[1] or '', 'active':r[2], 'has_token':r[3], 'locales':r[4]} for r in rows]
+        rows=c.execute("SELECT s.code,s.domain,s.active,s.config,COALESCE(array_agg(l.locale) FILTER (WHERE l.locale IS NOT NULL),'{}') FROM stores s LEFT JOIN store_locales l ON l.store_code=s.code GROUP BY s.code ORDER BY s.code").fetchall()
+    return [{'code':r[0],'domain':r[1] or '', 'active':r[2], 'has_token':bool((r[3] or {}).get('admin_token')) or env_credentials(r[3]) is not None, 'locales':r[4]} for r in rows]
 
 @app.get('/api/translation-profiles')
 def list_translation_profiles():
@@ -1518,14 +1548,17 @@ def save_store(x:StoreConfig):
     domain=x.domain.lower().removeprefix('https://').removeprefix('http://').strip('/')
     if not domain.endswith('.myshopify.com'): raise HTTPException(400,'Usa el dominio *.myshopify.com')
     with pool.connection() as c:
-        prior=c.execute("SELECT COALESCE(config->>'admin_token','') FROM stores WHERE code=%s",(x.code,)).fetchone()
-        token=x.token or (prior[0] if prior else '')
+        prior=c.execute("SELECT config FROM stores WHERE code=%s",(x.code,)).fetchone()
+        prior_config=(prior[0] if prior else None) or {}
+        token=x.token or prior_config.get('admin_token') or ''
         config={'admin_token':token} if token else {}
+        # Las credenciales por entorno (renovación automática del token) se conservan al guardar la tienda.
+        if prior_config.get('credentials_env'): config['credentials_env']=prior_config['credentials_env']
         c.execute('INSERT INTO stores(code,domain,config,active) VALUES(%s,%s,%s,true) ON CONFLICT(code) DO UPDATE SET domain=EXCLUDED.domain,config=EXCLUDED.config,active=true',(x.code,domain,Jsonb(config)))
         c.execute('DELETE FROM store_locales WHERE store_code=%s',(x.code,))
         for locale in dict.fromkeys(x.locales):
             c.execute("INSERT INTO store_locales(store_code,locale,strategy) VALUES(%s,%s,'BASE')",(x.code,locale))
-    return {'code':x.code,'domain':domain,'active':True,'has_token':bool(token),'locales':list(dict.fromkeys(x.locales))}
+    return {'code':x.code,'domain':domain,'active':True,'has_token':bool(token) or env_credentials(config) is not None,'locales':list(dict.fromkeys(x.locales))}
 
 @app.post('/api/products/import')
 def import_product(x:ImportProduct,user=Depends(operator)):
