@@ -134,6 +134,18 @@ class StoreConfig(BaseModel):
     domain:str=Field(min_length=3,max_length=255)
     token:str=Field(default='',max_length=500)
     locales:list[str]=Field(default_factory=list)
+class ShopifyGraphQLRequest(BaseModel):
+    store:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
+    query:str=Field(min_length=1,max_length=100000)
+    variables:dict=Field(default_factory=dict)
+    operation_name:str|None=Field(default=None,max_length=255)
+
+    @field_validator('variables')
+    @classmethod
+    def check_variables_size(cls,value):
+        if len(json.dumps(value,ensure_ascii=False).encode('utf-8'))>1_000_000:
+            raise ValueError('Las variables GraphQL superan el límite de 1 MB')
+        return value
 
 # Shared presentation assets are bundled by Docker's COPY hub ./hub.
 from pathlib import Path
@@ -142,15 +154,28 @@ STYLE = '<style>' + Path(__file__).with_name('ui.css').read_text(encoding='utf-8
 
 SHOPIFY_API_VERSION=os.getenv('SHOPIFY_API_VERSION','2026-07')
 
-def shopify_graphql(domain, token, query, variables=None):
+def shopify_graphql_payload(domain, token, query, variables=None, operation_name=None):
     url=f'https://{domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json'
-    req=urllib.request.Request(url,data=json.dumps({'query':query,'variables':variables or {}}).encode(),headers={'X-Shopify-Access-Token':token,'Content-Type':'application/json'},method='POST')
+    body={'query':query,'variables':variables or {}}
+    if operation_name: body['operationName']=operation_name
+    req=urllib.request.Request(url,data=json.dumps(body).encode(),headers={'X-Shopify-Access-Token':token,'Content-Type':'application/json'},method='POST')
     try:
         with urllib.request.urlopen(req,timeout=25) as response: data=json.loads(response.read())
     except urllib.error.HTTPError as exc:
-        if exc.code in (401,403): raise HTTPException(502,'Shopify rechazó el token de una tienda')
-        raise HTTPException(502,f'Error HTTP {exc.code} al consultar Shopify')
+        try:
+            payload=json.loads(exc.read())
+            detail=payload.get('errors') or payload.get('error') or payload.get('message') or f'HTTP {exc.code}'
+        except Exception:
+            detail=f'HTTP {exc.code}'
+        if isinstance(detail,(dict,list)): detail=json.dumps(detail,ensure_ascii=False)
+        prefix='Shopify rechazó el token o los permisos de la tienda' if exc.code in (401,403) else f'Error HTTP {exc.code} al consultar Shopify'
+        raise HTTPException(502,(prefix+': '+str(detail))[:700])
     except (urllib.error.URLError,TimeoutError): raise HTTPException(502,'No se pudo conectar con Shopify')
+    if not isinstance(data,dict): raise HTTPException(502,'Shopify devolvió una respuesta GraphQL no válida')
+    return data
+
+def shopify_graphql(domain, token, query, variables=None):
+    data=shopify_graphql_payload(domain,token,query,variables)
     if data.get('errors'): raise HTTPException(502,'Shopify GraphQL: '+str(data['errors'][0].get('message','error'))[:250])
     return data.get('data',{})
 
@@ -190,6 +215,12 @@ def shopify_stores():
     with pool.connection() as c:
         rows=c.execute("SELECT s.code,s.domain,s.config,COALESCE(array_agg(l.locale) FILTER (WHERE l.locale IS NOT NULL),'{}') FROM stores s LEFT JOIN store_locales l ON l.store_code=s.code WHERE s.active GROUP BY s.code ORDER BY s.code").fetchall()
     return [{'code':r[0],'domain':r[1],'token':store_token(r[1],r[2]) or '', 'locales':r[3]} for r in rows]
+
+def shopify_store_by_code(code):
+    with pool.connection() as c:
+        row=c.execute("SELECT s.code,s.domain,s.config,COALESCE(array_agg(l.locale) FILTER (WHERE l.locale IS NOT NULL),'{}') FROM stores s LEFT JOIN store_locales l ON l.store_code=s.code WHERE s.code=%s AND s.active GROUP BY s.code",(code,)).fetchone()
+    if not row: return None
+    return {'code':row[0],'domain':row[1],'token':store_token(row[1],row[2]) or '', 'locales':row[3]}
 
 def shopify_search(store, term, limit=12):
     if not store['domain'] or not store['token']: return []
@@ -689,6 +720,30 @@ def search_shopify_products(q:str):
     result.sort(key=lambda p:(p['store']!='ES',p['store'],p['sku'],p['candidates'][0]['title']))
     return {'products':result,'notices':notices}
 
+@app.get('/api/shopify/products/by-sku')
+def get_shopify_product_by_sku(store:str,sku:str):
+    store_code=store.strip().upper(); exact_sku=sku.strip()
+    selected=shopify_store_by_code(store_code)
+    if not selected or not selected['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales Shopify: '+store_code)
+    if not exact_sku: raise HTTPException(400,'Indica un SKU')
+    hits=shopify_search(selected,exact_sku,50)
+    matches={p['id']:p for p in hits if any((v.get('sku') or '').strip().casefold()==exact_sku.casefold() for v in (p.get('variants') or {}).get('nodes',[]))}
+    if not matches: raise HTTPException(404,f'No se encontró el SKU exacto {exact_sku} en {store_code}')
+    if len(matches)>1: raise HTTPException(409,f'El SKU {exact_sku} coincide con varios productos en {store_code}')
+    product=shopify_product(selected,next(iter(matches)),selected['locales'])
+    return {'store':store_code,'sku':exact_sku,'product':product}
+
+@app.post('/api/shopify/graphql')
+def execute_shopify_admin_graphql(x:ShopifyGraphQLRequest):
+    store=shopify_store_by_code(x.store.strip().upper())
+    if not store: raise HTTPException(404,'Tienda inactiva o no configurada: '+x.store)
+    if not store['domain'] or not store['token']: raise HTTPException(503,'La tienda no tiene credenciales Shopify disponibles: '+x.store)
+    payload=shopify_graphql_payload(store['domain'],store['token'],x.query,x.variables,x.operation_name)
+    # Preserve GraphQL-level errors and partial data. Shopify returns many field and
+    # mutation errors in HTTP 200 responses, so callers need the whole envelope.
+    return {'store':store['code'],'api_version':SHOPIFY_API_VERSION,'data':payload.get('data'),
+            'errors':payload.get('errors',[]),'extensions':payload.get('extensions',{})}
+
 @app.get('/api/shopify/products/compare')
 def compare_shopify_product(source_id:str,target_store:str|None=None,target_locale:str|None=None):
     return _compare_shopify_product(source_id,target_store,target_locale)
@@ -1003,6 +1058,36 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
     translated=strip_added_quotes(x.source_text,translated,x.html)
     for marker,target_term in tokens.items(): translated=translated.replace(marker,target_term)
     return {'translation':translated,'memory_hit':False,'glossary_terms':len(tokens),'require_review':profile['require_review']}
+
+@app.get('/api/translation-context')
+def translation_context(store:str,locale:str,source_store:str='ES',source_locale:str|None=None):
+    """Context for an agent doing its own translation: published locale, profile, and matching glossary."""
+    target_code=store.strip().upper(); source_code=source_store.strip().upper()
+    target=shopify_store_by_code(target_code)
+    if not target or not target['token']: raise HTTPException(404,'Tienda destino inactiva o sin credenciales: '+target_code)
+    source=shopify_store_by_code(source_code)
+    if not source or not source['token']: raise HTTPException(404,'Tienda origen inactiva o sin credenciales: '+source_code)
+    source_locales=shopify_shop_locales(source)
+    resolved_source_locale=source_locale or next((item['locale'] for item in source_locales if item.get('primary')),'es-ES')
+    target_locales=shopify_shop_locales(target)
+    locale_info=next((item for item in target_locales if item.get('locale','').casefold()==locale.casefold()),None)
+    profile=target_profile(target_code,locale)
+    with pool.connection() as c:
+        rows=c.execute("""SELECT DISTINCT ON (lower(source_term)) source_term,target_term,
+                (((source_store=%s AND target_store=%s)::int * 2)
+                  + (lower(source_locale)=lower(%s))::int
+                  + (lower(target_locale)=lower(%s))::int) AS specificity
+              FROM translation_glossary
+              WHERE enabled
+                AND ((source_store=%s AND target_store=%s) OR (source_store IS NULL AND target_store IS NULL))
+                AND split_part(lower(source_locale),'-',1)=split_part(lower(%s),'-',1)
+                AND split_part(lower(target_locale),'-',1)=split_part(lower(%s),'-',1)
+              ORDER BY lower(source_term),specificity DESC,updated_at DESC""",
+            (source_code,target_code,resolved_source_locale,locale,source_code,target_code,resolved_source_locale,locale)).fetchall()
+    terms=[{'source_term':row[0],'target_term':row[1]} for row in sorted(rows,key=lambda row:len(row[0]),reverse=True)]
+    return {'source_store':source_code,'source_locale':resolved_source_locale,'target_store':target_code,
+            'target_locale':locale,'locale':locale_info,'profile':({k:profile[k] for k in ('role','formality','require_review')} if profile else None),
+            'glossary_terms':terms}
 
 @app.get('/api/glossary')
 def list_glossary(target_locale:str|None=None,store:str|None=None,q:str|None=None,user=Depends(operator)):
