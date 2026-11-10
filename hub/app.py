@@ -2000,7 +2000,7 @@ def stock_apply_variant(store, variant, track, quantity, location_id=None):
         level=next((l for l in variant['levels'] if l['location_id']==location_id),None) if location_id else None
         level=level or (variant['levels'][0] if variant['levels'] else None)
         if not level: raise HTTPException(409,'El SKU no tiene ubicación de inventario en esta tienda')
-        stock_mutation(store,'mutation($input:InventorySetQuantitiesInput!) { inventorySetQuantities(input:$input) { inventoryAdjustmentGroup { id } userErrors { field message } } }',{'input':{'name':'available','reason':'correction','quantities':[{'inventoryItemId':item_id,'locationId':level['location_id'],'quantity':quantity}]}},'inventorySetQuantities')
+        stock_mutation(store,'mutation($input:InventorySetQuantitiesInput!) { inventorySetQuantities(input:$input) { inventoryAdjustmentGroup { id } userErrors { field message } } }',{'input':{'name':'available','reason':'correction','quantities':[{'inventoryItemId':item_id,'locationId':level['location_id'],'quantity':quantity,'changeFromQuantity':None}]}},'inventorySetQuantities')
 
 def stock_apply_store(store, sku, track, quantity, locations=None, item_ids=None):
     """Aplica seguimiento/cantidad a las variantes con ese SKU (todas, o solo `item_ids`).
