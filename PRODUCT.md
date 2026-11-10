@@ -10,7 +10,7 @@ Newgarden staff managing Shopify catalog content and translations across stores 
 
 ## Product Purpose
 
-Find and compare products, prepare translations, review individual fields, and manage stores and preferred terminology. Preserve existing backend behavior and explicit approval before saving translations.
+Find and compare products, prepare translations, review individual fields, and manage stores and preferred terminology. Preserve existing backend behavior and the optional field-level review flow (prior approval before saving translations is no longer mandatory).
 
 ## Brand Personality
 

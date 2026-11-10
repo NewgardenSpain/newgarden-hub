@@ -1,6 +1,6 @@
 # Newgarden Content Hub (piloto aislado)
 
-Servicio separado del Compose existente del directorio padre. Cola persistente secuencial, aprobación campo a campo y publicación exclusivamente simulada. El worker por lotes requiere DeepL API (`TRANSLATION_PROVIDER=deepl`); no genera traducciones de muestra. La clave DeepL se configura en el `.env` local y solo se entrega al worker; no se incluye en el repositorio ni en el código del navegador.
+Servicio separado del Compose existente del directorio padre. Cola persistente secuencial, aprobación campo a campo opcional y publicación directa a Shopify (`auto_apply`, o desde el editor y el MCP) sin aprobación previa obligatoria. El worker por lotes requiere DeepL API (`TRANSLATION_PROVIDER=deepl`); no genera traducciones de muestra. La clave DeepL se configura en el `.env` local y solo se entrega al worker; no se incluye en el repositorio ni en el código del navegador.
 
 ## Descubrimiento realizado
 
@@ -24,7 +24,7 @@ curl -fsS http://127.0.0.1:8787/health
 
 La app es de uso interno y no requiere login. La interfaz está en `/`, el explorador Shopify en `/products` y la configuración de tiendas en `/stores`; Swagger está en `/docs`. En cada tienda, `Consultar locales Shopify` muestra los códigos exactos habilitados, si son principales y si están publicados. El token necesita el scope `read_locales` para esa consulta; se pueden cargar todos los locales publicados y seleccionar los que se van a usar. Cada tienda conserva sus propios códigos, sin conversiones inferidas por país. El explorador busca por SKU, texto/nombre o GID en todas las tiendas activas, lee producto, variantes, imágenes, SEO y metacampos, y compara las traducciones registradas para locales adicionales con los campos actuales de los productos equivalentes en otras tiendas. Lee todas las páginas de metacampos de producto y variante del producto español, ignorando los de Yotpo; las variantes destino se emparejan por SKU (o título si no tienen SKU). Para cada metacampo de origen muestra `Falta el metacampo` si no existe en destino y `Metacampo vacío` si existe sin contenido. Editar el locale principal de una tienda actualiza solo el contenido base del producto o metacampo elegido; editar cualquier locale secundario registra una traducción Shopify, sin cambiar sus equivalentes. El editor de descripción conserva el HTML. La comparación requiere permisos Admin GraphQL de lectura de productos, `read_translations` y `read_locales`; las traducciones requieren `write_translations` y las actualizaciones del contenido base requieren `write_products`. La versión API se controla con `SHOPIFY_API_VERSION` (por defecto `2026-07`). Por defecto, Compose enlaza el servicio a `127.0.0.1`. Para acceso desde la LAN, configura `HUB_BIND` con la IP local del servidor y limita el acceso con el firewall de la red. No expongas el puerto a Internet. `.env` queda excluido de Git. La base de datos y worker no publican puertos; el worker mantiene concurrencia uno con un advisory lock PostgreSQL y no reanuda trabajos al arrancar.
 
-## MCP stdio para Codex
+## MCP stdio para Codex y Claude Code
 
 `scripts/content_hub_mcp.py` publica herramientas MCP sobre stdio y llama a la API indicada por `CONTENT_HUB_URL` (por defecto `http://127.0.0.1:8787`); no necesita dependencias Python adicionales. El proceso MCP corre en el host, por lo que puede usar el puerto Docker publicado. Regístralo en Codex desde este checkout:
 
@@ -35,7 +35,15 @@ codex mcp add newgarden-content-hub \\
 codex mcp list
 ```
 
-Herramientas disponibles: `list_stores`, `list_shop_locales`, `get_product_by_sku`, `get_translation_context`, `search_products`, `search_shop_products`, `search_orders`, `get_inventory_levels`, `shopify_admin_graphql`, comparar productos, consultar lotes y guardar ediciones en Shopify. En una solicitud de traducción, el modelo del agente lee el producto con `get_product_by_sku`, consulta términos y locale con `get_translation_context`, traduce con su propio modelo y escribe con `edit_translation` o `shopify_admin_graphql`. No se expone al MCP el flujo de traducción del servidor (`translate_product`/`translate_catalog`), que depende de `TRANSLATION_PROVIDER`. `shopify_admin_graphql` ejecuta queries y mutations Admin con variables y nombre de operación opcional; devuelve `data`, `errors` y `extensions`, incluidos los `userErrors` de mutations. La API usa `SHOPIFY_API_VERSION` y los scopes existentes de cada instalación. El backend resuelve el token solo para la tienda solicitada y nunca lo devuelve al proceso MCP. El MCP no añade confirmaciones: las herramientas de escritura actúan según la operación solicitada y Shopify aplica los permisos concedidos a esa app. Si el puerto o servicio no está activo, devuelve el error de conexión. Cambia `192.168.1.202` por la IP del host si el despliegue publica el servicio en otra dirección; para un binding localhost basta usar `127.0.0.1`.
+En Claude Code:
+
+```sh
+claude mcp add newgarden-content-hub \\
+  --env CONTENT_HUB_URL=http://192.168.1.202:8787 \\
+  -- python3 /srv/services/newgarden-content-hub/scripts/content_hub_mcp.py
+```
+
+Herramientas disponibles: `list_stores`, `list_shop_locales`, `get_product_by_sku`, `get_translation_context`, `search_products`, `search_shop_products`, `search_orders`, `get_inventory_levels`, `shopify_admin_graphql`, comparar productos, consultar lotes y guardar ediciones en Shopify. En una solicitud de traducción, el modelo del agente lee el producto con `get_product_by_sku`, consulta términos y locale con `get_translation_context`, traduce con su propio modelo y escribe con `edit_translation` o `shopify_admin_graphql`. No se expone al MCP el flujo de traducción del servidor (`translate_product`/`translate_catalog`), que depende de `TRANSLATION_PROVIDER`. `shopify_admin_graphql` ejecuta queries y mutations Admin con variables y nombre de operación opcional; devuelve `data`, `errors` y `extensions`, incluidos los `userErrors` de mutations. La API usa `SHOPIFY_API_VERSION` y los scopes existentes de cada instalación. El backend resuelve el token solo para la tienda solicitada y nunca lo devuelve al proceso MCP. Por decisión de gerencia no se exige aprobación humana previa a las escrituras, y el MCP no añade confirmaciones: las herramientas de escritura actúan según la operación solicitada y Shopify aplica los permisos concedidos a esa app. Si el puerto o servicio no está activo, devuelve el error de conexión. Cambia `192.168.1.202` por la IP del host si el despliegue publica el servicio en otra dirección; para un binding localhost basta usar `127.0.0.1`.
 
 Las migraciones SQL se registran y aplican una sola vez al iniciar la app o el worker. La migración `002` elimina las tiendas independientes NL/PT, sus correspondencias y reglas; cancela los trabajos aún en cola y conserva el historial ya generado y los locales NL/PT de ES.
 
@@ -57,7 +65,7 @@ Las propuestas de lote pasan ahora por una puerta determinista de integridad. `q
 
 ## Publicación directa y rechazo de lotes
 
-Por política de administración, las campañas necesitan rendimiento inmediato: la revisión del contenido traducido se hace en Shopify y el hub solo traduce y sube. Esto es una excepción a la aprobación humana previa y se controla por petición.
+Por política de administración, las campañas necesitan rendimiento inmediato: la revisión del contenido traducido se hace en Shopify y el hub solo traduce y sube. La aprobación humana previa ya no es obligatoria por decisión de gerencia (el proceso está probado y debe ser ágil); `auto_apply` sigue controlándose por petición.
 
 **Publicación directa (`auto_apply`)**
 
