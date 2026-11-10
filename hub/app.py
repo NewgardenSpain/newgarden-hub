@@ -1954,30 +1954,37 @@ def publish(job_id:int,user=Depends(operator)):
     return {'job_id':job_id,'simulated':True,'shopify_writes':0}
 
 # ---- Control de stock multitienda ----
-STOCK_VARIANT_QUERY='''query StockBySku($query:String!) { productVariants(first:5,query:$query) { nodes { id sku title product { id title } inventoryItem { id tracked inventoryLevels(first:25) { nodes { location { id name } quantities(names:["available"]) { name quantity } } } } } } }'''
+STOCK_VARIANT_QUERY='''query StockBySku($query:String!) { productVariants(first:25,query:$query) { nodes { id sku title product { id title status } inventoryItem { id tracked inventoryLevels(first:25) { nodes { location { id name } quantities(names:["available"]) { name quantity } } } } } } }'''
 
 class StockApply(BaseModel):
     sku:str=Field(min_length=1,max_length=120)
     stores:list[str]=Field(min_length=1)
+    # Artículos de inventario concretos por tienda; si una tienda no aparece, se aplica a todas sus variantes con ese SKU.
+    items:dict[str,list[str]]=Field(default_factory=dict)
     track:bool
     quantity:int|None=Field(default=None,ge=0,le=1_000_000)
+    # inventory_item_id -> location_id (solo si el artículo tiene varias ubicaciones).
     locations:dict[str,str]=Field(default_factory=dict)
     restock_at:str|None=Field(default=None,pattern=r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$')
     restock_quantity:int|None=Field(default=None,ge=0,le=1_000_000)
+    restock_track:bool=True
 
 def stock_lookup_store(store, sku):
-    """Estado de stock de un SKU exacto en una tienda."""
+    """Variantes con ese SKU exacto en una tienda (puede haber varias) y su estado de stock."""
     safe=sku.replace('\\','\\\\').replace('"','\\"')
     nodes=shopify_graphql(store['domain'],store['token'],STOCK_VARIANT_QUERY,{'query':f'sku:"{safe}"'}).get('productVariants',{}).get('nodes',[])
-    nodes=[v for v in nodes if (v.get('sku') or '').strip().casefold()==sku.casefold()]
-    if not nodes: return {'found':False}
-    if len(nodes)>1: return {'found':False,'error':f'El SKU coincide con {len(nodes)} variantes'}
-    v=nodes[0]; item=v.get('inventoryItem') or {}
-    levels=[]
-    for level in (item.get('inventoryLevels') or {}).get('nodes',[]):
-        available=next((q['quantity'] for q in level.get('quantities') or [] if q.get('name')=='available'),None)
-        levels.append({'location_id':level['location']['id'],'location':level['location']['name'],'available':available})
-    return {'found':True,'product':(v.get('product') or {}).get('title'),'variant':v.get('title'),'inventory_item_id':item.get('id'),'tracked':bool(item.get('tracked')),'levels':levels}
+    variants=[]
+    for v in nodes:
+        if (v.get('sku') or '').strip().casefold()!=sku.casefold(): continue
+        item=v.get('inventoryItem') or {}
+        if not item.get('id'): continue
+        levels=[]
+        for level in (item.get('inventoryLevels') or {}).get('nodes',[]):
+            available=next((q['quantity'] for q in level.get('quantities') or [] if q.get('name')=='available'),None)
+            levels.append({'location_id':level['location']['id'],'location':level['location']['name'],'available':available})
+        product=v.get('product') or {}
+        variants.append({'product':product.get('title'),'status':product.get('status'),'variant':v.get('title'),'inventory_item_id':item['id'],'tracked':bool(item.get('tracked')),'levels':levels})
+    return {'found':bool(variants),'variants':variants}
 
 def stock_mutation(store, query, variables, root):
     data=shopify_graphql(store['domain'],store['token'],query,variables).get(root) or {}
@@ -1985,18 +1992,29 @@ def stock_mutation(store, query, variables, root):
     if errors: raise HTTPException(502,'Shopify: '+'; '.join(e.get('message','error') for e in errors)[:300])
     return data
 
-def stock_apply_store(store, sku, track, quantity, location_id=None):
-    """Fija el seguimiento y, si se indica, la cantidad disponible de un SKU en una tienda."""
-    state=stock_lookup_store(store,sku)
-    if not state['found']: raise HTTPException(404,state.get('error') or 'SKU no encontrado en la tienda')
-    item_id=state['inventory_item_id']
-    if state['tracked']!=track:
+def stock_apply_variant(store, variant, track, quantity, location_id=None):
+    item_id=variant['inventory_item_id']
+    if variant['tracked']!=track:
         stock_mutation(store,'mutation($id:ID!,$input:InventoryItemInput!) { inventoryItemUpdate(id:$id,input:$input) { inventoryItem { id tracked } userErrors { field message } } }',{'id':item_id,'input':{'tracked':track}},'inventoryItemUpdate')
     if track and quantity is not None:
-        level=next((l for l in state['levels'] if l['location_id']==location_id),None) if location_id else (state['levels'][0] if state['levels'] else None)
+        level=next((l for l in variant['levels'] if l['location_id']==location_id),None) if location_id else None
+        level=level or (variant['levels'][0] if variant['levels'] else None)
         if not level: raise HTTPException(409,'El SKU no tiene ubicación de inventario en esta tienda')
         stock_mutation(store,'mutation($input:InventorySetQuantitiesInput!) { inventorySetQuantities(input:$input) { inventoryAdjustmentGroup { id } userErrors { field message } } }',{'input':{'name':'available','reason':'correction','ignoreCompareQuantity':True,'quantities':[{'inventoryItemId':item_id,'locationId':level['location_id'],'quantity':quantity}]}},'inventorySetQuantities')
-    return stock_lookup_store(store,sku)
+
+def stock_apply_store(store, sku, track, quantity, locations=None, item_ids=None):
+    """Aplica seguimiento/cantidad a las variantes con ese SKU (todas, o solo `item_ids`).
+    Devuelve (ids aplicados, errores por artículo)."""
+    state=stock_lookup_store(store,sku)
+    variants=[v for v in state['variants'] if not item_ids or v['inventory_item_id'] in item_ids]
+    if not variants: raise HTTPException(404,'SKU no encontrado en la tienda')
+    done=[]; errors=[]
+    for v in variants:
+        try:
+            stock_apply_variant(store,v,track,quantity,(locations or {}).get(v['inventory_item_id']))
+            done.append(v['inventory_item_id'])
+        except HTTPException as exc: errors.append(f"{v['product']}: {exc.detail}")
+    return done,errors
 
 @app.get('/api/stock/lookup')
 def stock_lookup(sku:str):
@@ -2004,22 +2022,22 @@ def stock_lookup(sku:str):
     if not sku: raise HTTPException(400,'Indica un SKU')
     stores=shopify_stores()
     def one(store):
-        if not store['domain'] or not store['token']: return {'store':store['code'],'found':False,'error':'Sin credenciales Shopify'}
+        if not store['domain'] or not store['token']: return {'store':store['code'],'found':False,'variants':[],'error':'Sin credenciales Shopify'}
         try: return {'store':store['code'],'domain':store['domain'],**stock_lookup_store(store,sku)}
-        except HTTPException as exc: return {'store':store['code'],'found':False,'error':str(exc.detail)}
+        except HTTPException as exc: return {'store':store['code'],'found':False,'variants':[],'error':str(exc.detail)}
     with ThreadPoolExecutor(max_workers=6) as pool_:
         results=list(pool_.map(one,stores))
     return {'sku':sku,'stores':results,'schedules':stock_schedules_for(sku)}
 
 def stock_schedules_for(sku):
     with pool.connection() as c:
-        rows=c.execute("SELECT id,store_code,quantity,to_char(run_at AT TIME ZONE 'Europe/Madrid','YYYY-MM-DD HH24:MI'),state,error FROM stock_schedules WHERE lower(sku)=lower(%s) AND (state IN ('PENDING','RUNNING') OR (state='FAILED' AND created_at>now()-interval '7 days')) ORDER BY run_at,id",(sku,)).fetchall()
-    return [{'id':r[0],'store':r[1],'quantity':r[2],'run_at':r[3],'state':r[4],'error':r[5]} for r in rows]
+        rows=c.execute("SELECT id,store_code,quantity,to_char(run_at AT TIME ZONE 'Europe/Madrid','YYYY-MM-DD HH24:MI'),state,error,track,inventory_item_id FROM stock_schedules WHERE lower(sku)=lower(%s) AND (state IN ('PENDING','RUNNING') OR (state='FAILED' AND created_at>now()-interval '7 days')) ORDER BY run_at,id",(sku,)).fetchall()
+    return [{'id':r[0],'store':r[1],'quantity':r[2],'run_at':r[3],'state':r[4],'error':r[5],'track':r[6],'inventory_item_id':r[7]} for r in rows]
 
 @app.post('/api/stock/apply')
 def stock_apply(x:StockApply,user=Depends(operator)):
     sku=x.sku.strip()
-    if x.restock_at and x.restock_quantity is None: raise HTTPException(400,'Indica la cantidad del reaprovisionamiento')
+    if x.restock_at and x.restock_track and x.restock_quantity is None: raise HTTPException(400,'Indica la cantidad del reaprovisionamiento')
     if x.restock_quantity is not None and not x.restock_at: raise HTTPException(400,'Indica la fecha del reaprovisionamiento')
     codes=list(dict.fromkeys(c.strip().upper() for c in x.stores if c.strip()))
     by_code={s['code']:s for s in shopify_stores()}
@@ -2029,15 +2047,14 @@ def stock_apply(x:StockApply,user=Depends(operator)):
         with pool.connection() as c:
             if not c.execute("SELECT (%s::timestamp AT TIME ZONE 'Europe/Madrid')>now()",(x.restock_at,)).fetchone()[0]: raise HTTPException(400,'La fecha de reaprovisionamiento debe ser futura')
     def one(code):
-        try:
-            state=stock_apply_store(by_code[code],sku,x.track,x.quantity,x.locations.get(code))
-            result={'store':code,'ok':True,**state}
-        except HTTPException as exc: return {'store':code,'ok':False,'error':str(exc.detail)}
-        if x.restock_at:
+        try: done,errors=stock_apply_store(by_code[code],sku,x.track,x.quantity,x.locations,x.items.get(code))
+        except HTTPException as exc: return {'store':code,'ok':False,'applied':0,'error':str(exc.detail)}
+        if x.restock_at and done:
             with pool.connection() as c:
-                c.execute("UPDATE stock_schedules SET state='CANCELLED' WHERE lower(sku)=lower(%s) AND store_code=%s AND state='PENDING'",(sku,code))
-                c.execute("INSERT INTO stock_schedules(sku,store_code,location_id,quantity,run_at) VALUES(%s,%s,%s,%s,%s::timestamp AT TIME ZONE 'Europe/Madrid')",(sku,code,x.locations.get(code),x.restock_quantity,x.restock_at))
-        return result
+                for item_id in done:
+                    c.execute("UPDATE stock_schedules SET state='CANCELLED' WHERE lower(sku)=lower(%s) AND store_code=%s AND state='PENDING' AND (inventory_item_id=%s OR inventory_item_id IS NULL)",(sku,code,item_id))
+                    c.execute("INSERT INTO stock_schedules(sku,store_code,inventory_item_id,location_id,quantity,track,run_at) VALUES(%s,%s,%s,%s,%s,%s,%s::timestamp AT TIME ZONE 'Europe/Madrid')",(sku,code,item_id,x.locations.get(item_id),x.restock_quantity if x.restock_track else None,x.restock_track,x.restock_at))
+        return {'store':code,'ok':not errors,'applied':len(done),'error':'; '.join(errors) or None}
     with ThreadPoolExecutor(max_workers=6) as pool_:
         results=list(pool_.map(one,codes))
     logging.getLogger('hub.stock').info('Stock %s: seguimiento=%s cantidad=%s reaprovisionamiento=%s en %s',sku,x.track,x.quantity,x.restock_at,codes)
@@ -2052,13 +2069,14 @@ def stock_cancel_schedule(schedule_id:int,user=Depends(operator)):
 
 def _stock_step():
     with pool.connection() as c:
-        row=c.execute("UPDATE stock_schedules SET state='RUNNING' WHERE id=(SELECT id FROM stock_schedules WHERE state='PENDING' AND run_at<=now() ORDER BY run_at,id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id,sku,store_code,location_id,quantity").fetchone()
+        row=c.execute("UPDATE stock_schedules SET state='RUNNING' WHERE id=(SELECT id FROM stock_schedules WHERE state='PENDING' AND run_at<=now() ORDER BY run_at,id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING id,sku,store_code,inventory_item_id,location_id,quantity,track").fetchone()
     if not row: return False
-    schedule_id,sku,code,location_id,quantity=row
+    schedule_id,sku,code,item_id,location_id,quantity,track=row
     try:
         store=shopify_store_by_code(code)
         if not store or not store['domain'] or not store['token']: raise HTTPException(503,'Tienda inactiva o sin credenciales: '+code)
-        stock_apply_store(store,sku,True,quantity,location_id)
+        done,errors=stock_apply_store(store,sku,track,quantity,{item_id:location_id} if item_id and location_id else None,[item_id] if item_id else None)
+        if errors: raise HTTPException(502,'; '.join(errors))
         state,error='DONE',None
     except Exception as exc:
         state,error='FAILED',str(getattr(exc,'detail',None) or exc)[:500]
@@ -2076,11 +2094,11 @@ def _stock_runner():
 
 @app.get('/stock',response_class=HTMLResponse)
 def stock_page():
-    body='''<main class="wrap"><h1>Control de stock multitienda</h1><p class="lede">Busca un SKU y verás en qué tiendas existe, si tiene el seguimiento de inventario activado y cuánto stock hay. Elige las tiendas a las que quieres aplicar el cambio (a menudo solo Europa). Los cambios se escriben directamente en Shopify. Si indicas una fecha de reaprovisionamiento, el hub activará el seguimiento y fijará la cantidad por sí solo ese día (hora de España peninsular).</p>
+    body='''<main class="wrap"><h1>Control de stock multitienda</h1><p class="lede">Busca un SKU y verás en qué tiendas existe (si varias variantes comparten SKU, salen todas, cada una con su casilla), si tiene el seguimiento de inventario activado y cuánto stock hay. Elige las tiendas a las que quieres aplicar el cambio (a menudo solo Europa). Los cambios se escriben directamente en Shopify. Si indicas una fecha de reaprovisionamiento, ese día el hub fijará la cantidad (activando el seguimiento) o devolverá el SKU a sin seguimiento, a tu elección (hora de España peninsular).</p>
 <section class="card"><form id="stock-search" class="field"><label for="sku">SKU exacto</label><div style="display:flex;gap:.5rem;flex-wrap:wrap"><input id="sku" required maxlength="120" autocomplete="off" placeholder="NG-1234" style="flex:1;min-width:14rem"><button class="button primary" id="search-button">Buscar</button></div></form><p class="muted" id="stock-status" role="status" aria-live="polite"></p></section>
-<section class="card" id="stock-result" hidden><h2 id="result-title"></h2><div class="actions" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem"><button type="button" class="button" id="pick-all">Todas</button><button type="button" class="button" id="pick-eu">Solo Europa</button><button type="button" class="button" id="pick-none">Ninguna</button></div><div class="table-wrap"><table><thead><tr><th></th><th>Tienda</th><th>Producto</th><th>Seguimiento</th><th>Stock</th><th>Ubicación</th></tr></thead><tbody id="stock-rows"></tbody></table></div>
+<section class="card" id="stock-result" hidden><h2 id="result-title"></h2><div class="actions" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem"><button type="button" class="button" id="pick-all">Todas</button><button type="button" class="button" id="pick-eu">Solo Europa</button><button type="button" class="button" id="pick-none">Ninguna</button></div><div class="table-wrap"><table><thead><tr><th></th><th>Tienda</th><th>Producto / variante</th><th>Seguimiento</th><th>Stock</th><th>Ubicación</th></tr></thead><tbody id="stock-rows"></tbody></table></div>
 <form id="stock-form"><div class="grid"><fieldset class="field"><legend>Seguimiento de stock</legend><label style="display:block"><input type="radio" name="track" value="on" checked style="width:auto"> Activar</label><label style="display:block"><input type="radio" name="track" value="off" style="width:auto"> Desactivar</label></fieldset><div class="field"><label for="qty">Cantidad ahora (opcional, solo si se activa)</label><input id="qty" type="number" min="0" max="1000000" step="1" placeholder="Dejar como está"></div></div>
-<fieldset class="field"><legend>Reaprovisionamiento programado (opcional)</legend><div class="grid"><div class="field"><label for="restock-at">Fecha y hora</label><input id="restock-at" type="datetime-local"></div><div class="field"><label for="restock-qty">Cantidad que se fijará ese día</label><input id="restock-qty" type="number" min="0" max="1000000" step="1"></div></div><p class="muted">Ese día se activa el seguimiento y se fija la cantidad. Sustituye cualquier reaprovisionamiento pendiente de este SKU en las tiendas elegidas.</p></fieldset>
+<fieldset class="field"><legend>Reaprovisionamiento programado (opcional)</legend><div class="grid"><div class="field"><label for="restock-at">Fecha y hora</label><input id="restock-at" type="datetime-local"></div><div class="field"><label style="display:block"><input type="radio" name="restock-mode" value="qty" checked style="width:auto"> Fijar cantidad (activa el seguimiento)</label><label style="display:block"><input type="radio" name="restock-mode" value="untrack" style="width:auto"> Volver a sin seguimiento (reaprovisionamiento definitivo)</label><label for="restock-qty">Cantidad que se fijará ese día</label><input id="restock-qty" type="number" min="0" max="1000000" step="1"></div></div><p class="muted">Sustituye cualquier reaprovisionamiento pendiente de este SKU en las tiendas elegidas.</p></fieldset>
 <button class="button primary" id="apply-button">Aplicar</button> <span class="muted" id="apply-status" role="status" aria-live="polite"></span></form></section>
 <section class="card" id="schedules-card" hidden><h2>Reaprovisionamientos de este SKU</h2><div class="table-wrap"><table><thead><tr><th>Tienda</th><th>Fecha</th><th>Cantidad</th><th>Estado</th><th></th></tr></thead><tbody id="schedule-rows"></tbody></table></div></section>
 </main>
@@ -2088,19 +2106,22 @@ def stock_page():
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Error al procesar la solicitud');return data}
 const EUROPE=['EU','ES','FR','DE','IT','B2B'];const rows=document.querySelector('#stock-rows'),statusBox=document.querySelector('#stock-status'),applyStatus=document.querySelector('#apply-status');let current=null;
-function stateText(s){if(s.error&&!s.found)return '<span class="muted">'+esc(s.error)+'</span>';if(!s.found)return '<span class="muted">No existe</span>';return s.tracked?'<span class="badge">ACTIVO</span>':'<span class="badge">DESACTIVADO</span>'}
-function stockText(s){if(!s.found)return '';if(!s.tracked)return '<span class="muted">sin seguimiento</span>';if(!s.levels.length)return '—';return s.levels.map(l=>esc(l.available??'—')).join(' / ')}
-function locationCell(s){if(!s.found)return '';if(s.levels.length<=1)return esc(s.levels[0]?.location||'—');return '<select class="loc" data-store="'+esc(s.store)+'" aria-label="Ubicación en '+esc(s.store)+'">'+s.levels.map(l=>'<option value="'+esc(l.location_id)+'">'+esc(l.location)+' ('+esc(l.available??'—')+')</option>').join('')+'</select>'}
-function render(data,keepChecked){current=data;const checked=new Set(keepChecked||[]);document.querySelector('#result-title').textContent='SKU '+data.sku;rows.innerHTML=data.stores.map(s=>'<tr><td><input type="checkbox" class="pick" value="'+esc(s.store)+'" style="width:auto" aria-label="Aplicar a '+esc(s.store)+'"'+(s.found?'':' disabled')+(checked.has(s.store)&&s.found?' checked':'')+'></td><td><strong>'+esc(s.store)+'</strong></td><td>'+(s.found?esc(s.product)+(s.variant&&s.variant!=='Default Title'?' <span class="muted">· '+esc(s.variant)+'</span>':''):'')+'</td><td>'+stateText(s)+'</td><td>'+stockText(s)+'</td><td>'+locationCell(s)+'</td></tr>').join('');document.querySelector('#stock-result').hidden=false;renderSchedules(data.schedules)}
-function renderSchedules(list){document.querySelector('#schedules-card').hidden=!list.length;document.querySelector('#schedule-rows').innerHTML=list.map(x=>'<tr><td>'+esc(x.store)+'</td><td>'+esc(x.run_at)+'</td><td>'+esc(x.quantity)+'</td><td>'+(x.state==='FAILED'?'<span class="badge">ERROR</span> '+esc(x.error||''):'<span class="badge">'+(x.state==='RUNNING'?'EN CURSO':'PENDIENTE')+'</span>')+'</td><td><button type="button" class="button cancel-schedule" data-id="'+x.id+'">'+(x.state==='FAILED'?'Descartar':'Cancelar')+'</button></td></tr>').join('')}
-async function search(sku,keep){statusBox.textContent='Consultando todas las tiendas…';document.querySelector('#search-button').disabled=true;try{render(await fetchJSON('/api/stock/lookup?sku='+encodeURIComponent(sku)),keep);const n=current.stores.filter(s=>s.found).length;statusBox.textContent=n?'Encontrado en '+n+' de '+current.stores.length+' tiendas.':'No se encontró este SKU en ninguna tienda.'}catch(e){statusBox.textContent=e.message;document.querySelector('#stock-result').hidden=true}document.querySelector('#search-button').disabled=false}
+function stateBadge(v){return v.tracked?'<span class="badge">ACTIVO</span>':'<span class="badge">DESACTIVADO</span>'}
+function statusBadge(v){return v.status&&v.status!=='ACTIVE'?' <span class="badge">'+esc(v.status)+'</span>':''}
+function stockText(v){if(!v.tracked)return '<span class="muted">sin seguimiento</span>'+(v.levels.length?' · '+v.levels.map(l=>esc(l.available??'—')).join(' / '):'');return v.levels.length?v.levels.map(l=>esc(l.available??'—')).join(' / '):'—'}
+function locationCell(v){if(v.levels.length<=1)return esc(v.levels[0]?.location||'—');return '<select class="loc" data-item="'+esc(v.inventory_item_id)+'" aria-label="Ubicación">'+v.levels.map(l=>'<option value="'+esc(l.location_id)+'">'+esc(l.location)+' ('+esc(l.available??'—')+')</option>').join('')+'</select>'}
+function render(data,keepChecked){current=data;const checked=new Set(keepChecked||[]);document.querySelector('#result-title').textContent='SKU '+data.sku;rows.innerHTML=data.stores.map(s=>{if(!s.found)return '<tr><td><input type="checkbox" disabled style="width:auto" aria-label="'+esc(s.store)+' no disponible"></td><td><strong>'+esc(s.store)+'</strong></td><td colspan="4" class="muted">'+esc(s.error||'No existe')+'</td></tr>';return s.variants.map((v,i)=>'<tr><td><input type="checkbox" class="pick" data-store="'+esc(s.store)+'" value="'+esc(v.inventory_item_id)+'" style="width:auto" aria-label="Aplicar a '+esc(s.store)+' · '+esc(v.product)+'"'+(checked.has(v.inventory_item_id)?' checked':'')+'></td><td><strong>'+esc(s.store)+'</strong></td><td>'+esc(v.product)+statusBadge(v)+(v.variant&&v.variant!=='Default Title'?' <span class="muted">· '+esc(v.variant)+'</span>':'')+'</td><td>'+stateBadge(v)+'</td><td>'+stockText(v)+'</td><td>'+locationCell(v)+'</td></tr>').join('')}).join('');document.querySelector('#stock-result').hidden=false;renderSchedules(data.schedules)}
+function itemName(id){for(const s of (current?.stores||[]))for(const v of s.variants||[])if(v.inventory_item_id===id)return v.product+(v.status&&v.status!=='ACTIVE'?' ('+v.status+')':'');return ''}
+function renderSchedules(list){document.querySelector('#schedules-card').hidden=!list.length;document.querySelector('#schedule-rows').innerHTML=list.map(x=>'<tr><td>'+esc(x.store)+(itemName(x.inventory_item_id)?' <span class="muted">· '+esc(itemName(x.inventory_item_id))+'</span>':'')+'</td><td>'+esc(x.run_at)+'</td><td>'+(x.track===false?'Sin seguimiento':esc(x.quantity))+'</td><td>'+(x.state==='FAILED'?'<span class="badge">ERROR</span> '+esc(x.error||''):'<span class="badge">'+(x.state==='RUNNING'?'EN CURSO':'PENDIENTE')+'</span>')+'</td><td><button type="button" class="button cancel-schedule" data-id="'+x.id+'">'+(x.state==='FAILED'?'Descartar':'Cancelar')+'</button></td></tr>').join('')}
+async function search(sku,keep){statusBox.textContent='Consultando todas las tiendas…';document.querySelector('#search-button').disabled=true;try{render(await fetchJSON('/api/stock/lookup?sku='+encodeURIComponent(sku)),keep);const n=current.stores.filter(s=>s.found).length,nv=current.stores.reduce((a,s)=>a+s.variants.length,0);statusBox.textContent=n?'Encontrado en '+n+' de '+current.stores.length+' tiendas ('+nv+' variante'+(nv===1?'':'s')+').':'No se encontró este SKU en ninguna tienda.'}catch(e){statusBox.textContent=e.message;document.querySelector('#stock-result').hidden=true}document.querySelector('#search-button').disabled=false}
 document.querySelector('#stock-search').addEventListener('submit',e=>{e.preventDefault();search(document.querySelector('#sku').value.trim())});
-const pick=fn=>document.querySelectorAll('.pick').forEach(x=>{if(!x.disabled)x.checked=fn(x.value)});
-document.querySelector('#pick-all').addEventListener('click',()=>pick(()=>true));document.querySelector('#pick-eu').addEventListener('click',()=>pick(v=>EUROPE.includes(v)));document.querySelector('#pick-none').addEventListener('click',()=>pick(()=>false));
+const pick=fn=>document.querySelectorAll('.pick').forEach(x=>{x.checked=fn(x.dataset.store)});
+document.querySelector('#pick-all').addEventListener('click',()=>pick(()=>true));document.querySelector('#pick-eu').addEventListener('click',()=>pick(s=>EUROPE.includes(s)));document.querySelector('#pick-none').addEventListener('click',()=>pick(()=>false));
+document.querySelectorAll('input[name=restock-mode]').forEach(x=>x.addEventListener('change',()=>{const u=document.querySelector('input[name=restock-mode]:checked').value==='untrack';document.querySelector('#restock-qty').disabled=u;if(u)document.querySelector('#restock-qty').value=''}));
 document.querySelector('#schedules-card').addEventListener('click',async e=>{const b=e.target.closest('.cancel-schedule');if(!b)return;b.disabled=true;try{await fetchJSON('/api/stock/schedules/'+b.dataset.id+'/cancel',{method:'POST'});await search(current.sku,[...document.querySelectorAll('.pick:checked')].map(x=>x.value))}catch(err){applyStatus.textContent=err.message;b.disabled=false}});
-document.querySelector('#stock-form').addEventListener('submit',async e=>{e.preventDefault();const stores=[...document.querySelectorAll('.pick:checked')].map(x=>x.value);if(!stores.length){applyStatus.textContent='Elige al menos una tienda.';return}
-const track=document.querySelector('input[name=track]:checked').value==='on',qty=document.querySelector('#qty').value,at=document.querySelector('#restock-at').value,rq=document.querySelector('#restock-qty').value;if((at!=='')!==(rq!=='')){applyStatus.textContent='El reaprovisionamiento necesita fecha y cantidad.';return}
-const locations={};document.querySelectorAll('.loc').forEach(x=>{locations[x.dataset.store]=x.value});const body={sku:current.sku,stores,track,locations};if(track&&qty!=='')body.quantity=Number(qty);if(at&&rq!==''){body.restock_at=at;body.restock_quantity=Number(rq)}
-const button=document.querySelector('#apply-button');button.disabled=true;applyStatus.textContent='Aplicando en '+stores.length+' tienda(s)…';try{const data=await fetchJSON('/api/stock/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const bad=data.results.filter(r=>!r.ok);await search(current.sku,stores);applyStatus.textContent=(data.results.length-bad.length)+' tienda(s) actualizadas'+(bad.length?'. Errores: '+bad.map(r=>r.store+': '+r.error).join(' · '):'.')+(body.restock_at?' Reaprovisionamiento programado.':'')}catch(err){applyStatus.textContent=err.message}button.disabled=false});
+document.querySelector('#stock-form').addEventListener('submit',async e=>{e.preventDefault();const picked=[...document.querySelectorAll('.pick:checked')],items={};for(const x of picked)(items[x.dataset.store]??=[]).push(x.value);const stores=Object.keys(items);if(!stores.length){applyStatus.textContent='Elige al menos una tienda.';return}
+const track=document.querySelector('input[name=track]:checked').value==='on',qty=document.querySelector('#qty').value,at=document.querySelector('#restock-at').value,untrack=document.querySelector('input[name=restock-mode]:checked').value==='untrack',rq=untrack?'':document.querySelector('#restock-qty').value;if(at===''&&document.querySelector('#restock-qty').value!==''){applyStatus.textContent='Indica la fecha del reaprovisionamiento.';return}if(at!==''&&!untrack&&rq===''){applyStatus.textContent='El reaprovisionamiento necesita una cantidad.';return}
+const locations={};document.querySelectorAll('.loc').forEach(x=>{locations[x.dataset.item]=x.value});const body={sku:current.sku,stores,items,track,locations};if(track&&qty!=='')body.quantity=Number(qty);if(at){body.restock_at=at;body.restock_track=!untrack;if(!untrack)body.restock_quantity=Number(rq)}
+const button=document.querySelector('#apply-button');button.disabled=true;applyStatus.textContent='Aplicando en '+picked.length+' variante(s) de '+stores.length+' tienda(s)…';try{const data=await fetchJSON('/api/stock/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const bad=data.results.filter(r=>!r.ok);await search(current.sku,picked.map(x=>x.value));applyStatus.textContent=(data.results.length-bad.length)+' tienda(s) actualizadas'+(bad.length?'. Errores: '+bad.map(r=>r.store+': '+r.error).join(' · '):'.')+(body.restock_at?' Reaprovisionamiento programado.':'')}catch(err){applyStatus.textContent=err.message}button.disabled=false});
 </script>'''
     return shell('Control de stock',body,'stock')
