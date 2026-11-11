@@ -342,8 +342,9 @@ def shell(title, body, active=''):
         'glossary': '<path d="M12 5v16M12 5C8 2 4 3 2 4v15c3-1 6-1 10 2 4-3 7-3 10-2V4c-3-1-6-2-10 1Z"/>',
         'stores': '<path d="M3 10v11h18V10M2 10l2-7h16l2 7M2 10h20M9 21v-7h6v7"/>',
         'stock': '<path d="M3 7h18v13H3zM3 7l3-4h12l3 4M9 12h6"/>',
+        'tags': '<path d="M3 12V3h9l9 9-9 9-9-9Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
     }
-    items = [('home','/','Resumen'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
+    items = [('home','/','Resumen'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
@@ -2131,3 +2132,130 @@ const locations={};document.querySelectorAll('.loc').forEach(x=>{locations[x.dat
 const button=document.querySelector('#apply-button');button.disabled=true;applyStatus.textContent='Aplicando en '+picked.length+' variante(s) de '+stores.length+' tienda(s)…';try{const data=await fetchJSON('/api/stock/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const bad=data.results.filter(r=>!r.ok);await search(current.sku,picked.map(x=>x.value));applyStatus.textContent=(data.results.length-bad.length)+' tienda(s) actualizadas'+(bad.length?'. Errores: '+bad.map(r=>r.store+': '+r.error).join(' · '):'.')+(body.restock_at?' Reaprovisionamiento programado.':'')}catch(err){applyStatus.textContent=err.message}button.disabled=false});
 </script>'''
     return shell('Control de stock',body,'stock')
+
+
+# ---- Etiquetado masivo: buscar productos y añadir/quitar etiquetas ----
+TAG_SEARCH_QUERY='''query TagSearch($query:String,$after:String) { products(first:100,query:$query,after:$after) { pageInfo { hasNextPage endCursor } nodes { id title handle status productType category { name } tags variants(first:5) { nodes { sku } } } } }'''
+
+class TagApply(BaseModel):
+    store:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
+    product_ids:list[str]=Field(min_length=1,max_length=500)
+    add:list[str]=Field(default_factory=list,max_length=50)
+    remove:list[str]=Field(default_factory=list,max_length=50)
+    # Otras tiendas donde aplicar lo mismo: los productos se enlazan por SKU exacto.
+    stores:list[str]=Field(default_factory=list,max_length=20)
+    skus:list[str]=Field(default_factory=list,max_length=500)
+
+    @field_validator('product_ids')
+    @classmethod
+    def check_ids(cls,value):
+        if any(not re.fullmatch(r'gid://shopify/Product/\d+',v) for v in value): raise ValueError('Identificador de producto no válido')
+        return list(dict.fromkeys(value))
+
+    @field_validator('add','remove')
+    @classmethod
+    def check_tags(cls,value):
+        tags=list(dict.fromkeys(t.strip() for t in value if t.strip()))
+        if any(len(t)>255 or ',' in t for t in tags): raise ValueError('Etiqueta no válida (máx. 255 caracteres y sin comas)')
+        return tags
+
+def _tag_term(field,value):
+    safe=value.strip().replace('\\','\\\\').replace('"','\\"')
+    return f'{field}:"{safe}"'
+
+@app.get('/api/tags/categories')
+def tags_categories(store:str):
+    st=shopify_store_by_code(store.strip().upper())
+    if not st or not st['domain'] or not st['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales')
+    nodes=shopify_graphql(st['domain'],st['token'],'query { productTypes(first:250) { nodes } }').get('productTypes',{}).get('nodes',[])
+    return {'categories':sorted((n for n in nodes if n),key=str.casefold)}
+
+@app.get('/api/tags/search')
+def tags_search(store:str,sku:str='',category:str='',tag:str='',title:str='',after:str|None=None):
+    terms=[_tag_term(f,v) for f,v in (('sku',sku),('product_type',category),('tag',tag),('title',title)) if v.strip()]
+    if not terms: raise HTTPException(400,'Indica al menos un criterio de búsqueda')
+    st=shopify_store_by_code(store.strip().upper())
+    if not st or not st['domain'] or not st['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales')
+    data=shopify_graphql(st['domain'],st['token'],TAG_SEARCH_QUERY,{'query':' '.join(terms),'after':after}).get('products') or {}
+    products=[{'id':n['id'],'title':n['title'],'handle':n['handle'],'status':n['status'],'category':n.get('productType') or ((n.get('category') or {}).get('name') or ''),'tags':n.get('tags') or [],'skus':[v['sku'] for v in n['variants']['nodes'] if v.get('sku')]} for n in data.get('nodes',[])]
+    page=data.get('pageInfo') or {}
+    return {'products':products,'has_next':bool(page.get('hasNextPage')),'cursor':page.get('endCursor')}
+
+TAG_VARIANT_QUERY='''query TagBySku($query:String!) { productVariants(first:25,query:$query) { nodes { sku product { id } } } }'''
+TAG_ADD='mutation($id:ID!,$tags:[String!]!) { tagsAdd(id:$id,tags:$tags) { node { ... on Product { tags } } userErrors { field message } } }'
+TAG_REMOVE='mutation($id:ID!,$tags:[String!]!) { tagsRemove(id:$id,tags:$tags) { node { ... on Product { tags } } userErrors { field message } } }'
+
+def tag_product(st,gid,add,remove):
+    try:
+        tags=None
+        for root,mutation,values in (('tagsAdd',TAG_ADD,add),('tagsRemove',TAG_REMOVE,remove)):
+            if not values: continue
+            result=stock_mutation(st,mutation,{'id':gid,'tags':values},root)
+            tags=(result.get('node') or {}).get('tags',tags)
+        return {'id':gid,'ok':True,'tags':tags}
+    except HTTPException as exc: return {'id':gid,'ok':False,'error':str(exc.detail)}
+
+def tag_ids_by_sku(st,skus):
+    """Productos de la tienda con alguna variante de esos SKU exactos. Devuelve (ids, skus no encontrados)."""
+    ids={}; missing=[]
+    for sku in skus:
+        hits=[]
+        nodes=shopify_graphql(st['domain'],st['token'],TAG_VARIANT_QUERY,{'query':_tag_term('sku',sku)}).get('productVariants',{}).get('nodes',[])
+        for v in nodes:
+            if (v.get('sku') or '').strip().casefold()==sku.casefold() and v.get('product'): hits.append(v['product']['id'])
+        for h in hits: ids[h]=True
+        if not hits: missing.append(sku)
+    return list(ids),missing
+
+@app.post('/api/tags/apply')
+def tags_apply(x:TagApply,user=Depends(operator)):
+    if not x.add and not x.remove: raise HTTPException(400,'Indica etiquetas que añadir o quitar')
+    overlap=set(t.casefold() for t in x.add)&set(t.casefold() for t in x.remove)
+    if overlap: raise HTTPException(400,'Una misma etiqueta no puede añadirse y quitarse a la vez')
+    codes=list(dict.fromkeys([x.store]+[c.strip().upper() for c in x.stores if c.strip()]))
+    by_code={s['code']:s for s in shopify_stores()}
+    unknown=[c for c in codes if c not in by_code or not by_code[c]['domain'] or not by_code[c]['token']]
+    if unknown: raise HTTPException(404,'Tienda inactiva o sin credenciales: '+', '.join(unknown))
+    skus=list(dict.fromkeys(s.strip() for s in x.skus if s.strip()))
+    if len(codes)>1 and not skus: raise HTTPException(400,'Para otras tiendas hacen falta SKUs de los productos seleccionados')
+    def one_store(code):
+        st=by_code[code]
+        try:
+            if code==x.store: ids,missing=x.product_ids,[]
+            else:
+                ids,missing=tag_ids_by_sku(st,skus)
+            with ThreadPoolExecutor(max_workers=4) as pool_:
+                results=list(pool_.map(lambda g:tag_product(st,g,x.add,x.remove),ids))
+        except HTTPException as exc: return {'store':code,'results':[],'missing':[],'error':str(exc.detail)}
+        return {'store':code,'results':results,'missing':missing,'error':None}
+    with ThreadPoolExecutor(max_workers=4) as pool_:
+        stores=list(pool_.map(one_store,codes))
+    logging.getLogger('hub.tags').info('Etiquetas +%s -%s: %s',x.add,x.remove,{r['store']:(len(r['results']),sum(1 for i in r['results'] if not i['ok']),len(r['missing'])) for r in stores})
+    return {'stores':stores}
+
+@app.get('/tags',response_class=HTMLResponse)
+def tags_page():
+    body='''<main class="wrap"><h1>Etiquetado masivo</h1><p class="lede">Busca productos de una tienda por referencia (SKU), categoría (tipo de producto), etiqueta o nombre; los criterios rellenados se combinan. Selecciona los resultados y añade o quita etiquetas de golpe. Los cambios se escriben directamente en Shopify.</p>
+<section class="card"><form id="tag-search" class="grid"><div class="field"><label for="store">Tienda</label><select id="store"></select></div><div class="field"><label for="f-sku">Referencia (SKU)</label><input id="f-sku" autocomplete="off"></div><div class="field"><label for="f-category">Categoría</label><select id="f-category"><option value="">Cualquiera</option></select></div><div class="field"><label for="f-tag">Etiqueta</label><input id="f-tag" autocomplete="off"></div><div class="field"><label for="f-title">Nombre</label><input id="f-title" autocomplete="off"></div><div class="field"><label>&nbsp;</label><button class="button primary" id="search-button">Buscar</button></div></form><p class="muted" id="search-status" role="status" aria-live="polite"></p></section>
+<section class="card" id="result-card" hidden><div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem"><button type="button" class="button" id="more" hidden>Cargar más</button><span class="muted" id="count"></span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="all" style="width:auto" aria-label="Seleccionar todos"></th><th>Producto</th><th>SKU</th><th>Categoría</th><th>Etiquetas</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+<section class="card" id="apply-card" hidden><form id="tag-form" class="grid"><div class="field"><label for="add">Añadir etiquetas (separadas por comas)</label><input id="add" autocomplete="off"></div><div class="field"><label for="remove">Quitar etiquetas (separadas por comas)</label><input id="remove" autocomplete="off"></div><fieldset class="field"><legend>Aplicar también en otras tiendas (se buscan por SKU)</legend><div id="targets" style="display:flex;gap:.75rem;flex-wrap:wrap"></div></fieldset><div class="field"><label>&nbsp;</label><button class="button primary" id="apply-button">Aplicar a la selección</button></div></form><p class="muted" id="apply-status" role="status" aria-live="polite"></p></section>
+</main>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Error al procesar la solicitud');return data}
+const $=s=>document.querySelector(s),rows=$('#rows');let products=[],cursor=null,query='';
+const list=v=>v.split(',').map(t=>t.trim()).filter(Boolean);
+let storeCodes=[];function renderTargets(){const cur=$('#store').value;$('#targets').innerHTML=storeCodes.filter(c=>c!==cur).map(c=>'<label style="display:inline-flex;gap:.25rem;align-items:center"><input type="checkbox" class="target" value="'+esc(c)+'" style="width:auto"> '+esc(c)+'</label>').join('')}
+fetchJSON('/api/stores').then(d=>{const s=(Array.isArray(d)?d:(d.stores||[])).filter(x=>x.active&&x.has_token);storeCodes=s.map(x=>x.code);$('#store').innerHTML=s.map(x=>'<option value="'+esc(x.code)+'">'+esc(x.code)+'</option>').join('');loadCategories();renderTargets()}).catch(e=>$('#search-status').textContent=e.message);
+async function loadCategories(){const sel=$('#f-category');sel.innerHTML='<option value="">Cualquiera</option>';if(!$('#store').value)return;try{const d=await fetchJSON('/api/tags/categories?store='+encodeURIComponent($('#store').value));sel.innerHTML+=d.categories.map(c=>'<option value="'+esc(c)+'">'+esc(c)+'</option>').join('')}catch(e){$('#search-status').textContent='No se pudieron cargar las categorías: '+e.message}}
+$('#store').addEventListener('change',()=>{loadCategories();renderTargets()});
+function row(p){return '<tr data-id="'+esc(p.id)+'"><td><input type="checkbox" class="pick" value="'+esc(p.id)+'" style="width:auto" aria-label="Seleccionar '+esc(p.title)+'"></td><td>'+esc(p.title)+(p.status!=='ACTIVE'?' <span class="badge">'+esc(p.status)+'</span>':'')+'</td><td>'+esc(p.skus.join(', '))+'</td><td>'+esc(p.category)+'</td><td class="tags">'+p.tags.map(t=>'<span class="badge">'+esc(t)+'</span>').join(' ')+'</td></tr>'}
+function render(){rows.innerHTML=products.map(row).join('');$('#result-card').hidden=!products.length;$('#apply-card').hidden=!products.length;$('#more').hidden=!cursor;$('#count').textContent=products.length+' producto(s) cargados'+(cursor?' (hay más)':'');$('#all').checked=false}
+async function load(append){const b=$('#search-button');b.disabled=true;$('#search-status').textContent='Buscando…';try{const q=new URLSearchParams({store:$('#store').value,sku:$('#f-sku').value,category:$('#f-category').value,tag:$('#f-tag').value,title:$('#f-title').value});if(append&&cursor)q.set('after',cursor);const d=await fetchJSON('/api/tags/search?'+q);products=append?products.concat(d.products):d.products;cursor=d.has_next?d.cursor:null;render();$('#search-status').textContent=products.length?'':'Sin resultados.'}catch(e){$('#search-status').textContent=e.message}finally{b.disabled=false}}
+$('#tag-search').addEventListener('submit',e=>{e.preventDefault();load(false)});$('#more').addEventListener('click',()=>load(true));
+$('#all').addEventListener('change',e=>document.querySelectorAll('.pick').forEach(x=>x.checked=e.target.checked));
+$('#tag-form').addEventListener('submit',async e=>{e.preventDefault();const ids=[...document.querySelectorAll('.pick:checked')].map(x=>x.value),add=list($('#add').value),remove=list($('#remove').value),st=$('#apply-status');if(!ids.length){st.textContent='Selecciona al menos un producto.';return}if(!add.length&&!remove.length){st.textContent='Indica etiquetas que añadir o quitar.';return}
+const targets=[...document.querySelectorAll('.target:checked')].map(x=>x.value),skus=[...new Set(ids.flatMap(i=>products.find(p=>p.id===i)?.skus||[]))];if(targets.length&&!skus.length){st.textContent='Los productos seleccionados no tienen SKU para enlazar con otras tiendas.';return}
+const b=$('#apply-button');b.disabled=true;st.textContent='Aplicando en '+(1+targets.length)+' tienda(s)…';try{const d=await fetchJSON('/api/tags/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({store:$('#store').value,product_ids:ids,add,remove,stores:targets,skus})});for(const r of d.stores[0].results)if(r.ok&&r.tags){const p=products.find(x=>x.id===r.id);if(p)p.tags=r.tags}const keep=new Set(ids);render();document.querySelectorAll('.pick').forEach(x=>x.checked=keep.has(x.value));st.innerHTML=d.stores.map(r=>{const bad=r.results.filter(i=>!i.ok);return '<strong>'+esc(r.store)+'</strong>: '+(r.error?esc(r.error):(r.results.length-bad.length)+' actualizados'+(bad.length?', '+bad.length+' con error ('+esc(bad.slice(0,2).map(i=>i.error).join('; '))+')':'')+(r.missing.length?', sin encontrar '+r.missing.length+' SKU ('+esc(r.missing.slice(0,5).join(', '))+(r.missing.length>5?'…':'')+')':''))}).join('<br>')}catch(err){st.textContent=err.message}finally{b.disabled=false}});
+</script>'''
+    return shell('Etiquetado masivo',body,'tags')
