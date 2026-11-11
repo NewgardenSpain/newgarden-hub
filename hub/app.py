@@ -2163,16 +2163,23 @@ def _tag_term(field,value):
     safe=value.strip().replace('\\','\\\\').replace('"','\\"')
     return f'{field}:"{safe}"'
 
-@app.get('/api/tags/categories')
-def tags_categories(store:str):
+TAG_COLLECTIONS_QUERY='''query TagCollections($query:String) { collections(first:25,query:$query,sortKey:TITLE) { nodes { id title handle } } }'''
+
+@app.get('/api/tags/collections')
+def tags_collections(store:str,q:str=''):
     st=shopify_store_by_code(store.strip().upper())
     if not st or not st['domain'] or not st['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales')
-    nodes=shopify_graphql(st['domain'],st['token'],'query { productTypes(first:250) { nodes } }').get('productTypes',{}).get('nodes',[])
-    return {'categories':sorted((n for n in nodes if n),key=str.casefold)}
+    words=re.findall(r'[\w-]+',q)
+    query=' '.join(f'title:{w}*' for w in words) or None
+    nodes=shopify_graphql(st['domain'],st['token'],TAG_COLLECTIONS_QUERY,{'query':query}).get('collections',{}).get('nodes',[])
+    return {'collections':[{'id':n['id'].rsplit('/',1)[-1],'title':n['title'],'handle':n['handle']} for n in nodes]}
 
 @app.get('/api/tags/search')
-def tags_search(store:str,sku:str='',category:str='',tag:str='',title:str='',after:str|None=None):
-    terms=[_tag_term(f,v) for f,v in (('sku',sku),('product_type',category),('tag',tag)) if v.strip()]
+def tags_search(store:str,sku:str='',collection_id:str='',tag:str='',title:str='',after:str|None=None):
+    terms=[_tag_term(f,v) for f,v in (('sku',sku),('tag',tag)) if v.strip()]
+    if collection_id.strip():
+        if not collection_id.strip().isdigit(): raise HTTPException(400,'Colección no válida')
+        terms.append(f'collection_id:{collection_id.strip()}')
     # Shopify no encuentra `title:"lola"` entre comillas: hay que usar cada palabra como prefijo (`title:lola*`).
     terms+=[f'title:{w}*' for w in re.findall(r'[\w-]+',title)]
     if not terms: raise HTTPException(400,'Indica al menos un criterio de búsqueda')
@@ -2238,8 +2245,8 @@ def tags_apply(x:TagApply,user=Depends(operator)):
 
 @app.get('/tags',response_class=HTMLResponse)
 def tags_page():
-    body='''<main class="wrap"><h1>Etiquetado masivo</h1><p class="lede">Busca productos de una tienda por referencia (SKU), categoría (tipo de producto), etiqueta o nombre; los criterios rellenados se combinan. Selecciona los resultados y añade o quita etiquetas de golpe. Los cambios se escriben directamente en Shopify.</p>
-<section class="card"><form id="tag-search" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(15rem,1fr))"><div class="field"><label for="store">Tienda</label><select id="store"></select></div><div class="field"><label for="f-sku">Referencia (SKU)</label><input id="f-sku" autocomplete="off"></div><div class="field"><label for="f-category">Categoría</label><select id="f-category" style="width:100%"><option value="">Cualquiera</option></select></div><div class="field"><label for="f-tag">Etiqueta</label><input id="f-tag" autocomplete="off"></div><div class="field"><label for="f-title">Nombre</label><input id="f-title" autocomplete="off"></div><div class="field"><label>&nbsp;</label><button class="button primary" id="search-button">Buscar</button></div></form><p class="muted" id="search-status" role="status" aria-live="polite"></p></section>
+    body='''<main class="wrap"><h1>Etiquetado masivo</h1><p class="lede">Busca productos de una tienda por referencia (SKU), colección, etiqueta o nombre; los criterios rellenados se combinan. Selecciona los resultados y añade o quita etiquetas de golpe. Los cambios se escriben directamente en Shopify.</p>
+<section class="card"><form id="tag-search" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(15rem,1fr))"><div class="field"><label for="store">Tienda</label><select id="store"></select></div><div class="field"><label for="f-sku">Referencia (SKU)</label><input id="f-sku" autocomplete="off"></div><div class="field"><label for="f-collection">Colección</label><input id="f-collection" list="collection-list" autocomplete="off" placeholder="Escribe para buscar…"><datalist id="collection-list"></datalist></div><div class="field"><label for="f-tag">Etiqueta</label><input id="f-tag" autocomplete="off"></div><div class="field"><label for="f-title">Nombre</label><input id="f-title" autocomplete="off"></div><div class="field"><label>&nbsp;</label><button class="button primary" id="search-button">Buscar</button></div></form><p class="muted" id="search-status" role="status" aria-live="polite"></p></section>
 <section class="card" id="result-card" hidden><div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.75rem"><button type="button" class="button" id="more" hidden>Cargar todos</button><span class="muted" id="count"></span></div><div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="all" style="width:auto" aria-label="Seleccionar todos"></th><th>Producto</th><th>SKU</th><th style="min-width:14rem">Categoría</th><th>Etiquetas</th></tr></thead><tbody id="rows"></tbody></table></div></section>
 <section class="card" id="apply-card" hidden><form id="tag-form" class="grid"><div class="field"><label for="add">Añadir etiquetas (separadas por comas)</label><input id="add" autocomplete="off"></div><div class="field"><label for="remove">Quitar etiquetas (separadas por comas)</label><input id="remove" autocomplete="off"></div><fieldset class="field"><legend>Aplicar también en otras tiendas (se buscan por SKU)</legend><div id="targets" style="display:flex;gap:.75rem;flex-wrap:wrap"></div></fieldset><div class="field"><label>&nbsp;</label><button class="button primary" id="apply-button">Aplicar a la selección</button></div></form><p class="muted" id="apply-status" role="status" aria-live="polite"></p></section>
 </main>
@@ -2249,12 +2256,14 @@ async function fetchJSON(url,options){const r=await fetch(url,options);let data=
 const $=s=>document.querySelector(s),rows=$('#rows');let products=[],cursor=null,total=null,selected=new Set(),loading=false;
 const list=v=>v.split(',').map(t=>t.trim()).filter(Boolean);
 let storeCodes=[];function renderTargets(){const cur=$('#store').value;$('#targets').innerHTML=storeCodes.filter(c=>c!==cur).map(c=>'<label style="display:inline-flex;gap:.25rem;align-items:center"><input type="checkbox" class="target" value="'+esc(c)+'" style="width:auto"> '+esc(c)+'</label>').join('')}
-fetchJSON('/api/stores').then(d=>{const s=(Array.isArray(d)?d:(d.stores||[])).filter(x=>x.active&&x.has_token);storeCodes=s.map(x=>x.code);$('#store').innerHTML=s.map(x=>'<option value="'+esc(x.code)+'">'+esc(x.code)+'</option>').join('');loadCategories();renderTargets()}).catch(e=>$('#search-status').textContent=e.message);
-async function loadCategories(){const sel=$('#f-category');sel.innerHTML='<option value="">Cualquiera</option>';if(!$('#store').value)return;try{const d=await fetchJSON('/api/tags/categories?store='+encodeURIComponent($('#store').value));sel.innerHTML+=d.categories.map(c=>'<option value="'+esc(c)+'">'+esc(c)+'</option>').join('')}catch(e){$('#search-status').textContent='No se pudieron cargar las categorías: '+e.message}}
-$('#store').addEventListener('change',()=>{loadCategories();renderTargets()});
+fetchJSON('/api/stores').then(d=>{const s=(Array.isArray(d)?d:(d.stores||[])).filter(x=>x.active&&x.has_token);storeCodes=s.map(x=>x.code);$('#store').innerHTML=s.map(x=>'<option value="'+esc(x.code)+'">'+esc(x.code)+'</option>').join('');loadCollections('');renderTargets()}).catch(e=>$('#search-status').textContent=e.message);
+let collMap=new Map(),collTimer=null,collSeq=0;
+async function loadCollections(q){const n=++collSeq,store=$('#store').value;if(!store)return;try{const d=await fetchJSON('/api/tags/collections?store='+encodeURIComponent(store)+'&q='+encodeURIComponent(q||''));if(n!==collSeq)return;const dup=new Set(d.collections.map(c=>c.title).filter((t,i,a)=>a.indexOf(t)!==i));collMap=new Map(d.collections.map(c=>[dup.has(c.title)?c.title+' ('+c.handle+')':c.title,c.id]));$('#collection-list').innerHTML=[...collMap.keys()].map(k=>'<option value="'+esc(k)+'"></option>').join('')}catch(e){$('#search-status').textContent='No se pudieron cargar las colecciones: '+e.message}}
+$('#f-collection').addEventListener('input',()=>{clearTimeout(collTimer);collTimer=setTimeout(()=>loadCollections($('#f-collection').value),250)});
+$('#store').addEventListener('change',()=>{$('#f-collection').value='';loadCollections('');renderTargets()});
 function row(p){return '<tr data-id="'+esc(p.id)+'"><td><input type="checkbox" class="pick" value="'+esc(p.id)+'" style="width:auto" aria-label="Seleccionar '+esc(p.title)+'"></td><td>'+esc(p.title)+(p.status!=='ACTIVE'?' <span class="badge">'+esc(p.status)+'</span>':'')+'</td><td>'+esc(p.skus.join(', '))+'</td><td style="white-space:normal;min-width:14rem">'+esc(p.category)+'</td><td class="tags">'+p.tags.map(t=>'<span class="badge">'+esc(t)+'</span>').join(' ')+'</td></tr>'}
 function render(){rows.innerHTML=products.map(row).join('');document.querySelectorAll('.pick').forEach(x=>x.checked=selected.has(x.value));$('#result-card').hidden=!products.length;$('#apply-card').hidden=!products.length;$('#more').hidden=!cursor;$('#count').textContent=products.length+(total!=null?' de '+total:'')+' producto(s) cargados · '+selected.size+' seleccionados'+(cursor?' · faltan por cargar':'');$('#all').checked=products.length>0&&products.every(p=>selected.has(p.id))}
-async function fetchPage(append){const q=new URLSearchParams({store:$('#store').value,sku:$('#f-sku').value,category:$('#f-category').value,tag:$('#f-tag').value,title:$('#f-title').value});if(append&&cursor)q.set('after',cursor);const d=await fetchJSON('/api/tags/search?'+q);products=append?products.concat(d.products):d.products;cursor=d.has_next?d.cursor:null;if(!append||d.total!=null)total=d.total??total;return d}
+async function fetchPage(append){const cv=$('#f-collection').value.trim(),colId=cv?(collMap.get(cv)||''):'';if(cv&&!colId)throw new Error('Elige una colección de la lista.');const q=new URLSearchParams({store:$('#store').value,sku:$('#f-sku').value,collection_id:colId,tag:$('#f-tag').value,title:$('#f-title').value});if(append&&cursor)q.set('after',cursor);const d=await fetchJSON('/api/tags/search?'+q);products=append?products.concat(d.products):d.products;cursor=d.has_next?d.cursor:null;if(!append||d.total!=null)total=d.total??total;return d}
 async function load(append,all){if(loading)return;loading=true;const b=$('#search-button'),m=$('#more');b.disabled=true;m.disabled=true;$('#search-status').textContent='Buscando…';if(!append){selected=new Set();products=[];cursor=null;total=null}try{await fetchPage(append);render();while(all&&cursor){$('#search-status').textContent='Cargando '+products.length+(total!=null?' de '+total:'')+'…';await fetchPage(true);render()}$('#search-status').textContent=products.length?'':'Sin resultados.'}catch(e){$('#search-status').textContent=e.message;render()}finally{loading=false;b.disabled=false;m.disabled=false}}
 $('#tag-search').addEventListener('submit',e=>{e.preventDefault();load(false)});$('#more').addEventListener('click',()=>load(true,true));
 rows.addEventListener('change',e=>{if(e.target.classList.contains('pick')){e.target.checked?selected.add(e.target.value):selected.delete(e.target.value);render()}});
