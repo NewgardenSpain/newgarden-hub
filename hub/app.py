@@ -342,9 +342,9 @@ def shell(title, body, active=''):
         'glossary': '<path d="M12 5v16M12 5C8 2 4 3 2 4v15c3-1 6-1 10 2 4-3 7-3 10-2V4c-3-1-6-2-10 1Z"/>',
         'stores': '<path d="M3 10v11h18V10M2 10l2-7h16l2 7M2 10h20M9 21v-7h6v7"/>',
         'stock': '<path d="M3 7h18v13H3zM3 7l3-4h12l3 4M9 12h6"/>',
-        'tags': '<path d="M3 12V3h9l9 9-9 9-9-9Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
+        'tags': '<path d="M3 12V3h9l9 9-9 9-9-9Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',        'collections': '<rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/>',
     }
-    items = [('home','/','Resumen'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
+    items = [('home','/','Resumen'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
@@ -2273,3 +2273,125 @@ const targets=[...document.querySelectorAll('.target:checked')].map(x=>x.value),
 const b=$('#apply-button');b.disabled=true;st.textContent='Aplicando en '+(1+targets.length)+' tienda(s)…';try{const d=await fetchJSON('/api/tags/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({store:$('#store').value,product_ids:ids,add,remove,stores:targets,skus})});for(const r of d.stores[0].results)if(r.ok&&r.tags){const p=products.find(x=>x.id===r.id);if(p)p.tags=r.tags}render();st.innerHTML=d.stores.map(r=>{const bad=r.results.filter(i=>!i.ok);return '<strong>'+esc(r.store)+'</strong>: '+(r.error?esc(r.error):(r.results.length-bad.length)+' actualizados'+(bad.length?', '+bad.length+' con error ('+esc(bad.slice(0,2).map(i=>i.error).join('; '))+')':'')+(r.missing.length?', sin encontrar '+r.missing.length+' SKU ('+esc(r.missing.slice(0,5).join(', '))+(r.missing.length>5?'…':'')+')':''))}).join('<br>')}catch(err){st.textContent=err.message}finally{b.disabled=false}});
 </script>'''
     return shell('Etiquetado masivo',body,'tags')
+
+
+# ---- Traducción de colecciones ya existentes (origen y destino preexisten) ----
+COLLECTION_FIELDS={'title':'Título','descriptionHtml':'Descripción','seo.title':'Título SEO','seo.description':'Descripción SEO','handle':'URL (handle)'}
+COLLECTION_DEFAULT_FIELDS=['title','descriptionHtml','seo.title','seo.description']
+COLLECTION_TRANSLATION_KEY={'title':'title','descriptionHtml':'body_html','seo.title':'meta_title','seo.description':'meta_description','handle':'handle'}
+COLLECTION_QUERY='''query CollectionForTranslation($id:ID!) { collection(id:$id) { id title handle descriptionHtml seo { title description } } }'''
+
+class CollectionTranslate(BaseModel):
+    source_store:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
+    source_collection_id:str=Field(pattern=r'^\d{1,20}$')
+    target_store:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
+    target_collection_id:str=Field(pattern=r'^\d{1,20}$')
+    target_locale:str|None=Field(default=None,min_length=2,max_length=20)
+    fields:list[str]=Field(default_factory=lambda:list(COLLECTION_DEFAULT_FIELDS),min_length=1,max_length=10)
+
+    @field_validator('fields')
+    @classmethod
+    def check_fields(cls,value):
+        bad=[f for f in value if f not in COLLECTION_FIELDS]
+        if bad: raise ValueError('Campo no válido: '+', '.join(bad))
+        return list(dict.fromkeys(value))
+
+def collection_value(collection:dict,key:str)->str:
+    if key.startswith('seo.'): return (collection.get('seo') or {}).get(key[4:]) or ''
+    return collection.get(key) or ''
+
+def load_collection(store:dict,numeric_id:str)->dict:
+    c=shopify_graphql(store['domain'],store['token'],COLLECTION_QUERY,{'id':f'gid://shopify/Collection/{numeric_id}'}).get('collection')
+    if not c: raise HTTPException(404,f'Colección {numeric_id} no encontrada en {store["code"]}')
+    return c
+
+@app.get('/api/collections/search')
+def collections_search(store:str,q:str=''):
+    return tags_collections(store,q)
+
+@app.post('/api/collections/translate')
+def collections_translate(x:CollectionTranslate,user=Depends(operator)):
+    """Traduce una colección de la tienda origen y sustituye el contenido de otra colección ya existente en la tienda
+    destino. Solo se tocan los campos de texto elegidos: reglas, productos, orden, imagen y demás ajustes se conservan."""
+    if x.source_store==x.target_store: raise HTTPException(400,'La tienda origen y la destino deben ser distintas')
+    source=shopify_store_by_code(x.source_store); target=shopify_store_by_code(x.target_store)
+    for st,code in ((source,x.source_store),(target,x.target_store)):
+        if not st or not st['domain'] or not st['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales: '+code)
+    source_locales=shopify_shop_locales(source); target_locales=shopify_shop_locales(target)
+    source_locale=next((l['locale'] for l in source_locales if l.get('primary')),None)
+    if not source_locale: raise HTTPException(502,'No se pudo determinar el idioma base de la tienda origen')
+    locale_info=(next((l for l in target_locales if l.get('locale','').casefold()==x.target_locale.casefold()),None) if x.target_locale
+                 else next((l for l in target_locales if l.get('primary')),None))
+    if not locale_info: raise HTTPException(400,'El idioma destino no está habilitado en '+x.target_store)
+    target_locale=locale_info['locale']
+    if not target_profile(x.target_store,target_locale): raise HTTPException(400,f'{x.target_store} · {target_locale} no tiene un perfil de traducción activo')
+    src=load_collection(source,x.source_collection_id); dst=load_collection(target,x.target_collection_id)
+    translated={}; skipped=[]
+    for key in x.fields:
+        text=collection_value(src,key).strip()
+        if not text: skipped.append(key); continue
+        req=CellTranslateRequest(source_text=text,source_store=x.source_store,source_locale=source_locale,target_store=x.target_store,target_locale=target_locale,
+            field_key={'title':'title','descriptionHtml':'body_html','seo.title':'seo_title','seo.description':'seo_description','handle':'handle'}[key],html=key=='descriptionHtml')
+        translated[key]=translate_cell(req,user)['translation']
+    if not translated: raise HTTPException(400,'La colección origen no tiene contenido en los campos elegidos')
+    gid=dst['id']
+    if locale_info.get('primary'):
+        collection={'id':gid}
+        for key,value in translated.items():
+            if not key.startswith('seo.'): collection[key]=value
+        if any(k.startswith('seo.') for k in translated):
+            # CollectionInput.seo reemplaza el objeto entero: se reenvía el campo hermano.
+            seo={k:v for k,v in (dst.get('seo') or {}).items() if v is not None}
+            seo.update({k[4:]:v for k,v in translated.items() if k.startswith('seo.')})
+            collection['seo']=seo
+        if 'handle' in translated: collection['redirectNewHandle']=True
+        mutation='''mutation UpdateCollection($input:CollectionInput!) { collectionUpdate(input:$input) { userErrors { field message } } }'''
+        result=shopify_graphql(target['domain'],target['token'],mutation,{'input':collection}).get('collectionUpdate') or {}
+        mode='base'
+    else:
+        res=shopify_graphql(target['domain'],target['token'],'query($id:ID!){translatableResource(resourceId:$id){translatableContent{key digest}}}',{'id':gid}).get('translatableResource') or {}
+        digests={i['key']:i['digest'] for i in res.get('translatableContent',[])}
+        items=[]
+        for key,value in translated.items():
+            tk=COLLECTION_TRANSLATION_KEY[key]
+            if tk not in digests: raise HTTPException(409,f'Shopify no ofrece un digest traducible para «{COLLECTION_FIELDS[key]}» en la colección destino')
+            items.append({'locale':target_locale,'key':tk,'value':value,'translatableContentDigest':digests[tk]})
+        mutation='''mutation RegisterTranslation($id:ID!,$translations:[TranslationInput!]!) { translationsRegister(resourceId:$id,translations:$translations) { userErrors { field message } } }'''
+        result=shopify_graphql(target['domain'],target['token'],mutation,{'id':gid,'translations':items}).get('translationsRegister') or {}
+        mode='translation'
+    errors=result.get('userErrors',[])
+    if errors: raise HTTPException(400,'Shopify: '+'; '.join(e.get('message','error') for e in errors)[:500])
+    logging.getLogger('hub.collections').info('Colección %s/%s -> %s/%s (%s, %s): %s',x.source_store,x.source_collection_id,x.target_store,x.target_collection_id,target_locale,mode,list(translated))
+    return {'saved':True,'mode':mode,'target_locale':target_locale,'source_title':src['title'],'target_title_before':dst['title'],
+        'fields':[{'key':k,'label':COLLECTION_FIELDS[k],'before':collection_value(dst,k),'source':collection_value(src,k),'after':v} for k,v in translated.items()],
+        'skipped':[COLLECTION_FIELDS[k] for k in skipped]}
+
+@app.get('/collections',response_class=HTMLResponse)
+def collections_page():
+    body='''<main class="wrap"><h1>Traducir colecciones</h1><p class="lede">Elige una colección de una tienda y la colección equivalente de otra tienda (las dos ya deben existir). El contenido de texto de la segunda se sustituye por la traducción de la primera; reglas, productos, orden e imágenes de la colección destino no se tocan. Los cambios se escriben directamente en Shopify.</p>
+<section class="card"><form id="coll-form" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(18rem,1fr))">
+<fieldset class="field"><legend>Origen</legend><label for="s-store">Tienda</label><select id="s-store"></select><label for="s-coll" style="margin-top:.5rem">Colección</label><input id="s-coll" list="s-list" autocomplete="off" placeholder="Escribe para buscar…"><datalist id="s-list"></datalist></fieldset>
+<fieldset class="field"><legend>Destino (se sobrescribe)</legend><label for="t-store">Tienda</label><select id="t-store"></select><label for="t-coll" style="margin-top:.5rem">Colección equivalente</label><input id="t-coll" list="t-list" autocomplete="off" placeholder="Escribe para buscar…"><datalist id="t-list"></datalist><label for="t-locale" style="margin-top:.5rem">Idioma destino</label><select id="t-locale"></select></fieldset>
+<fieldset class="field"><legend>Campos a traducir</legend><div id="fields" style="display:flex;flex-direction:column;gap:.35rem"></div></fieldset>
+<div class="field"><label>&nbsp;</label><button class="button primary" id="go">Traducir y sustituir</button></div></form><p class="muted" id="status" role="status" aria-live="polite"></p></section>
+<section class="card" id="result" hidden></section></main>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Error al procesar la solicitud');return data}
+const $=s=>document.querySelector(s);
+const FIELDS=[['title','Título',1],['descriptionHtml','Descripción',1],['seo.title','Título SEO',1],['seo.description','Descripción SEO',1],['handle','URL (handle): cambia la dirección de la colección',0]];
+$('#fields').innerHTML=FIELDS.map(f=>'<label style="display:inline-flex;gap:.4rem;align-items:center"><input type="checkbox" class="fld" value="'+f[0]+'" style="width:auto"'+(f[2]?' checked':'')+'> '+esc(f[1])+'</label>').join('');
+const sides={s:{map:new Map(),seq:0,timer:null},t:{map:new Map(),seq:0,timer:null}};
+async function loadColl(k,q){const side=sides[k],n=++side.seq,store=$('#'+k+'-store').value;if(!store)return;try{const d=await fetchJSON('/api/collections/search?store='+encodeURIComponent(store)+'&q='+encodeURIComponent(q||''));if(n!==side.seq)return;const dup=new Set(d.collections.map(c=>c.title).filter((t,i,a)=>a.indexOf(t)!==i));side.map=new Map(d.collections.map(c=>[dup.has(c.title)?c.title+' ('+c.handle+')':c.title,c.id]));$('#'+k+'-list').innerHTML=[...side.map.keys()].map(v=>'<option value="'+esc(v)+'"></option>').join('')}catch(e){$('#status').textContent='No se pudieron cargar las colecciones: '+e.message}}
+for(const k of['s','t']){$('#'+k+'-coll').addEventListener('input',()=>{clearTimeout(sides[k].timer);sides[k].timer=setTimeout(()=>loadColl(k,$('#'+k+'-coll').value),250)});$('#'+k+'-store').addEventListener('change',()=>{$('#'+k+'-coll').value='';loadColl(k,'');if(k==='t')loadLocales()})}
+async function loadLocales(){const st=$('#t-store').value;if(!st)return;try{const d=await fetchJSON('/api/stores/'+encodeURIComponent(st)+'/shop-locales');$('#t-locale').innerHTML=d.map(l=>'<option value="'+esc(l.locale)+'">'+esc(l.name||l.locale)+' ('+esc(l.locale)+')'+(l.primary?' · principal':'')+'</option>').join('')}catch(e){$('#t-locale').innerHTML='';$('#status').textContent=e.message}}
+fetchJSON('/api/stores').then(d=>{const s=(Array.isArray(d)?d:(d.stores||[])).filter(x=>x.active&&x.has_token),o=s.map(x=>'<option value="'+esc(x.code)+'">'+esc(x.code)+'</option>').join('');$('#s-store').innerHTML=o;$('#t-store').innerHTML=o;if(s.length>1)$('#t-store').selectedIndex=1;loadColl('s','');loadColl('t','');loadLocales()}).catch(e=>$('#status').textContent=e.message);
+$('#coll-form').addEventListener('submit',async e=>{e.preventDefault();const st=$('#status'),res=$('#result'),sid=sides.s.map.get($('#s-coll').value.trim()),tid=sides.t.map.get($('#t-coll').value.trim()),fields=[...document.querySelectorAll('.fld:checked')].map(x=>x.value);
+if(!sid||!tid){st.textContent='Elige las dos colecciones de las listas.';return}if(!fields.length){st.textContent='Elige al menos un campo.';return}if($('#s-store').value===$('#t-store').value){st.textContent='Origen y destino deben ser tiendas distintas.';return}
+const b=$('#go');b.disabled=true;res.hidden=true;st.textContent='Traduciendo y escribiendo en Shopify…';
+try{const d=await fetchJSON('/api/collections/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_store:$('#s-store').value,source_collection_id:sid,target_store:$('#t-store').value,target_collection_id:tid,target_locale:$('#t-locale').value||null,fields})});
+st.textContent='Hecho: «'+d.target_title_before+'» ('+$('#t-store').value+', '+d.target_locale+') actualizada desde «'+d.source_title+'»'+(d.skipped.length?'. Sin contenido en origen: '+d.skipped.join(', '):'')+'.';
+res.innerHTML='<div class="table-wrap"><table><thead><tr><th>Campo</th><th>Antes (destino)</th><th>Origen</th><th>Ahora (destino)</th></tr></thead><tbody>'+d.fields.map(f=>'<tr><td>'+esc(f.label)+'</td><td style="white-space:normal;max-width:22rem">'+esc(f.before)+'</td><td style="white-space:normal;max-width:22rem">'+esc(f.source)+'</td><td style="white-space:normal;max-width:22rem">'+esc(f.after)+'</td></tr>').join('')+'</tbody></table></div>';res.hidden=false}
+catch(err){st.textContent=err.message}finally{b.disabled=false}});
+</script>'''
+    return shell('Traducir colecciones',body,'collections')
