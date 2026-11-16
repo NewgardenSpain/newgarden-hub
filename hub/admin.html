@@ -82,6 +82,7 @@
     <button type="button" class="button secondary" id="v-load">Recargar</button>
   </div>
   <p id="v-status" class="muted" role="status" aria-live="polite"></p>
+  <div class="callout" id="v-locale-note" hidden></div>
   <div id="v-main" hidden>
     <div class="step">
       <div class="step-head"><h2>Valores actuales</h2></div>
@@ -104,7 +105,7 @@
   </div>
   <div class="actionbar" id="v-bar" hidden>
     <div class="field grow"><label for="v-new">Nuevo valor</label><input id="v-new" autocomplete="off" placeholder="Texto libre, por ejemplo 3-5 días"></div>
-    <label class="adm-check"><input type="checkbox" id="v-clear"> Vaciar el valor</label>
+    <label class="adm-check"><input type="checkbox" id="v-clear"> <span id="v-clear-label">Vaciar el valor</span></label>
     <button type="button" class="button primary" id="v-apply" disabled>Aplicar</button>
     <span id="v-summary-line" class="muted grow" role="status" aria-live="polite"></span>
   </div>

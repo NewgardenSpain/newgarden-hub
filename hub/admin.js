@@ -269,14 +269,36 @@ async function openCollection(id) {
 }
 
 /* ---------- VALORES DE UN METACAMPO ---------- */
-const V = { store: null, rows: [], byId: new Map(), byProduct: new Map(), group: false, expanded: new Set(), total: 0, definition: null, loaded: false, busy: false, seq: 0, filterValue: null, recent: null, last: null, q: '', collIds: null, collName: '', collMap: {}, sel: new Set(), limit: 200 };
+const V = { store: null, locale: null, locales: {}, rows: [], byId: new Map(), byProduct: new Map(), bySku: new Map(), group: false, expanded: new Set(), total: 0, definition: null, loaded: false, busy: false, seq: 0, filterValue: null, recent: null, last: null, q: '', collIds: null, collName: '', collMap: {}, sel: new Set(), limit: 200 };
 const vMf = () => { const raw = $('#v-mf').value.trim(), i = raw.indexOf('.'); return i > 0 && i < raw.length - 1 ? { ns: raw.slice(0, i), key: raw.slice(i + 1) } : null; };
 const vShow = v => v === '' ? '(vacío)' : v;
+const skuKey = r => (r && r.sku ? r.sku.trim().toLowerCase() : '');
+const canSel = r => !!r && !r.nobase;
+// Si un SKU está repetido, seleccionar (o quitar) una variante afecta a todas las que lo comparten.
+function selAdd(id) { const r = V.byId.get(id); if (!canSel(r)) return; V.sel.add(id); const k = skuKey(r); if (k) (V.bySku.get(k) || []).forEach(s => { if (canSel(s)) V.sel.add(s.id); }); }
+function selDel(id) { const r = V.byId.get(id); V.sel.delete(id); const k = skuKey(r); if (k) (V.bySku.get(k) || []).forEach(s => V.sel.delete(s.id)); }
+const withSiblings = ids => { const out = new Set(); ids.forEach(id => { const r = V.byId.get(id); if (!canSel(r)) return; out.add(id); const k = skuKey(r); if (k) (V.bySku.get(k) || []).forEach(s => { if (canSel(s)) out.add(s.id); }); }); return out; };
+const dupOthers = r => { const k = skuKey(r); return k ? (V.bySku.get(k) || []).filter(s => s.id !== r.id) : []; };
+const dupTitle = sibs => sibs.map(s => `${s.product} (${STATUS_ES[s.product_status] || s.product_status || '?'})`).join(' · ');
+const dupTag = r => { const o = dupOthers(r); return o.length ? tag('SKU repetido ×' + (o.length + 1), 'warn', 'También en: ' + dupTitle(o)) : ''; };
+const skuCell = r => { const o = dupOthers(r); return esc(r.sku) + (o.length ? `<br>${dupTag(r)}<small>También en: ${esc(dupTitle(o.slice(0, 2)))}${o.length > 2 ? ' …' : ''}</small>` : ''); };
+const productCell = r => esc(r.product) + (r.product_status && r.product_status !== 'ACTIVE' ? ' ' + statusTag(r.product_status) : '') + `<small>${esc(r.title)}</small>`;
+const valueCell = r => (r.nobase ? '<span class="muted">(sin valor base)</span>' : (r.value === '' ? '<span class="muted">(vacío)</span>' : esc(r.value)) + (r.outdated ? ' ' + tag('desactualizada', 'warn', 'La traducción es anterior al último cambio del valor base') : '')) + (V.locale && !r.nobase ? `<small>Base: ${esc(r.base || '')}</small>` : '');
+const vSpaces = v => v !== v.trim() ? 'espacio al inicio o al final' : /\u00a0|\s{2,}/.test(v) ? 'espacios dobles o raros' : '';
 
+const LANG_ES = { nl: 'Holandés', pt: 'Portugués' };
+function renderValueChips() {
+  const items = [];
+  state.stores.forEach(s => {
+    items.push({ store: s.code, locale: null, label: s.code, title: s.domain });
+    (V.locales[s.code] || []).forEach(l => items.push({ store: s.code, locale: l.locale, label: `${s.code} · ${LANG_ES[l.locale.split('-')[0]] || l.name}`, title: `Traducción ${l.locale} del metacampo en ${s.code}` }));
+  });
+  $('#v-stores').innerHTML = items.map(c => `<label class="chip"><input type="radio" name="vstore" value="${esc(c.store + '|' + (c.locale || ''))}"${c.store === V.store && (c.locale || null) === V.locale ? ' checked' : ''}><span title="${esc(c.title)}">${esc(c.label)}</span></label>`).join('');
+  $$('#v-stores input').forEach(i => i.onchange = () => { const [s, l] = i.value.split('|'); V.store = s; V.locale = l || null; clearColl(); loadValues(); });
+}
 function initValues() {
-  V.store = state.store;
-  $('#v-stores').innerHTML = state.stores.map(s => `<label class="chip"><input type="radio" name="vstore" value="${esc(s.code)}"${s.code === V.store ? ' checked' : ''}><span title="${esc(s.domain)}">${esc(s.code)}</span></label>`).join('');
-  $$('#v-stores input').forEach(i => i.onchange = () => { V.store = i.value; clearColl(); loadValues(); });
+  V.store = state.store; V.locale = null; renderValueChips();
+  api('/api/admin/translation-locales').then(d => { V.locales = d.locales || {}; renderValueChips(); }).catch(() => {});
   $('#v-load').onclick = loadValues;
   $('#v-mf').addEventListener('change', loadValues);
   let qt; $('#v-q').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(() => { V.q = norm($('#v-q').value.trim()); V.recent = null; V.limit = 200; renderValues(); }, 200); });
@@ -292,7 +314,7 @@ function initValues() {
     try { const d = await api(`/api/admin/collection/product-ids?store=${enc(V.store)}&id=${enc(id)}`); V.collIds = new Set(d.ids); V.collName = name; V.recent = null; V.limit = 200; renderValues(); }
     catch (err) { $('#v-count').textContent = err.message; }
   });
-  $('#v-sel-all').onclick = () => { vMatchingIds().forEach(id => V.sel.add(id)); updateSelection(); };
+  $('#v-sel-all').onclick = () => { vMatchingIds().forEach(selAdd); updateSelection(); };
   $$('[data-vview]').forEach(b => b.onclick = () => { V.group = b.dataset.vview === 'group'; $$('[data-vview]').forEach(x => x.setAttribute('aria-pressed', x === b)); V.limit = 200; renderValues(); });
   $('#v-table').addEventListener('click', e => { const t = e.target.closest('[data-toggle]'); if (!t) return; const id = t.dataset.toggle; V.expanded.has(id) ? V.expanded.delete(id) : V.expanded.add(id); renderValues(); });
   $('#v-sel-none').onclick = () => { V.sel.clear(); updateSelection(); };
@@ -303,7 +325,7 @@ function initValues() {
   $('#v-summary').addEventListener('click', e => {
     const f = e.target.closest('[data-vfilter]'), r = e.target.closest('[data-vreplace]');
     if (f) { V.recent = null; V.filterValue = V.filterValue === f.dataset.vfilter ? null : f.dataset.vfilter; V.limit = 200; renderValues(); }
-    if (r) { V.recent = null; V.filterValue = r.dataset.vreplace; V.limit = 200; V.sel = new Set(vFiltered().map(x => x.id)); renderValues(); $('#v-new').focus(); }
+    if (r) { V.recent = null; V.filterValue = r.dataset.vreplace; V.limit = 200; V.sel.clear(); vFiltered().forEach(x => selAdd(x.id)); renderValues(); $('#v-new').focus(); }
   });
   $('#v-filters').addEventListener('click', e => {
     const b = e.target.closest('[data-clear]'); if (!b) return;
@@ -312,10 +334,10 @@ function initValues() {
   });
   $('#v-table').addEventListener('change', e => {
     const one = e.target.closest('[data-vid]');
-    if (one) { one.checked ? V.sel.add(one.dataset.vid) : V.sel.delete(one.dataset.vid); updateSelection(); return; }
+    if (one) { one.checked ? selAdd(one.dataset.vid) : selDel(one.dataset.vid); updateSelection(); return; }
     const prod = e.target.closest('[data-pid]');
-    if (prod) { (V.byProduct.get(prod.dataset.pid) || []).forEach(r => prod.checked ? V.sel.add(r.id) : V.sel.delete(r.id)); updateSelection(); return; }
-    if (e.target.id === 'v-all') { vShownIds().forEach(id => e.target.checked ? V.sel.add(id) : V.sel.delete(id)); updateSelection(); }
+    if (prod) { (V.byProduct.get(prod.dataset.pid) || []).forEach(r => prod.checked ? selAdd(r.id) : selDel(r.id)); updateSelection(); return; }
+    if (e.target.id === 'v-all') { vShownIds().forEach(id => e.target.checked ? selAdd(id) : selDel(id)); updateSelection(); }
   });
   loadDefs().then(d => {
     $('#v-mf-list').innerHTML = d.rows.filter(r => r.owner === 'PRODUCTVARIANT' && !((Object.values(r.stores).find(Boolean) || {}).type || '').includes('reference')).map(r => `<option value="${esc(r.namespace + '.' + r.key)}" label="${esc(r.name || '')}">`).join('');
@@ -329,20 +351,25 @@ async function loadValues() {
   if (!V.store) { st.textContent = 'No hay tiendas disponibles.'; return; }
   if (!mf) { st.textContent = 'Escribe el metacampo como namespace.clave (por ejemplo custom.tiempo_de_entrega).'; return; }
   const seq = ++V.seq;
-  Object.assign(V, { rows: [], byId: new Map(), byProduct: new Map(), expanded: new Set(), filterValue: null, recent: null, last: null, loaded: false, limit: 200 }); V.sel.clear();
+  Object.assign(V, { rows: [], byId: new Map(), byProduct: new Map(), bySku: new Map(), expanded: new Set(), filterValue: null, recent: null, last: null, loaded: false, limit: 200 }); V.sel.clear();
   $('#v-main').hidden = true; $('#v-bar').hidden = true; $('#v-result').innerHTML = '';
+  const lname = V.locale ? (LANG_ES[V.locale.split('-')[0]] || V.locale) : '';
+  $('#v-locale-note').hidden = !V.locale;
+  if (V.locale) $('#v-locale-note').innerHTML = `Estás viendo y editando la <strong>traducción al ${esc(lname.toLowerCase())} (${esc(V.locale)})</strong> del metacampo, no su valor base. Las variantes sin valor base no se pueden traducir. Si cambias el valor base, la traducción queda «desactualizada» hasta que la vuelvas a escribir.`;
+  $('#v-clear-label').textContent = V.locale ? 'Quitar la traducción' : 'Vaciar el valor';
+  $('#v-new').placeholder = V.locale ? `Texto libre en ${lname.toLowerCase()}, por ejemplo 3/5 dagen` : 'Texto libre, por ejemplo 3-5 días';
   let after = null, first = true;
   try {
     do {
-      const d = await api(`/api/admin/values/page?store=${enc(V.store)}&namespace=${enc(mf.ns)}&key=${enc(mf.key)}${after ? '&after=' + enc(after) : ''}`);
+      const d = await api(`/api/admin/values/page?store=${enc(V.store)}&namespace=${enc(mf.ns)}&key=${enc(mf.key)}${V.locale ? '&locale=' + enc(V.locale) : ''}${after ? '&after=' + enc(after) : ''}`);
       if (seq !== V.seq) return;
       if (first) { V.total = d.total || 0; V.definition = d.definition; first = false; }
-      d.variants.forEach(v => { V.rows.push(v); V.byId.set(v.id, v); (V.byProduct.get(v.product_id) || V.byProduct.set(v.product_id, []).get(v.product_id)).push(v); });
+      d.variants.forEach(v => { V.rows.push(v); V.byId.set(v.id, v); (V.byProduct.get(v.product_id) || V.byProduct.set(v.product_id, []).get(v.product_id)).push(v); const k = skuKey(v); if (k) (V.bySku.get(k) || V.bySku.set(k, []).get(k)).push(v); });
       st.textContent = `Cargando variantes… ${V.rows.length}${V.total ? ' de ' + V.total : ''}`;
       after = d.has_next ? d.cursor : null;
     } while (after);
     V.loaded = true;
-    st.textContent = `${V.rows.length} variantes en ${V.store}.` + (V.definition ? '' : ` El metacampo ${mf.ns}.${mf.key} no existe en ${V.store}: solo puedes consultarlo.`);
+    st.textContent = `${V.rows.length} variantes en ${V.store}${V.locale ? ' (traducción ' + V.locale + ')' : ''}.` + (V.definition ? '' : ` El metacampo ${mf.ns}.${mf.key} no existe en ${V.store}: solo puedes consultarlo.`);
     $('#v-main').hidden = false; renderValues();
   } catch (err) { if (seq === V.seq) st.textContent = err.message; }
 }
@@ -359,22 +386,22 @@ function productRows(vs) {
   const pid = vs[0].product_id, open = V.expanded.has(pid), counts = new Map();
   vs.forEach(v => counts.set(v.value, (counts.get(v.value) || 0) + 1));
   const sum = [...counts].map(([v, c]) => `${v === '' ? '<em>(vacío)</em>' : esc(v)} <span class="muted">(${c})</span>`).join(', ');
-  let h = `<tr data-prod="${esc(pid)}"><td class="chk"><input type="checkbox" data-pid="${esc(pid)}" aria-label="Seleccionar todas las variantes de ${esc(vs[0].product)}"></td><td class="wrap-cell"><button type="button" class="row-link" data-toggle="${esc(pid)}" aria-expanded="${open}">${open ? '▾' : '▸'} ${esc(vs[0].product)}</button><small>${vs.length} ${vs.length === 1 ? 'variante' : 'variantes'}</small></td><td class="wrap-cell">${sum}</td><td class="wrap-cell after"></td></tr>`;
-  if (open) h += vs.map(r => `<tr class="subrow" data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}" aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="wrap-cell"><small>${esc(r.sku)} · ${esc(r.title)}</small></td><td class="wrap-cell">${r.value === '' ? '<span class="muted">(vacío)</span>' : esc(r.value)}</td><td class="wrap-cell after"></td></tr>`).join('');
+  let h = `<tr data-prod="${esc(pid)}"><td class="chk"><input type="checkbox" data-pid="${esc(pid)}" aria-label="Seleccionar todas las variantes de ${esc(vs[0].product)}"></td><td class="wrap-cell"><button type="button" class="row-link" data-toggle="${esc(pid)}" aria-expanded="${open}">${open ? '▾' : '▸'} ${esc(vs[0].product)}</button>${vs[0].product_status && vs[0].product_status !== 'ACTIVE' ? ' ' + statusTag(vs[0].product_status) : ''}${vs.some(v => dupOthers(v).length) ? ' ' + tag('SKU repetido en otros productos', 'warn') : ''}<small>${vs.length} ${vs.length === 1 ? 'variante' : 'variantes'}</small></td><td class="wrap-cell">${sum}</td><td class="wrap-cell after"></td></tr>`;
+  if (open) h += vs.map(r => `<tr class="subrow" data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}"${r.nobase ? ' disabled' : ''} aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="wrap-cell"><small>${esc(r.sku)} · ${esc(r.title)}</small>${dupTag(r)}</td><td class="wrap-cell">${valueCell(r)}</td><td class="wrap-cell after"></td></tr>`).join('');
   return h;
 }
 
 function renderValues() {
   const counts = new Map(); V.rows.forEach(r => counts.set(r.value, (counts.get(r.value) || 0) + 1));
   const list = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  $('#v-summary').innerHTML = table(['Valor', 'Variantes', ''], list.map(([v, n]) => `<tr${V.filterValue === v ? ' class="vrow-sel"' : ''}><td class="wrap-cell">${v === '' ? '<em>(vacío)</em>' : esc(v)}</td><td class="nw">${n}</td><td class="nw"><button type="button" class="button secondary" data-vfilter="${esc(v)}" aria-pressed="${V.filterValue === v}">${V.filterValue === v ? 'Quitar filtro' : 'Ver'}</button> ${V.definition ? `<button type="button" class="button secondary" data-vreplace="${esc(v)}">Reemplazar…</button>` : ''}</td></tr>`).join(''));
+  $('#v-summary').innerHTML = table(['Valor', 'Variantes', ''], list.map(([v, n]) => `<tr${V.filterValue === v ? ' class="vrow-sel"' : ''}><td class="wrap-cell">${v === '' ? '<em>(vacío)</em>' : esc(v)}${vSpaces(v) ? ' ' + tag(vSpaces(v), 'warn') : ''}</td><td class="nw">${n}</td><td class="nw"><button type="button" class="button secondary" data-vfilter="${esc(v)}" aria-pressed="${V.filterValue === v}">${V.filterValue === v ? 'Quitar filtro' : 'Ver'}</button> ${V.definition ? `<button type="button" class="button secondary" data-vreplace="${esc(v)}">Reemplazar…</button>` : ''}</td></tr>`).join(''));
   $('#v-filters').innerHTML = (V.filterValue !== null ? `<span class="vchip">Valor: «${esc(vShow(V.filterValue))}» <button type="button" class="button secondary" data-clear="value" aria-label="Quitar filtro de valor">✕</button></span>` : '') + (V.recent ? `<span class="vchip">Cambiadas ahora: ${V.recent.size} <button type="button" class="button secondary" data-clear="recent" aria-label="Quitar filtro de cambiadas">✕</button></span>` : '') + (V.collIds ? `<span class="vchip">Colección: ${esc(V.collName)} <button type="button" class="button secondary" data-clear="coll" aria-label="Quitar filtro de colección">✕</button></span>` : '');
   $('#v-sel-all').textContent = V.group ? 'Seleccionar los productos que coinciden' : 'Seleccionar las que coinciden';
   $('#v-view-hint').textContent = V.group ? 'Marcar un producto selecciona todas sus variantes, tengan el valor que tengan.' : '';
   const f = vFiltered(); let more = false;
   if (!f.length) $('#v-table').innerHTML = '<p class="muted">Ninguna variante coincide con los filtros.</p>';
   else if (!V.group) {
-    $('#v-table').innerHTML = table(['<input type="checkbox" id="v-all" aria-label="Seleccionar las variantes mostradas">', 'SKU', 'Producto', 'Valor actual', 'Después'], f.slice(0, V.limit).map(r => `<tr data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}" aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="nw">${esc(r.sku)}</td><td class="wrap-cell">${esc(r.product)}<small>${esc(r.title)}</small></td><td class="wrap-cell">${r.value === '' ? '<span class="muted">(vacío)</span>' : esc(r.value)}</td><td class="wrap-cell after"></td></tr>`).join(''));
+    $('#v-table').innerHTML = table(['<input type="checkbox" id="v-all" aria-label="Seleccionar las variantes mostradas">', 'SKU', 'Producto', 'Valor actual', 'Después'], f.slice(0, V.limit).map(r => `<tr data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}"${r.nobase ? ' disabled' : ''} aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="wrap-cell">${skuCell(r)}</td><td class="wrap-cell">${productCell(r)}</td><td class="wrap-cell">${valueCell(r)}</td><td class="wrap-cell after"></td></tr>`).join(''));
     more = f.length > V.limit;
   } else {
     const prods = vProducts();
@@ -418,7 +445,7 @@ async function runPlan(plan, label) {
     for (let i = 0; i < g.ids.length; i += 100) {
       const chunk = g.ids.slice(i, i + 100); st.textContent = `${label}… ${done} de ${total}`; done += chunk.length;
       try {
-        const r = await post('/api/admin/values/apply', { store: V.store, namespace: mf.ns, key: mf.key, value: g.value, clear: g.clear, ids: chunk, operation_id: op });
+        const r = await post('/api/admin/values/apply', { store: V.store, namespace: mf.ns, key: mf.key, value: g.value, clear: g.clear, exact: !!g.exact, locale: V.locale, ids: chunk, operation_id: op });
         op = r.operation_id; applied += r.applied; skipped += r.skipped; r.failed.forEach(f => failed.push(f));
         const bad = new Set(r.failed.map(f => f.id));
         chunk.forEach(id => { if (!bad.has(id)) { const row = V.byId.get(id); if (row) row.value = g.clear ? '' : g.value; okIds.push(id); } });
@@ -434,7 +461,7 @@ function showResult(res, title, undoable) {
 }
 async function applyValues() {
   const mf = vMf(), clear = $('#v-clear').checked, nv = clear ? '' : $('#v-new').value.trim();
-  const ids = [...V.sel].filter(id => V.byId.get(id) && V.byId.get(id).value !== nv);
+  const ids = [...withSiblings(V.sel)].filter(id => V.byId.get(id).value !== nv);
   if (!mf || (!nv && !clear) || !ids.length) return;
   const before = new Map(ids.map(id => [id, V.byId.get(id).value]));
   V.busy = true; updateSelection(); $('#v-result').innerHTML = '';
@@ -449,7 +476,7 @@ async function applyValues() {
 async function undoLast() {
   if (!V.last || !V.last.items.length || V.busy) return;
   const groups = new Map(); V.last.items.forEach(i => { if (V.byId.get(i.id)) (groups.get(i.before) || groups.set(i.before, []).get(i.before)).push(i.id); });
-  const plan = [...groups].map(([value, ids]) => ({ value, clear: value === '', ids }));
+  const plan = [...groups].map(([value, ids]) => ({ value, clear: value === '', exact: true, ids }));
   V.busy = true; updateSelection(); $('#v-result').innerHTML = '';
   const res = await runPlan(plan, 'Deshaciendo');
   V.busy = false; shown.historial = false; V.last = null;

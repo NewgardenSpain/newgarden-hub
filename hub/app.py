@@ -3011,16 +3011,44 @@ _MF_NS=re.compile(r'^[A-Za-z0-9_-]{2,255}$'); _MF_KEY=re.compile(r'^[A-Za-z0-9_-
 def _mf_ref(namespace,key):
     if not _MF_NS.fullmatch(namespace or '') or not _MF_KEY.fullmatch(key or ''): raise HTTPException(400,'Metacampo no válido')
 
-VALUES_PAGE_QUERY='query($after:String,$ns:String!,$key:String!){ productVariantsCount{count} productVariants(first:250,after:$after){ nodes{ id sku title product{id title} metafield(namespace:$ns,key:$key){value} } pageInfo{hasNextPage endCursor} } }'
+VALUES_PAGE_QUERY='query($after:String,$ns:String!,$key:String!){ productVariantsCount{count} productVariants(first:250,after:$after){ nodes{ id sku title product{id title status} metafield(namespace:$ns,key:$key){value} } pageInfo{hasNextPage endCursor} } }'
+# Con idioma: se devuelve también la traducción del metacampo en ese idioma (y si está desactualizada).
+VALUES_PAGE_QUERY_T='query($after:String,$ns:String!,$key:String!,$loc:String!){ productVariantsCount{count} productVariants(first:250,after:$after){ nodes{ id sku title product{id title status} metafield(namespace:$ns,key:$key){ id value translations(locale:$loc){ key value outdated } } } pageInfo{hasNextPage endCursor} } }'
+
+_LOCALES_CACHE={}
+def admin_store_locales(st):
+    """Idiomas activos de una tienda (en caché 10 minutos)."""
+    cached=_LOCALES_CACHE.get(st['code'])
+    if cached and time.time()-cached[0]<600: return cached[1]
+    locales=shopify_shop_locales(st); _LOCALES_CACHE[st['code']]=(time.time(),locales); return locales
+
+def admin_translation_locale(st,locale):
+    for l in admin_store_locales(st):
+        if l['locale']==locale and not l.get('primary'): return l['locale']
+    raise HTTPException(400,f'El idioma {locale} no está activo como traducción en {st["code"]}')
+
+@app.get('/api/admin/translation-locales')
+def admin_translation_locales():
+    """Idiomas de traducción holandés/portugués activos por tienda (p. ej. ES → nl, pt-PT), para editar sus plazos aparte del valor base."""
+    stores=[s for s in shopify_stores() if s['domain'] and s['token']]
+    res=run_per_store(stores,lambda s:[{'locale':l['locale'],'name':l['name']} for l in admin_store_locales(s) if not l.get('primary') and is_nl_pt_locale(l['locale'])])
+    return {'locales':{r['store']:r['data'] for r in res if r['ok'] and r['data']}}
 
 @app.get('/api/admin/values/page')
-def admin_values_page(store:str,namespace:str,key:str,after:str|None=None):
-    """Una página (250) de variantes de la tienda con el valor actual del metacampo. El cliente pide páginas hasta terminar."""
+def admin_values_page(store:str,namespace:str,key:str,after:str|None=None,locale:str|None=None):
+    """Una página (250) de variantes de la tienda con el valor actual del metacampo (o de su traducción si se indica idioma)."""
     st=admin_store(store); _mf_ref(namespace,key)
-    data=admin_gql(st,VALUES_PAGE_QUERY,{'after':after,'ns':namespace,'key':key})
+    loc=admin_translation_locale(st,locale) if locale else None
+    data=admin_gql(st,VALUES_PAGE_QUERY_T if loc else VALUES_PAGE_QUERY,{'after':after,'ns':namespace,'key':key,**({'loc':loc} if loc else {})})
     page=data.get('productVariants') or {}; info=page.get('pageInfo') or {}
-    out={'store':st['code'],'total':(data.get('productVariantsCount') or {}).get('count'),'has_next':bool(info.get('hasNextPage')),'cursor':info.get('endCursor'),
-         'variants':[{'id':n['id'],'sku':n.get('sku') or '','title':n.get('title') or '','product_id':n['product']['id'],'product':n['product']['title'],'value':(n.get('metafield') or {}).get('value') or ''} for n in page.get('nodes',[])]}
+    def row(n):
+        mf=n.get('metafield') or {}
+        out={'id':n['id'],'sku':n.get('sku') or '','title':n.get('title') or '','product_id':n['product']['id'],'product':n['product']['title'],'product_status':n['product'].get('status') or '','value':mf.get('value') or ''}
+        if loc:
+            tr=next((t for t in mf.get('translations') or [] if t.get('key')=='value'),None)
+            out.update({'base':mf.get('value') or '','value':(tr or {}).get('value') or '','outdated':bool(tr and tr.get('outdated')),'nobase':not mf.get('id')})
+        return out
+    out={'store':st['code'],'locale':loc,'total':(data.get('productVariantsCount') or {}).get('count'),'has_next':bool(info.get('hasNextPage')),'cursor':info.get('endCursor'),'variants':[row(n) for n in page.get('nodes',[])]}
     if after is None:
         try: defn=metafield_definitions(st['code']).get(('PRODUCTVARIANT',namespace,key))
         except HTTPException: defn=None
@@ -3047,10 +3075,78 @@ class AdminValuesApply(BaseModel):
     ids:list[str]
     operation_id:int|None=None
     clear:bool=False
+    exact:bool=False  # al deshacer: se restaura el valor tal cual, sin recortar espacios
+    locale:str|None=None  # si se indica, se edita la traducción del metacampo en ese idioma y no el valor base
 
 VALUES_CURRENT_QUERY='query($ids:[ID!]!,$ns:String!,$key:String!){ nodes(ids:$ids){ ... on ProductVariant { id metafield(namespace:$ns,key:$key){ value } } } }'
+VALUES_CURRENT_QUERY_T='query($ids:[ID!]!,$ns:String!,$key:String!,$loc:String!){ nodes(ids:$ids){ ... on ProductVariant { id metafield(namespace:$ns,key:$key){ id value translations(locale:$loc){ key value } } } } }'
+VALUES_DIGEST_QUERY='query($ids:[ID!]!){ translatableResourcesByIds(resourceIds:$ids,first:50){ nodes{ resourceId translatableContent{ key digest } } } }'
 VALUES_DELETE_MUTATION='mutation($metafields:[MetafieldIdentifierInput!]!){metafieldsDelete(metafields:$metafields){deletedMetafields{key namespace ownerId} userErrors{field message}}}'
 VALUES_SET_MUTATION='mutation($metafields:[MetafieldsSetInput!]!){metafieldsSet(metafields:$metafields){metafields{id} userErrors{field message}}}'
+
+def _values_finish(st,x,label,value,results):
+    """Registra la auditoría y devuelve el resumen común. results = [(id, estado, error, valor_anterior)]."""
+    op=x.operation_id
+    try:
+        with pool.connection() as c:
+            if op is None or not c.execute("SELECT 1 FROM admin_operations WHERE id=%s AND kind='values.apply'",(op,)).fetchone():
+                op=c.execute("INSERT INTO admin_operations(operator,kind,mode,payload) VALUES(%s,'values.apply','single',%s) RETURNING id",(operator(),Jsonb({'store':st['code'],'metafield':label,'value':value}))).fetchone()[0]
+            for vid,status,error,before in results:
+                c.execute("INSERT INTO admin_operation_items(op_id,store_code,entity_gid,status,error,before,after) VALUES(%s,%s,%s,%s,%s,%s,%s)",(op,st['code'],vid,status,error,Jsonb({label:before}) if before is not None else None,Jsonb({label:value}) if status=='OK' else None))
+    except Exception:
+        logging.getLogger('hub.admin').exception('No se pudo registrar la auditoría')
+    logging.getLogger('hub.admin').info('values.apply %s %s variantes=%d',st['code'],label,len(results))
+    return {'operation_id':op,'applied':sum(1 for r in results if r[1]=='OK'),'skipped':sum(1 for r in results if r[1]=='SKIPPED'),'failed':[{'id':r[0],'error':r[2]} for r in results if r[1]=='FAILED']}
+
+def _values_apply_translation(st,x,ids,value):
+    """Escribe (o quita) la TRADUCCIÓN del metacampo en un idioma. Requiere que la variante tenga valor base."""
+    loc=admin_translation_locale(st,x.locale); label=f'{x.namespace}.{x.key} [{loc}]'
+    current={}
+    for i in range(0,len(ids),50):
+        for n in admin_gql(st,VALUES_CURRENT_QUERY_T,{'ids':ids[i:i+50],'ns':x.namespace,'key':x.key,'loc':loc}).get('nodes') or []:
+            if not n: continue
+            mf=n.get('metafield') or {}; tr=next((t for t in mf.get('translations') or [] if t.get('key')=='value'),None)
+            current[n['id']]=(mf.get('id'),(tr or {}).get('value') or '')
+    results=[]; todo=[]
+    for vid in ids:
+        if vid not in current: results.append((vid,'FAILED','La variante ya no existe',None))
+        elif not current[vid][0]: results.append((vid,'FAILED','Sin valor base: no hay metacampo que traducir',None))
+        elif current[vid][1]==value: results.append((vid,'SKIPPED',None,current[vid][1]))
+        else: todo.append(vid)
+    digests={}
+    if not x.clear and todo:
+        mids=list(dict.fromkeys(current[v][0] for v in todo))
+        for i in range(0,len(mids),50):
+            for n in (admin_gql(st,VALUES_DIGEST_QUERY,{'ids':mids[i:i+50]}).get('translatableResourcesByIds') or {}).get('nodes',[]):
+                d=next((c['digest'] for c in n.get('translatableContent') or [] if c.get('key')=='value'),None)
+                if d: digests[n['resourceId']]=d
+    def run_batch(batch):
+        out=[]; decl=[]; body=[]; var={}; idx=[]
+        for vid in batch:
+            mid=current[vid][0]; i=len(idx)
+            if x.clear:
+                decl.append(f'$r{i}:ID!'); var[f'r{i}']=mid
+                body.append(f'a{i}:translationsRemove(resourceId:$r{i},translationKeys:["value"],locales:[{json.dumps(loc)}]){{ userErrors{{ field message }} }}')
+            else:
+                if mid not in digests: out.append((vid,'FAILED','Shopify no ofrece contenido traducible para esta variante',current[vid][1])); continue
+                decl.append(f'$r{i}:ID!,$t{i}:[TranslationInput!]!'); var[f'r{i}']=mid
+                var[f't{i}']=[{'locale':loc,'key':'value','value':value,'translatableContentDigest':digests[mid]}]
+                body.append(f'a{i}:translationsRegister(resourceId:$r{i},translations:$t{i}){{ userErrors{{ field message }} }}')
+            idx.append(vid)
+        if not body: return out
+        try:
+            data=admin_gql(st,'mutation('+','.join(decl)+'){ '+' '.join(body)+' }',var)
+            for i,vid in enumerate(idx):
+                errs=((data.get(f'a{i}') or {}).get('userErrors')) or []
+                out.append((vid,'FAILED' if errs else 'OK','; '.join(e.get('message','error') for e in errs)[:300] if errs else None,current[vid][1]))
+        except HTTPException as exc:
+            out+=[(vid,'FAILED',str(exc.detail)[:300],current[vid][1]) for vid in idx]
+        return out
+    batches=[todo[i:i+10] for i in range(0,len(todo),10)]
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(4,len(batches))) as ex:
+            for res in ex.map(run_batch,batches): results+=res
+    return _values_finish(st,x,label,value,results)
 
 @app.post('/api/admin/values/apply')
 def admin_values_apply(x:AdminValuesApply):
@@ -3062,13 +3158,13 @@ def admin_values_apply(x:AdminValuesApply):
     if not x.clear and not x.value.strip(): raise HTTPException(400,'Indica el nuevo valor')
     defn=metafield_definitions(st['code']).get(('PRODUCTVARIANT',x.namespace,x.key))
     if not defn: raise HTTPException(409,f'El metacampo {x.namespace}.{x.key} no existe en {st["code"]}')
-    value='' if x.clear else admin_metafield_value(defn['type'],x.value.strip())
+    value='' if x.clear else admin_metafield_value(defn['type'],x.value if x.exact else x.value.strip())
+    if x.locale: return _values_apply_translation(st,x,ids,value)
     current={}
     for i in range(0,len(ids),50):
         for n in admin_gql(st,VALUES_CURRENT_QUERY,{'ids':ids[i:i+50],'ns':x.namespace,'key':x.key}).get('nodes') or []:
             if n: current[n['id']]=(n.get('metafield') or {}).get('value') or ''
-    label=f'{x.namespace}.{x.key}'; results=[]
-    todo=[]
+    label=f'{x.namespace}.{x.key}'; results=[]; todo=[]
     for vid in ids:
         if vid not in current: results.append((vid,'FAILED','La variante ya no existe',None))
         elif current[vid]==value: results.append((vid,'SKIPPED',None,current[vid]))
@@ -3090,17 +3186,7 @@ def admin_values_apply(x:AdminValuesApply):
         with ThreadPoolExecutor(max_workers=min(4,len(batches))) as ex:
             for res in ex.map(apply_batch,batches):
                 for vid,status,error in res: results.append((vid,status,error,current.get(vid)))
-    op=x.operation_id
-    try:
-        with pool.connection() as c:
-            if op is None or not c.execute("SELECT 1 FROM admin_operations WHERE id=%s AND kind='values.apply'",(op,)).fetchone():
-                op=c.execute("INSERT INTO admin_operations(operator,kind,mode,payload) VALUES(%s,'values.apply','single',%s) RETURNING id",(operator(),Jsonb({'store':st['code'],'metafield':label,'value':value}))).fetchone()[0]
-            for vid,status,error,before in results:
-                c.execute("INSERT INTO admin_operation_items(op_id,store_code,entity_gid,status,error,before,after) VALUES(%s,%s,%s,%s,%s,%s,%s)",(op,st['code'],vid,status,error,Jsonb({label:before}) if before is not None else None,Jsonb({label:value}) if status=='OK' else None))
-    except Exception:
-        logging.getLogger('hub.admin').exception('No se pudo registrar la auditoría')
-    logging.getLogger('hub.admin').info('values.apply %s %s variantes=%d',st['code'],label,len(ids))
-    return {'operation_id':op,'applied':sum(1 for r in results if r[1]=='OK'),'skipped':sum(1 for r in results if r[1]=='SKIPPED'),'failed':[{'id':r[0],'error':r[2]} for r in results if r[1]=='FAILED']}
+    return _values_finish(st,x,label,value,results)
 
 ADMIN_ASSETS=Path(__file__).parent
 ADMIN_BODY='<style>'+(ADMIN_ASSETS/'admin.css').read_text(encoding='utf-8')+'</style>'+(ADMIN_ASSETS/'admin.html').read_text(encoding='utf-8')+'<script>'+(ADMIN_ASSETS/'admin.js').read_text(encoding='utf-8')+'</script>'
