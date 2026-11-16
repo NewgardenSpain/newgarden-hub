@@ -2974,6 +2974,100 @@ def admin_retry_failed(op_id:int):
     logging.getLogger('hub.admin').info('global.retry de #%s tiendas=%s',op_id,list(only))
     return {'operation_id':op_new,'stores':stores_out}
 
+# --- Valores de un metacampo de variante (p. ej. tiempo de entrega): listar, filtrar y cambiar en bloque ---
+_MF_NS=re.compile(r'^[A-Za-z0-9_-]{2,255}$'); _MF_KEY=re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+def _mf_ref(namespace,key):
+    if not _MF_NS.fullmatch(namespace or '') or not _MF_KEY.fullmatch(key or ''): raise HTTPException(400,'Metacampo no válido')
+
+VALUES_PAGE_QUERY='query($after:String,$ns:String!,$key:String!){ productVariantsCount{count} productVariants(first:250,after:$after){ nodes{ id sku title product{id title} metafield(namespace:$ns,key:$key){value} } pageInfo{hasNextPage endCursor} } }'
+
+@app.get('/api/admin/values/page')
+def admin_values_page(store:str,namespace:str,key:str,after:str|None=None):
+    """Una página (250) de variantes de la tienda con el valor actual del metacampo. El cliente pide páginas hasta terminar."""
+    st=admin_store(store); _mf_ref(namespace,key)
+    data=admin_gql(st,VALUES_PAGE_QUERY,{'after':after,'ns':namespace,'key':key})
+    page=data.get('productVariants') or {}; info=page.get('pageInfo') or {}
+    out={'store':st['code'],'total':(data.get('productVariantsCount') or {}).get('count'),'has_next':bool(info.get('hasNextPage')),'cursor':info.get('endCursor'),
+         'variants':[{'id':n['id'],'sku':n.get('sku') or '','title':n.get('title') or '','product_id':n['product']['id'],'product':n['product']['title'],'value':(n.get('metafield') or {}).get('value') or ''} for n in page.get('nodes',[])]}
+    if after is None:
+        try: defn=metafield_definitions(st['code']).get(('PRODUCTVARIANT',namespace,key))
+        except HTTPException: defn=None
+        out['definition']={'type':defn['type']} if defn else None
+    return out
+
+@app.get('/api/admin/collection/product-ids')
+def admin_collection_product_ids(store:str,id:str):
+    st=admin_store(store)
+    if not id.startswith('gid://shopify/Collection/'): raise HTTPException(400,'Identificador de colección no válido')
+    ids=[]; after=None
+    for _ in range(60):
+        page=((admin_gql(st,'query($id:ID!,$after:String){collection(id:$id){products(first:250,after:$after){nodes{id} pageInfo{hasNextPage endCursor}}}}',{'id':id,'after':after}).get('collection') or {}).get('products')) or {}
+        ids+=[n['id'] for n in page.get('nodes',[])]; info=page.get('pageInfo') or {}
+        if not info.get('hasNextPage') or not info.get('endCursor'): break
+        after=info['endCursor']
+    return {'ids':ids}
+
+class AdminValuesApply(BaseModel):
+    store:str
+    namespace:str
+    key:str
+    value:str
+    ids:list[str]
+    operation_id:int|None=None
+
+VALUES_CURRENT_QUERY='query($ids:[ID!]!,$ns:String!,$key:String!){ nodes(ids:$ids){ ... on ProductVariant { id metafield(namespace:$ns,key:$key){ value } } } }'
+VALUES_SET_MUTATION='mutation($metafields:[MetafieldsSetInput!]!){metafieldsSet(metafields:$metafields){metafields{id} userErrors{field message}}}'
+
+@app.post('/api/admin/values/apply')
+def admin_values_apply(x:AdminValuesApply):
+    """Asigna un valor a una lista de variantes (máx. 250 por llamada). Las que ya lo tienen se omiten; un fallo no detiene al resto."""
+    st=admin_store(x.store); _mf_ref(x.namespace,x.key)
+    ids=list(dict.fromkeys(x.ids))
+    if not ids or len(ids)>250: raise HTTPException(400,'Indica entre 1 y 250 variantes por llamada')
+    if any(not i.startswith('gid://shopify/ProductVariant/') for i in ids): raise HTTPException(400,'Identificador de variante no válido')
+    if not x.value.strip(): raise HTTPException(400,'Indica el nuevo valor')
+    defn=metafield_definitions(st['code']).get(('PRODUCTVARIANT',x.namespace,x.key))
+    if not defn: raise HTTPException(409,f'El metacampo {x.namespace}.{x.key} no existe en {st["code"]}')
+    value=admin_metafield_value(defn['type'],x.value.strip())
+    current={}
+    for i in range(0,len(ids),50):
+        for n in admin_gql(st,VALUES_CURRENT_QUERY,{'ids':ids[i:i+50],'ns':x.namespace,'key':x.key}).get('nodes') or []:
+            if n: current[n['id']]=(n.get('metafield') or {}).get('value') or ''
+    label=f'{x.namespace}.{x.key}'; results=[]
+    todo=[]
+    for vid in ids:
+        if vid not in current: results.append((vid,'FAILED','La variante ya no existe',None))
+        elif current[vid]==value: results.append((vid,'SKIPPED',None,current[vid]))
+        else: todo.append(vid)
+    def entry(vid): return {'ownerId':vid,'namespace':x.namespace,'key':x.key,'type':defn['type'],'value':value}
+    def apply_batch(batch):
+        try:
+            admin_exec(st,VALUES_SET_MUTATION,{'metafields':[entry(v) for v in batch]},'metafieldsSet')
+            return [(v,'OK',None) for v in batch]
+        except HTTPException:
+            out=[]  # el lote es atómico: se repite uno a uno para saber cuáles fallan
+            for v in batch:
+                try: admin_exec(st,VALUES_SET_MUTATION,{'metafields':[entry(v)]},'metafieldsSet'); out.append((v,'OK',None))
+                except HTTPException as exc: out.append((v,'FAILED',str(exc.detail)[:300]))
+            return out
+    batches=[todo[i:i+25] for i in range(0,len(todo),25)]
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(4,len(batches))) as ex:
+            for res in ex.map(apply_batch,batches):
+                for vid,status,error in res: results.append((vid,status,error,current.get(vid)))
+    op=x.operation_id
+    try:
+        with pool.connection() as c:
+            if op is None or not c.execute("SELECT 1 FROM admin_operations WHERE id=%s AND kind='values.apply'",(op,)).fetchone():
+                op=c.execute("INSERT INTO admin_operations(operator,kind,mode,payload) VALUES(%s,'values.apply','single',%s) RETURNING id",(operator(),Jsonb({'store':st['code'],'metafield':label,'value':value}))).fetchone()[0]
+            for vid,status,error,before in results:
+                c.execute("INSERT INTO admin_operation_items(op_id,store_code,entity_gid,status,error,before,after) VALUES(%s,%s,%s,%s,%s,%s,%s)",(op,st['code'],vid,status,error,Jsonb({label:before}) if before is not None else None,Jsonb({label:value}) if status=='OK' else None))
+    except Exception:
+        logging.getLogger('hub.admin').exception('No se pudo registrar la auditoría')
+    logging.getLogger('hub.admin').info('values.apply %s %s variantes=%d',st['code'],label,len(ids))
+    return {'operation_id':op,'applied':sum(1 for r in results if r[1]=='OK'),'skipped':sum(1 for r in results if r[1]=='SKIPPED'),'failed':[{'id':r[0],'error':r[2]} for r in results if r[1]=='FAILED']}
+
 ADMIN_ASSETS=Path(__file__).parent
 ADMIN_BODY='<style>'+(ADMIN_ASSETS/'admin.css').read_text(encoding='utf-8')+'</style>'+(ADMIN_ASSETS/'admin.html').read_text(encoding='utf-8')+'<script>'+(ADMIN_ASSETS/'admin.js').read_text(encoding='utf-8')+'</script>'
 

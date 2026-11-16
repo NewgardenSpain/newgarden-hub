@@ -38,7 +38,7 @@
 .step-head h2 { margin: 0; }
 .step-n { display: inline-grid; flex: none; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--ink); color: #fff; font: 600 13px var(--mono); }
 .step-hint { margin: 10px 0 14px; color: var(--muted); font-size: 13px; }
-.actionbar { position: sticky; bottom: 0; z-index: var(--z-sticky); display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 16px 0; padding: 14px 0; border-top: 1px solid var(--line); background: rgba(242, 243, 242, .96); }
+.actionbar { position: sticky; bottom: 0; z-index: var(--z-sticky); display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 16px 0; padding: 14px 0; border-top: 1px solid var(--line); background: var(--paper); box-shadow: 0 -8px 16px -12px rgba(0, 0, 0, .25); }
 
 /* Filas de cambio y combobox */
 .change { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(240px, 1.4fr) auto; gap: 12px; align-items: start; padding: 14px 0; border-top: 1px solid var(--line); }
@@ -123,3 +123,19 @@
   .step { padding: 18px; }
   .ed-sec { padding: 18px; }
 }
+
+/* Valores de un metacampo */
+.adm-bar-top { align-items: flex-end; }
+.v-mf { min-width: min(340px, 100%); margin: 0; }
+.actionbar .field { margin: 0; }
+.actionbar .grow { flex: 1 1 260px; }
+.actionbar .field label { font-size: 12px; }
+.vrow-sel td { background: #fff9ed; }
+.adm td.chk, .adm th.chk { width: 44px; padding-right: 0; }
+.adm .chk input { width: 18px; min-height: 18px; }
+.vnew { color: var(--green); font-weight: 600; }
+.vchip { display: inline-flex; align-items: center; gap: 8px; padding: 4px 6px 4px 12px; border: 1px solid #7d877f; border-radius: 999px; background: #fff; font-size: 13px; }
+.vchip button { min-height: 26px; padding: 0 8px; border-radius: 999px; }
+#v-summary .table-wrap { max-height: 300px; overflow: auto; }
+#v-table .table-wrap { max-height: 70vh; overflow: auto; }
+#v-table thead th, #v-summary thead th { position: sticky; top: 0; z-index: 2; }

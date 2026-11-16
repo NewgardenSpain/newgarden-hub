@@ -25,7 +25,7 @@ const OWNER_ES = { PRODUCT: 'Producto', PRODUCTVARIANT: 'Variante' };
 const state = { stores: [], store: null, kind: 'products', cursor: null, rows: [], seq: 0, defs: null, defsPromise: null, editing: null };
 
 /* ---------- pestañas principales ---------- */
-const TABS = ['tienda', 'varias', 'metacampos', 'historial'];
+const TABS = ['tienda', 'varias', 'valores', 'metacampos', 'historial'];
 const shown = {};
 function showTab(name, push = true) {
   if (!TABS.includes(name)) name = 'tienda';
@@ -34,7 +34,7 @@ function showTab(name, push = true) {
     b.setAttribute('aria-selected', on); b.tabIndex = on ? 0 : -1; $('#panel-' + t).hidden = !on;
   });
   if (push) history.replaceState(null, '', '#' + name);
-  if (!shown[name]) { shown[name] = true; ({ tienda: loadList, varias: initMulti, metacampos: renderMatrix, historial: loadHistory })[name](true); }
+  if (!shown[name]) { shown[name] = true; ({ tienda: loadList, varias: initMulti, valores: initValues, metacampos: renderMatrix, historial: loadHistory })[name](true); }
 }
 $$('.adm-tabs [role=tab]').forEach(b => {
   b.onclick = () => showTab(b.dataset.tab);
@@ -268,6 +268,135 @@ async function openCollection(id) {
   } catch (err) { console.error(err.stack); $('#ed-title').textContent = 'No se pudo abrir'; $('#ed-body').innerHTML = `<div class="callout err">${esc(err.message)}</div>`; }
 }
 
+/* ---------- VALORES DE UN METACAMPO ---------- */
+const V = { store: null, rows: [], byId: new Map(), total: 0, definition: null, loaded: false, busy: false, seq: 0, filterValue: null, q: '', collIds: null, collName: '', collMap: {}, sel: new Set(), limit: 200 };
+const vMf = () => { const raw = $('#v-mf').value.trim(), i = raw.indexOf('.'); return i > 0 && i < raw.length - 1 ? { ns: raw.slice(0, i), key: raw.slice(i + 1) } : null; };
+const vShow = v => v === '' ? '(vacío)' : v;
+
+function initValues() {
+  V.store = state.store;
+  $('#v-stores').innerHTML = state.stores.map(s => `<label class="chip"><input type="radio" name="vstore" value="${esc(s.code)}"${s.code === V.store ? ' checked' : ''}><span title="${esc(s.domain)}">${esc(s.code)}</span></label>`).join('');
+  $$('#v-stores input').forEach(i => i.onchange = () => { V.store = i.value; clearColl(); loadValues(); });
+  $('#v-load').onclick = loadValues;
+  $('#v-mf').addEventListener('change', loadValues);
+  let qt; $('#v-q').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(() => { V.q = norm($('#v-q').value.trim()); V.limit = 200; renderValues(); }, 200); });
+  let ct; $('#v-coll').addEventListener('input', () => {
+    clearTimeout(ct); const q = $('#v-coll').value.trim();
+    if (!q && V.collIds) { clearColl(); renderValues(); return; }
+    if (q.length < 2) return;
+    ct = setTimeout(async () => { try { const d = await api(`/api/admin/collections?store=${enc(V.store)}&q=${enc(q)}`); d.collections.forEach(c => V.collMap[c.title] = c.id); $('#v-coll-list').innerHTML = d.collections.map(c => `<option value="${esc(c.title)}">`).join(''); } catch (e) { /* sin sugerencias */ } }, 300);
+  });
+  $('#v-coll').addEventListener('change', async () => {
+    const name = $('#v-coll').value.trim(), id = V.collMap[name]; if (!name || !id) return;
+    $('#v-count').textContent = 'Leyendo la colección…';
+    try { const d = await api(`/api/admin/collection/product-ids?store=${enc(V.store)}&id=${enc(id)}`); V.collIds = new Set(d.ids); V.collName = name; V.limit = 200; renderValues(); }
+    catch (err) { $('#v-count').textContent = err.message; }
+  });
+  $('#v-sel-all').onclick = () => { vFiltered().forEach(r => V.sel.add(r.id)); updateSelection(); };
+  $('#v-sel-none').onclick = () => { V.sel.clear(); updateSelection(); };
+  $('#v-more').onclick = () => { V.limit += 300; renderValues(); };
+  $('#v-new').addEventListener('input', updateSelection);
+  $('#v-apply').onclick = applyValues;
+  $('#v-summary').addEventListener('click', e => {
+    const f = e.target.closest('[data-vfilter]'), r = e.target.closest('[data-vreplace]');
+    if (f) { V.filterValue = V.filterValue === f.dataset.vfilter ? null : f.dataset.vfilter; V.limit = 200; renderValues(); }
+    if (r) { V.filterValue = r.dataset.vreplace; V.limit = 200; V.sel = new Set(vFiltered().map(x => x.id)); renderValues(); $('#v-new').focus(); }
+  });
+  $('#v-filters').addEventListener('click', e => {
+    const b = e.target.closest('[data-clear]'); if (!b) return;
+    if (b.dataset.clear === 'value') V.filterValue = null; else { clearColl(); }
+    V.limit = 200; renderValues();
+  });
+  $('#v-table').addEventListener('change', e => {
+    const one = e.target.closest('[data-vid]');
+    if (one) { one.checked ? V.sel.add(one.dataset.vid) : V.sel.delete(one.dataset.vid); updateSelection(); return; }
+    if (e.target.id === 'v-all') { vShownRows().forEach(r => e.target.checked ? V.sel.add(r.id) : V.sel.delete(r.id)); updateSelection(); }
+  });
+  loadDefs().then(d => {
+    $('#v-mf-list').innerHTML = d.rows.filter(r => r.owner === 'PRODUCTVARIANT' && !((Object.values(r.stores).find(Boolean) || {}).type || '').includes('reference')).map(r => `<option value="${esc(r.namespace + '.' + r.key)}" label="${esc(r.name || '')}">`).join('');
+  }).catch(() => {});
+  loadValues();
+}
+function clearColl() { V.collIds = null; V.collName = ''; $('#v-coll').value = ''; }
+
+async function loadValues() {
+  const mf = vMf(), st = $('#v-status');
+  if (!V.store) { st.textContent = 'No hay tiendas disponibles.'; return; }
+  if (!mf) { st.textContent = 'Escribe el metacampo como namespace.clave (por ejemplo custom.tiempo_de_entrega).'; return; }
+  const seq = ++V.seq;
+  Object.assign(V, { rows: [], byId: new Map(), filterValue: null, loaded: false, limit: 200 }); V.sel.clear();
+  $('#v-main').hidden = true; $('#v-bar').hidden = true; $('#v-result').innerHTML = '';
+  let after = null, first = true;
+  try {
+    do {
+      const d = await api(`/api/admin/values/page?store=${enc(V.store)}&namespace=${enc(mf.ns)}&key=${enc(mf.key)}${after ? '&after=' + enc(after) : ''}`);
+      if (seq !== V.seq) return;
+      if (first) { V.total = d.total || 0; V.definition = d.definition; first = false; }
+      d.variants.forEach(v => { V.rows.push(v); V.byId.set(v.id, v); });
+      st.textContent = `Cargando variantes… ${V.rows.length}${V.total ? ' de ' + V.total : ''}`;
+      after = d.has_next ? d.cursor : null;
+    } while (after);
+    V.loaded = true;
+    st.textContent = `${V.rows.length} variantes en ${V.store}.` + (V.definition ? '' : ` El metacampo ${mf.ns}.${mf.key} no existe en ${V.store}: solo puedes consultarlo.`);
+    $('#v-main').hidden = false; renderValues();
+  } catch (err) { if (seq === V.seq) st.textContent = err.message; }
+}
+
+function vFiltered() {
+  return V.rows.filter(r => (V.filterValue === null || r.value === V.filterValue) && (!V.q || norm(`${r.sku} ${r.product} ${r.title}`).includes(V.q)) && (!V.collIds || V.collIds.has(r.product_id)));
+}
+const vShownRows = () => vFiltered().slice(0, V.limit);
+
+function renderValues() {
+  const counts = new Map(); V.rows.forEach(r => counts.set(r.value, (counts.get(r.value) || 0) + 1));
+  const list = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  $('#v-summary').innerHTML = table(['Valor', 'Variantes', ''], list.map(([v, n]) => `<tr${V.filterValue === v ? ' class="vrow-sel"' : ''}><td class="wrap-cell">${v === '' ? '<em>(vacío)</em>' : esc(v)}</td><td class="nw">${n}</td><td class="nw"><button type="button" class="button secondary" data-vfilter="${esc(v)}" aria-pressed="${V.filterValue === v}">${V.filterValue === v ? 'Quitar filtro' : 'Ver'}</button> ${V.definition ? `<button type="button" class="button secondary" data-vreplace="${esc(v)}">Reemplazar…</button>` : ''}</td></tr>`).join(''));
+  $('#v-filters').innerHTML = (V.filterValue !== null ? `<span class="vchip">Valor: «${esc(vShow(V.filterValue))}» <button type="button" class="button secondary" data-clear="value" aria-label="Quitar filtro de valor">✕</button></span>` : '') + (V.collIds ? `<span class="vchip">Colección: ${esc(V.collName)} <button type="button" class="button secondary" data-clear="coll" aria-label="Quitar filtro de colección">✕</button></span>` : '');
+  const f = vFiltered(), shownRows = f.slice(0, V.limit);
+  $('#v-table').innerHTML = f.length ? table(['<input type="checkbox" id="v-all" aria-label="Seleccionar las variantes mostradas">', 'SKU', 'Producto', 'Valor actual', 'Después'], shownRows.map(r => `<tr data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}" aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="nw">${esc(r.sku)}</td><td class="wrap-cell">${esc(r.product)}<small>${esc(r.title)}</small></td><td class="wrap-cell">${r.value === '' ? '<span class="muted">(vacío)</span>' : esc(r.value)}</td><td class="wrap-cell after"></td></tr>`).join('')) : '<p class="muted">Ninguna variante coincide con los filtros.</p>';
+  $('#v-more').hidden = f.length <= V.limit;
+  updateSelection();
+}
+
+function updateSelection() {
+  const f = vFiltered(), nv = $('#v-new').value.trim();
+  $$('#v-table tbody tr').forEach(tr => {
+    const id = tr.dataset.row, on = V.sel.has(id), r = V.byId.get(id);
+    tr.classList.toggle('vrow-sel', on); $('[data-vid]', tr).checked = on;
+    $('.after', tr).innerHTML = on && nv ? (r && r.value === nv ? '<span class="muted">sin cambios</span>' : `<span class="vnew">${esc(nv)}</span>`) : '<span class="muted">—</span>';
+  });
+  const all = $('#v-all'), shownRows = vShownRows(), n = shownRows.filter(r => V.sel.has(r.id)).length;
+  if (all) { all.checked = n > 0 && n === shownRows.length; all.indeterminate = n > 0 && n < shownRows.length; }
+  $('#v-count').textContent = `${f.length} de ${V.rows.length} variantes coinciden · ${V.sel.size} seleccionadas` + (f.length > V.limit ? ` (se muestran ${V.limit})` : '');
+  const groups = new Map(); V.sel.forEach(id => { const r = V.byId.get(id); if (r) groups.set(r.value, (groups.get(r.value) || 0) + 1); });
+  const changing = [...V.sel].filter(id => V.byId.get(id) && V.byId.get(id).value !== nv).length;
+  $('#v-bar').hidden = !V.loaded;
+  $('#v-summary-line').textContent = !V.definition ? 'El metacampo no existe en esta tienda: no se puede cambiar.' : !V.sel.size ? 'Selecciona variantes para cambiarlas.' : `${[...groups].map(([v, c]) => `«${vShow(v)}» (${c})`).join(', ')} → «${nv || '…'}»`;
+  const btn = $('#v-apply'); btn.textContent = V.sel.size ? `Aplicar a ${changing} ${changing === 1 ? 'variante' : 'variantes'}` : 'Aplicar';
+  btn.disabled = V.busy || !V.definition || !nv || !changing;
+}
+
+async function applyValues() {
+  const mf = vMf(), nv = $('#v-new').value.trim(), st = $('#v-status');
+  const ids = [...V.sel].filter(id => V.byId.get(id) && V.byId.get(id).value !== nv);
+  if (!mf || !nv || !ids.length) return;
+  V.busy = true; updateSelection(); $('#v-result').innerHTML = '';
+  let op = null, applied = 0, skipped = 0; const failed = [];
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100); st.textContent = `Aplicando… ${i} de ${ids.length}`;
+    try {
+      const r = await post('/api/admin/values/apply', { store: V.store, namespace: mf.ns, key: mf.key, value: nv, ids: chunk, operation_id: op });
+      op = r.operation_id; applied += r.applied; skipped += r.skipped; r.failed.forEach(f => failed.push(f));
+      const bad = new Set(r.failed.map(f => f.id));
+      chunk.forEach(id => { if (!bad.has(id)) { const row = V.byId.get(id); if (row) row.value = nv; V.sel.delete(id); } });
+    } catch (err) { chunk.forEach(id => failed.push({ id, error: err.message })); }
+  }
+  V.busy = false; shown.historial = false; renderValues();
+  st.textContent = `Operación terminada${op ? ' (registro #' + op + ')' : ''}.`;
+  $('#v-result').innerHTML = `<div class="res-summary"><h2>Resultado</h2>${tag(applied + ' cambiadas', applied ? 'ok' : 'muted')}${skipped ? tag(skipped + ' ya tenían ese valor', 'muted') : ''}${failed.length ? tag(failed.length + ' con error', 'err') : ''}</div>` +
+    (failed.length ? `<div class="callout err"><strong>No se pudieron cambiar:</strong>${table(['SKU', 'Producto', 'Error'], failed.slice(0, 50).map(f => { const r = V.byId.get(f.id) || {}; return `<tr><td class="nw">${esc(r.sku || '')}</td><td class="wrap-cell">${esc(r.product || '')}<small>${esc(r.title || '')}</small></td><td class="wrap-cell">${esc(f.error || '')}</td></tr>`; }).join(''))}${failed.length > 50 ? `<p class="muted">…y ${failed.length - 50} más (consulta el Historial).</p>` : ''}</div>` : '');
+}
+
 /* ---------- METACAMPOS: matriz ---------- */
 let mfOwner = 'PRODUCT';
 $$('[data-owner]').forEach(b => b.onclick = () => { mfOwner = b.dataset.owner; $$('[data-owner]').forEach(x => x.setAttribute('aria-pressed', x === b)); renderMatrix(); });
@@ -465,7 +594,7 @@ function renderResults(d, applied, box) {
 }
 
 /* ---------- HISTORIAL ---------- */
-const KIND_ES = { 'global.apply': 'Edición multitienda', 'global.retry': 'Reintento', 'definition.create': 'Crear definición', 'product.update': 'Producto', 'variant.update': 'Variante', 'collection.update': 'Colección', 'metafield.set': 'Metacampo' };
+const KIND_ES = { 'global.apply': 'Edición multitienda', 'global.retry': 'Reintento', 'definition.create': 'Crear definición', 'product.update': 'Producto', 'variant.update': 'Variante', 'collection.update': 'Colección', 'metafield.set': 'Metacampo', 'values.apply': 'Cambio de valores' };
 $('#hist-reload').onclick = () => loadHistory();
 async function loadHistory() {
   const box = $('#hist'), st = $('#hist-status'); st.textContent = 'Cargando…';

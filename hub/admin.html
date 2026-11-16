@@ -5,6 +5,7 @@
 <div class="adm-tabs" role="tablist" aria-label="Secciones">
   <button type="button" role="tab" id="tab-tienda" data-tab="tienda" aria-controls="panel-tienda">Una tienda</button>
   <button type="button" role="tab" id="tab-varias" data-tab="varias" aria-controls="panel-varias">Varias tiendas</button>
+  <button type="button" role="tab" id="tab-valores" data-tab="valores" aria-controls="panel-valores">Valores</button>
   <button type="button" role="tab" id="tab-metacampos" data-tab="metacampos" aria-controls="panel-metacampos">Metacampos</button>
   <button type="button" role="tab" id="tab-historial" data-tab="historial" aria-controls="panel-historial">Historial</button>
 </div>
@@ -70,6 +71,41 @@
   </div>
 
   <div id="g-result" aria-live="polite"></div>
+</section>
+
+<!-- VALORES DE UN METACAMPO -->
+<section id="panel-valores" role="tabpanel" aria-labelledby="tab-valores" hidden>
+  <p class="adm-intro">Consulta qué valor tiene un metacampo de variante en una tienda (por ejemplo el <strong>tiempo de entrega</strong>), filtra por valor, nombre, SKU o colección y cámbialo en bloque. Si un SKU está repetido, se cambian todas sus variantes.</p>
+  <div class="adm-bar adm-bar-top">
+    <div><span class="adm-label" id="v-store-label">Tienda</span><div class="chips" id="v-stores" role="radiogroup" aria-labelledby="v-store-label"></div></div>
+    <div class="field v-mf"><label for="v-mf">Metacampo de variante</label><input id="v-mf" list="v-mf-list" value="custom.tiempo_de_entrega" autocomplete="off" spellcheck="false"><datalist id="v-mf-list"></datalist></div>
+    <button type="button" class="button secondary" id="v-load">Recargar</button>
+  </div>
+  <p id="v-status" class="muted" role="status" aria-live="polite"></p>
+  <div id="v-main" hidden>
+    <div class="step">
+      <div class="step-head"><h2>Valores actuales</h2></div>
+      <p class="step-hint">Pulsa «Ver» para filtrar por un valor, o «Reemplazar» para seleccionar todas sus variantes y cambiarlas.</p>
+      <div id="v-summary"></div>
+    </div>
+    <div class="step">
+      <div class="step-head"><h2>Variantes</h2></div>
+      <div class="adm-bar">
+        <div class="adm-search"><input id="v-q" type="search" placeholder="Buscar por nombre o SKU" aria-label="Buscar por nombre, SKU o variante"><input id="v-coll" list="v-coll-list" type="search" placeholder="Filtrar por colección" aria-label="Filtrar por colección" autocomplete="off"><datalist id="v-coll-list"></datalist></div>
+        <div class="actions" style="margin:0"><button type="button" class="button secondary" id="v-sel-all">Seleccionar las que coinciden</button><button type="button" class="button secondary" id="v-sel-none">Quitar selección</button></div>
+      </div>
+      <div id="v-filters" class="chips"></div>
+      <p id="v-count" class="muted" role="status" aria-live="polite"></p>
+      <div id="v-table"></div>
+      <div class="actions"><button type="button" class="button secondary" id="v-more" hidden>Mostrar más</button></div>
+    </div>
+    <div id="v-result" aria-live="polite"></div>
+  </div>
+  <div class="actionbar" id="v-bar" hidden>
+    <div class="field grow"><label for="v-new">Nuevo valor</label><input id="v-new" autocomplete="off" placeholder="Texto libre, por ejemplo 3-5 días"></div>
+    <button type="button" class="button primary" id="v-apply" disabled>Aplicar</button>
+    <span id="v-summary-line" class="muted grow" role="status" aria-live="polite"></span>
+  </div>
 </section>
 
 <!-- METACAMPOS -->
