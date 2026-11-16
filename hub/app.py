@@ -2464,7 +2464,13 @@ def admin_metafield_definitions(stores:str=''):
 
 @app.get('/admin',response_class=HTMLResponse)
 def admin_page():
-    body='''<main class="wrap"><h1>Administración multitienda</h1><p class="lede">Consulta cada tienda como en su panel de Shopify, o compara todas a la vez en la pestaña Global.</p>
+    body='''<style>
+#result table,#detail table{width:100%;min-width:max-content}
+#result th,#result td,#detail th,#detail td{overflow-wrap:normal;word-break:normal;white-space:nowrap;padding:12px 16px;vertical-align:middle}
+#result td.wrap-cell,#detail td.wrap-cell{white-space:normal;min-width:16rem;max-width:36rem;overflow-wrap:anywhere}
+#result .badge,#detail .badge{white-space:nowrap}
+#store-tabs [hidden],#sections [hidden],#search[hidden],#more[hidden],#detail[hidden]{display:none!important}
+</style><main class="wrap"><h1>Administración multitienda</h1><p class="lede">Consulta cada tienda como en su panel de Shopify, o compara todas a la vez en la pestaña Global.</p>
 <div class="actions" role="tablist" aria-label="Tiendas" id="store-tabs"></div>
 <div class="actions" id="sections" style="margin-top:.75rem"><button class="button secondary" data-section="products" aria-pressed="true">Productos</button><button class="button secondary" data-section="collections" aria-pressed="false">Colecciones</button><button class="button secondary" data-section="metafields" aria-pressed="false">Metacampos</button></div>
 <section class="card" style="margin-top:1rem"><form id="search" class="actions"><input id="q" type="search" placeholder="Buscar por título o SKU" aria-label="Buscar"><button class="button primary">Buscar</button><span id="status" class="status" role="status" aria-live="polite"></span></form><div id="result"><p class="muted">Cargando…</p></div><div class="actions"><button class="button secondary" id="more" hidden>Cargar más</button></div></section>
@@ -2475,25 +2481,27 @@ async function fetchJSON(u,o){const r=await fetch(u,o);const d=await r.json().ca
 let stores=[],tab='GLOBAL',section='products',cursor=null,rows=[];
 function renderTabs(){const t=$('#store-tabs');t.innerHTML=['GLOBAL',...stores.map(s=>s.code)].map(c=>'<button role="tab" class="button '+(c===tab?'primary':'secondary')+'" aria-selected="'+(c===tab)+'" data-tab="'+esc(c)+'">'+(c==='GLOBAL'?'Global':esc(c))+'</button>').join('');
 t.querySelectorAll('button').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;if(tab==='GLOBAL')section='metafields';renderTabs();renderSections();load(true)})}
-function renderSections(){document.querySelectorAll('#sections button').forEach(b=>{const global=tab==='GLOBAL';b.hidden=global&&b.dataset.section!=='metafields';b.setAttribute('aria-pressed',b.dataset.section===section);});$('#search').hidden=section==='metafields'}
+function renderSections(){document.querySelectorAll('#sections button').forEach(b=>{const global=tab==='GLOBAL';b.hidden=global&&b.dataset.section!=='metafields';b.setAttribute('aria-pressed',b.dataset.section===section);});$('#search').hidden=false;$('#q').placeholder=section==='metafields'?'Filtrar por namespace.clave':'Buscar por título o SKU'}
 document.querySelectorAll('#sections button').forEach(b=>b.onclick=()=>{section=b.dataset.section;renderSections();load(true)});
 $('#search').onsubmit=e=>{e.preventDefault();load(true)};$('#more').onclick=()=>load(false);
 function table(head,body){return '<div class="table-wrap"><table><thead><tr>'+head.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+body+'</tbody></table></div>'}
 async function load(reset){const st=$('#status'),res=$('#result');$('#detail').hidden=true;if(reset){cursor=null;rows=[];res.innerHTML='<p class="muted">Cargando…</p>'}st.textContent='';
 try{
 if(section==='metafields'){const d=await fetchJSON('/api/admin/metafield-definitions'+(tab==='GLOBAL'?'':'?stores='+tab));$('#more').hidden=true;
+const f=$('#q').value.trim().toLowerCase();d.rows=d.rows.filter(r=>!f||(r.namespace+'.'+r.key).toLowerCase().includes(f));
 const cell=c=>c?'<span class="badge">'+esc(c.type)+'</span>':'<span class="badge" style="color:#a15c00">no existe</span>';
 res.innerHTML=(d.errors.length?'<p class="muted">No se pudieron leer: '+d.errors.map(e=>esc(e.store+' ('+e.error+')')).join('; ')+'</p>':'')+table(['Propietario','Namespace.clave',...d.stores.map(esc),'Estado'],d.rows.map(r=>'<tr><td>'+esc(r.owner)+'</td><td>'+esc(r.namespace+'.'+r.key)+'</td>'+d.stores.map(s=>'<td>'+cell(r.stores[s])+'</td>').join('')+'<td>'+({ok:'Coherente',missing:'Falta en alguna tienda',type_mismatch:'Tipos distintos'}[r.status])+'</td></tr>').join(''));return}
+if(tab==='GLOBAL'){section='metafields';renderSections();return load(true)}
 const url='/api/admin/'+section+'?store='+encodeURIComponent(tab)+'&q='+encodeURIComponent($('#q').value)+(cursor?'&after='+encodeURIComponent(cursor):'');
 const d=await fetchJSON(url);cursor=d.cursor;$('#more').hidden=!d.has_next;
 if(section==='products'){rows=rows.concat(d.products);st.textContent=(d.total!=null?d.total+' productos':'')
-res.innerHTML=table(['Producto','Estado','SKU','Etiquetas','Stock'],rows.map(p=>'<tr><td><a href="#" data-id="'+esc(p.id)+'">'+esc(p.title)+'</a><br><small class="muted">'+esc(p.handle)+'</small></td><td><span class="badge">'+esc(p.status)+'</span></td><td>'+esc(p.skus.slice(0,3).join(', '))+(p.skus.length>3?' …':'')+'</td><td>'+esc(p.tags.join(', '))+'</td><td>'+esc(p.inventory)+'</td></tr>').join(''));
+res.innerHTML=table(['Producto','Estado','SKU','Etiquetas','Stock'],rows.map(p=>'<tr><td><a href="#" data-id="'+esc(p.id)+'">'+esc(p.title)+'</a><br><small class="muted">'+esc(p.handle)+'</small></td><td><span class="badge">'+esc(p.status)+'</span></td><td>'+esc(p.skus.slice(0,3).join(', '))+(p.skus.length>3?' …':'')+'</td><td class="wrap-cell">'+esc(p.tags.join(', '))+'</td><td>'+esc(p.inventory)+'</td></tr>').join(''));
 res.querySelectorAll('a[data-id]').forEach(a=>a.onclick=e=>{e.preventDefault();openProduct(a.dataset.id)})}
 else{rows=rows.concat(d.collections);res.innerHTML=table(['Colección','Handle','Productos'],rows.map(c=>'<tr><td>'+esc(c.title)+'</td><td>'+esc(c.handle)+'</td><td>'+esc(c.products)+'</td></tr>').join(''))}
 }catch(err){res.innerHTML='';st.textContent=err.message}}
 async function openProduct(id){const box=$('#detail');box.hidden=false;box.innerHTML='<p class="muted">Cargando…</p>';
 try{const p=(await fetchJSON('/api/admin/product?store='+encodeURIComponent(tab)+'&id='+encodeURIComponent(id))).product;
-const mf=m=>'<tr><td>'+esc(m.namespace+'.'+m.key)+'</td><td><span class="badge">'+esc(m.type)+'</span></td><td style="white-space:normal">'+esc(m.value)+'</td></tr>';
+const mf=m=>'<tr><td>'+esc(m.namespace+'.'+m.key)+'</td><td><span class="badge">'+esc(m.type)+'</span></td><td class="wrap-cell">'+esc(m.value)+'</td></tr>';
 box.innerHTML='<h2>'+esc(p.title)+'</h2><p class="muted">'+esc(p.handle)+' · '+esc(p.status)+' · '+esc(p.vendor)+' · '+esc(p.productType)+'</p><h3>Variantes</h3>'+table(['SKU','Título','Código de barras'],p.variants.nodes.map(v=>'<tr><td>'+esc(v.sku)+'</td><td>'+esc(v.title)+'</td><td>'+esc(v.barcode)+'</td></tr>').join(''))+'<h3>Metacampos del producto</h3>'+table(['Clave','Tipo','Valor'],p.metafields.nodes.map(mf).join('')||'<tr><td colspan="3" class="muted">Sin metacampos</td></tr>');
 box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
 (async()=>{try{stores=(await fetchJSON('/api/admin/stores')).stores;section='metafields';renderTabs();renderSections();load(true)}catch(err){$('#result').innerHTML='<p class="status">'+esc(err.message)+'</p>'}})();
