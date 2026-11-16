@@ -3012,11 +3012,13 @@ class AdminValuesApply(BaseModel):
     store:str
     namespace:str
     key:str
-    value:str
+    value:str=''
     ids:list[str]
     operation_id:int|None=None
+    clear:bool=False
 
 VALUES_CURRENT_QUERY='query($ids:[ID!]!,$ns:String!,$key:String!){ nodes(ids:$ids){ ... on ProductVariant { id metafield(namespace:$ns,key:$key){ value } } } }'
+VALUES_DELETE_MUTATION='mutation($metafields:[MetafieldIdentifierInput!]!){metafieldsDelete(metafields:$metafields){deletedMetafields{key namespace ownerId} userErrors{field message}}}'
 VALUES_SET_MUTATION='mutation($metafields:[MetafieldsSetInput!]!){metafieldsSet(metafields:$metafields){metafields{id} userErrors{field message}}}'
 
 @app.post('/api/admin/values/apply')
@@ -3026,10 +3028,10 @@ def admin_values_apply(x:AdminValuesApply):
     ids=list(dict.fromkeys(x.ids))
     if not ids or len(ids)>250: raise HTTPException(400,'Indica entre 1 y 250 variantes por llamada')
     if any(not i.startswith('gid://shopify/ProductVariant/') for i in ids): raise HTTPException(400,'Identificador de variante no válido')
-    if not x.value.strip(): raise HTTPException(400,'Indica el nuevo valor')
+    if not x.clear and not x.value.strip(): raise HTTPException(400,'Indica el nuevo valor')
     defn=metafield_definitions(st['code']).get(('PRODUCTVARIANT',x.namespace,x.key))
     if not defn: raise HTTPException(409,f'El metacampo {x.namespace}.{x.key} no existe en {st["code"]}')
-    value=admin_metafield_value(defn['type'],x.value.strip())
+    value='' if x.clear else admin_metafield_value(defn['type'],x.value.strip())
     current={}
     for i in range(0,len(ids),50):
         for n in admin_gql(st,VALUES_CURRENT_QUERY,{'ids':ids[i:i+50],'ns':x.namespace,'key':x.key}).get('nodes') or []:
@@ -3040,15 +3042,16 @@ def admin_values_apply(x:AdminValuesApply):
         if vid not in current: results.append((vid,'FAILED','La variante ya no existe',None))
         elif current[vid]==value: results.append((vid,'SKIPPED',None,current[vid]))
         else: todo.append(vid)
-    def entry(vid): return {'ownerId':vid,'namespace':x.namespace,'key':x.key,'type':defn['type'],'value':value}
+    def entry(vid): return {'ownerId':vid,'namespace':x.namespace,'key':x.key} if x.clear else {'ownerId':vid,'namespace':x.namespace,'key':x.key,'type':defn['type'],'value':value}
+    mutation,root=(VALUES_DELETE_MUTATION,'metafieldsDelete') if x.clear else (VALUES_SET_MUTATION,'metafieldsSet')
     def apply_batch(batch):
         try:
-            admin_exec(st,VALUES_SET_MUTATION,{'metafields':[entry(v) for v in batch]},'metafieldsSet')
+            admin_exec(st,mutation,{'metafields':[entry(v) for v in batch]},root)
             return [(v,'OK',None) for v in batch]
         except HTTPException:
             out=[]  # el lote es atómico: se repite uno a uno para saber cuáles fallan
             for v in batch:
-                try: admin_exec(st,VALUES_SET_MUTATION,{'metafields':[entry(v)]},'metafieldsSet'); out.append((v,'OK',None))
+                try: admin_exec(st,mutation,{'metafields':[entry(v)]},root); out.append((v,'OK',None))
                 except HTTPException as exc: out.append((v,'FAILED',str(exc.detail)[:300]))
             return out
     batches=[todo[i:i+25] for i in range(0,len(todo),25)]

@@ -269,7 +269,7 @@ async function openCollection(id) {
 }
 
 /* ---------- VALORES DE UN METACAMPO ---------- */
-const V = { store: null, rows: [], byId: new Map(), total: 0, definition: null, loaded: false, busy: false, seq: 0, filterValue: null, q: '', collIds: null, collName: '', collMap: {}, sel: new Set(), limit: 200 };
+const V = { store: null, rows: [], byId: new Map(), total: 0, definition: null, loaded: false, busy: false, seq: 0, filterValue: null, recent: null, last: null, q: '', collIds: null, collName: '', collMap: {}, sel: new Set(), limit: 200 };
 const vMf = () => { const raw = $('#v-mf').value.trim(), i = raw.indexOf('.'); return i > 0 && i < raw.length - 1 ? { ns: raw.slice(0, i), key: raw.slice(i + 1) } : null; };
 const vShow = v => v === '' ? '(vacío)' : v;
 
@@ -279,7 +279,7 @@ function initValues() {
   $$('#v-stores input').forEach(i => i.onchange = () => { V.store = i.value; clearColl(); loadValues(); });
   $('#v-load').onclick = loadValues;
   $('#v-mf').addEventListener('change', loadValues);
-  let qt; $('#v-q').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(() => { V.q = norm($('#v-q').value.trim()); V.limit = 200; renderValues(); }, 200); });
+  let qt; $('#v-q').addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(() => { V.q = norm($('#v-q').value.trim()); V.recent = null; V.limit = 200; renderValues(); }, 200); });
   let ct; $('#v-coll').addEventListener('input', () => {
     clearTimeout(ct); const q = $('#v-coll').value.trim();
     if (!q && V.collIds) { clearColl(); renderValues(); return; }
@@ -289,22 +289,23 @@ function initValues() {
   $('#v-coll').addEventListener('change', async () => {
     const name = $('#v-coll').value.trim(), id = V.collMap[name]; if (!name || !id) return;
     $('#v-count').textContent = 'Leyendo la colección…';
-    try { const d = await api(`/api/admin/collection/product-ids?store=${enc(V.store)}&id=${enc(id)}`); V.collIds = new Set(d.ids); V.collName = name; V.limit = 200; renderValues(); }
+    try { const d = await api(`/api/admin/collection/product-ids?store=${enc(V.store)}&id=${enc(id)}`); V.collIds = new Set(d.ids); V.collName = name; V.recent = null; V.limit = 200; renderValues(); }
     catch (err) { $('#v-count').textContent = err.message; }
   });
   $('#v-sel-all').onclick = () => { vFiltered().forEach(r => V.sel.add(r.id)); updateSelection(); };
   $('#v-sel-none').onclick = () => { V.sel.clear(); updateSelection(); };
   $('#v-more').onclick = () => { V.limit += 300; renderValues(); };
-  $('#v-new').addEventListener('input', updateSelection);
+  $('#v-new').addEventListener('input', updateSelection); $('#v-clear').addEventListener('change', () => { $('#v-new').disabled = $('#v-clear').checked; updateSelection(); });
+  $('#v-result').addEventListener('click', e => { if (e.target.closest('#v-undo')) undoLast(); });
   $('#v-apply').onclick = applyValues;
   $('#v-summary').addEventListener('click', e => {
     const f = e.target.closest('[data-vfilter]'), r = e.target.closest('[data-vreplace]');
-    if (f) { V.filterValue = V.filterValue === f.dataset.vfilter ? null : f.dataset.vfilter; V.limit = 200; renderValues(); }
-    if (r) { V.filterValue = r.dataset.vreplace; V.limit = 200; V.sel = new Set(vFiltered().map(x => x.id)); renderValues(); $('#v-new').focus(); }
+    if (f) { V.recent = null; V.filterValue = V.filterValue === f.dataset.vfilter ? null : f.dataset.vfilter; V.limit = 200; renderValues(); }
+    if (r) { V.recent = null; V.filterValue = r.dataset.vreplace; V.limit = 200; V.sel = new Set(vFiltered().map(x => x.id)); renderValues(); $('#v-new').focus(); }
   });
   $('#v-filters').addEventListener('click', e => {
     const b = e.target.closest('[data-clear]'); if (!b) return;
-    if (b.dataset.clear === 'value') V.filterValue = null; else { clearColl(); }
+    if (b.dataset.clear === 'value') V.filterValue = null; else if (b.dataset.clear === 'recent') V.recent = null; else { clearColl(); }
     V.limit = 200; renderValues();
   });
   $('#v-table').addEventListener('change', e => {
@@ -324,7 +325,7 @@ async function loadValues() {
   if (!V.store) { st.textContent = 'No hay tiendas disponibles.'; return; }
   if (!mf) { st.textContent = 'Escribe el metacampo como namespace.clave (por ejemplo custom.tiempo_de_entrega).'; return; }
   const seq = ++V.seq;
-  Object.assign(V, { rows: [], byId: new Map(), filterValue: null, loaded: false, limit: 200 }); V.sel.clear();
+  Object.assign(V, { rows: [], byId: new Map(), filterValue: null, recent: null, last: null, loaded: false, limit: 200 }); V.sel.clear();
   $('#v-main').hidden = true; $('#v-bar').hidden = true; $('#v-result').innerHTML = '';
   let after = null, first = true;
   try {
@@ -343,7 +344,7 @@ async function loadValues() {
 }
 
 function vFiltered() {
-  return V.rows.filter(r => (V.filterValue === null || r.value === V.filterValue) && (!V.q || norm(`${r.sku} ${r.product} ${r.title}`).includes(V.q)) && (!V.collIds || V.collIds.has(r.product_id)));
+  return V.rows.filter(r => (V.filterValue === null || r.value === V.filterValue) && (!V.recent || V.recent.has(r.id)) && (!V.q || norm(`${r.sku} ${r.product} ${r.title}`).includes(V.q)) && (!V.collIds || V.collIds.has(r.product_id)));
 }
 const vShownRows = () => vFiltered().slice(0, V.limit);
 
@@ -351,7 +352,7 @@ function renderValues() {
   const counts = new Map(); V.rows.forEach(r => counts.set(r.value, (counts.get(r.value) || 0) + 1));
   const list = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   $('#v-summary').innerHTML = table(['Valor', 'Variantes', ''], list.map(([v, n]) => `<tr${V.filterValue === v ? ' class="vrow-sel"' : ''}><td class="wrap-cell">${v === '' ? '<em>(vacío)</em>' : esc(v)}</td><td class="nw">${n}</td><td class="nw"><button type="button" class="button secondary" data-vfilter="${esc(v)}" aria-pressed="${V.filterValue === v}">${V.filterValue === v ? 'Quitar filtro' : 'Ver'}</button> ${V.definition ? `<button type="button" class="button secondary" data-vreplace="${esc(v)}">Reemplazar…</button>` : ''}</td></tr>`).join(''));
-  $('#v-filters').innerHTML = (V.filterValue !== null ? `<span class="vchip">Valor: «${esc(vShow(V.filterValue))}» <button type="button" class="button secondary" data-clear="value" aria-label="Quitar filtro de valor">✕</button></span>` : '') + (V.collIds ? `<span class="vchip">Colección: ${esc(V.collName)} <button type="button" class="button secondary" data-clear="coll" aria-label="Quitar filtro de colección">✕</button></span>` : '');
+  $('#v-filters').innerHTML = (V.filterValue !== null ? `<span class="vchip">Valor: «${esc(vShow(V.filterValue))}» <button type="button" class="button secondary" data-clear="value" aria-label="Quitar filtro de valor">✕</button></span>` : '') + (V.recent ? `<span class="vchip">Cambiadas ahora: ${V.recent.size} <button type="button" class="button secondary" data-clear="recent" aria-label="Quitar filtro de cambiadas">✕</button></span>` : '') + (V.collIds ? `<span class="vchip">Colección: ${esc(V.collName)} <button type="button" class="button secondary" data-clear="coll" aria-label="Quitar filtro de colección">✕</button></span>` : '');
   const f = vFiltered(), shownRows = f.slice(0, V.limit);
   $('#v-table').innerHTML = f.length ? table(['<input type="checkbox" id="v-all" aria-label="Seleccionar las variantes mostradas">', 'SKU', 'Producto', 'Valor actual', 'Después'], shownRows.map(r => `<tr data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}" aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="nw">${esc(r.sku)}</td><td class="wrap-cell">${esc(r.product)}<small>${esc(r.title)}</small></td><td class="wrap-cell">${r.value === '' ? '<span class="muted">(vacío)</span>' : esc(r.value)}</td><td class="wrap-cell after"></td></tr>`).join('')) : '<p class="muted">Ninguna variante coincide con los filtros.</p>';
   $('#v-more').hidden = f.length <= V.limit;
@@ -359,42 +360,68 @@ function renderValues() {
 }
 
 function updateSelection() {
-  const f = vFiltered(), nv = $('#v-new').value.trim();
+  const f = vFiltered(), clear = $('#v-clear').checked, nv = clear ? '' : $('#v-new').value.trim();
   $$('#v-table tbody tr').forEach(tr => {
     const id = tr.dataset.row, on = V.sel.has(id), r = V.byId.get(id);
     tr.classList.toggle('vrow-sel', on); $('[data-vid]', tr).checked = on;
-    $('.after', tr).innerHTML = on && nv ? (r && r.value === nv ? '<span class="muted">sin cambios</span>' : `<span class="vnew">${esc(nv)}</span>`) : '<span class="muted">—</span>';
+    $('.after', tr).innerHTML = on && (nv || clear) ? (r && r.value === nv ? '<span class="muted">sin cambios</span>' : `<span class="vnew">${clear ? '(vacío)' : esc(nv)}</span>`) : '<span class="muted">—</span>';
   });
   const all = $('#v-all'), shownRows = vShownRows(), n = shownRows.filter(r => V.sel.has(r.id)).length;
   if (all) { all.checked = n > 0 && n === shownRows.length; all.indeterminate = n > 0 && n < shownRows.length; }
-  $('#v-count').textContent = `${f.length} de ${V.rows.length} variantes coinciden · ${V.sel.size} seleccionadas` + (f.length > V.limit ? ` (se muestran ${V.limit})` : '');
+  $('#v-count').textContent = `${f.length} de ${V.rows.length} variantes coinciden · ${V.sel.size} seleccionadas` + (() => { const out = [...V.sel].filter(id => !f.some(r => r.id === id)).length; return out ? ` (${out} fuera del filtro actual)` : ''; })() + (f.length > V.limit ? ` (se muestran ${V.limit})` : '');
   const groups = new Map(); V.sel.forEach(id => { const r = V.byId.get(id); if (r) groups.set(r.value, (groups.get(r.value) || 0) + 1); });
   const changing = [...V.sel].filter(id => V.byId.get(id) && V.byId.get(id).value !== nv).length;
   $('#v-bar').hidden = !V.loaded;
-  $('#v-summary-line').textContent = !V.definition ? 'El metacampo no existe en esta tienda: no se puede cambiar.' : !V.sel.size ? 'Selecciona variantes para cambiarlas.' : `${[...groups].map(([v, c]) => `«${vShow(v)}» (${c})`).join(', ')} → «${nv || '…'}»`;
+  $('#v-summary-line').textContent = !V.definition ? 'El metacampo no existe en esta tienda: no se puede cambiar.' : !V.sel.size ? 'Selecciona variantes para cambiarlas.' : `${[...groups].map(([v, c]) => `«${vShow(v)}» (${c})`).join(', ')} → «${clear ? '(vacío)' : (nv || '…')}»`;
   const btn = $('#v-apply'); btn.textContent = V.sel.size ? `Aplicar a ${changing} ${changing === 1 ? 'variante' : 'variantes'}` : 'Aplicar';
-  btn.disabled = V.busy || !V.definition || !nv || !changing;
+  btn.disabled = V.busy || !V.definition || (!nv && !clear) || !changing;
 }
 
-async function applyValues() {
-  const mf = vMf(), nv = $('#v-new').value.trim(), st = $('#v-status');
-  const ids = [...V.sel].filter(id => V.byId.get(id) && V.byId.get(id).value !== nv);
-  if (!mf || !nv || !ids.length) return;
-  V.busy = true; updateSelection(); $('#v-result').innerHTML = '';
-  let op = null, applied = 0, skipped = 0; const failed = [];
-  for (let i = 0; i < ids.length; i += 100) {
-    const chunk = ids.slice(i, i + 100); st.textContent = `Aplicando… ${i} de ${ids.length}`;
-    try {
-      const r = await post('/api/admin/values/apply', { store: V.store, namespace: mf.ns, key: mf.key, value: nv, ids: chunk, operation_id: op });
-      op = r.operation_id; applied += r.applied; skipped += r.skipped; r.failed.forEach(f => failed.push(f));
-      const bad = new Set(r.failed.map(f => f.id));
-      chunk.forEach(id => { if (!bad.has(id)) { const row = V.byId.get(id); if (row) row.value = nv; V.sel.delete(id); } });
-    } catch (err) { chunk.forEach(id => failed.push({ id, error: err.message })); }
+// Ejecuta un plan [{ value, clear, ids }] en bloques de 100 y actualiza los datos locales.
+async function runPlan(plan, label) {
+  const mf = vMf(), st = $('#v-status'), total = plan.reduce((n, g) => n + g.ids.length, 0);
+  let op = null, applied = 0, skipped = 0, done = 0; const failed = [], okIds = [];
+  for (const g of plan) {
+    for (let i = 0; i < g.ids.length; i += 100) {
+      const chunk = g.ids.slice(i, i + 100); st.textContent = `${label}… ${done} de ${total}`; done += chunk.length;
+      try {
+        const r = await post('/api/admin/values/apply', { store: V.store, namespace: mf.ns, key: mf.key, value: g.value, clear: g.clear, ids: chunk, operation_id: op });
+        op = r.operation_id; applied += r.applied; skipped += r.skipped; r.failed.forEach(f => failed.push(f));
+        const bad = new Set(r.failed.map(f => f.id));
+        chunk.forEach(id => { if (!bad.has(id)) { const row = V.byId.get(id); if (row) row.value = g.clear ? '' : g.value; okIds.push(id); } });
+      } catch (err) { chunk.forEach(id => failed.push({ id, error: err.message })); }
+    }
   }
-  V.busy = false; shown.historial = false; renderValues();
-  st.textContent = `Operación terminada${op ? ' (registro #' + op + ')' : ''}.`;
-  $('#v-result').innerHTML = `<div class="res-summary"><h2>Resultado</h2>${tag(applied + ' cambiadas', applied ? 'ok' : 'muted')}${skipped ? tag(skipped + ' ya tenían ese valor', 'muted') : ''}${failed.length ? tag(failed.length + ' con error', 'err') : ''}</div>` +
-    (failed.length ? `<div class="callout err"><strong>No se pudieron cambiar:</strong>${table(['SKU', 'Producto', 'Error'], failed.slice(0, 50).map(f => { const r = V.byId.get(f.id) || {}; return `<tr><td class="nw">${esc(r.sku || '')}</td><td class="wrap-cell">${esc(r.product || '')}<small>${esc(r.title || '')}</small></td><td class="wrap-cell">${esc(f.error || '')}</td></tr>`; }).join(''))}${failed.length > 50 ? `<p class="muted">…y ${failed.length - 50} más (consulta el Historial).</p>` : ''}</div>` : '');
+  return { op, applied, skipped, failed, okIds };
+}
+function showResult(res, title, undoable) {
+  $('#v-status').textContent = `Operación terminada${res.op ? ' (registro #' + res.op + ')' : ''}.`;
+  $('#v-result').innerHTML = `<div class="res-summary"><h2>${title}</h2>${tag(res.applied + ' cambiadas', res.applied ? 'ok' : 'muted')}${res.skipped ? tag(res.skipped + ' ya tenían ese valor', 'muted') : ''}${res.failed.length ? tag(res.failed.length + ' con error', 'err') : ''}${undoable && V.last && V.last.items.length ? '<button type="button" class="button secondary" id="v-undo">Deshacer este cambio</button>' : ''}</div>` +
+    (res.failed.length ? `<div class="callout err"><strong>No se pudieron cambiar:</strong>${table(['SKU', 'Producto', 'Error'], res.failed.slice(0, 50).map(f => { const r = V.byId.get(f.id) || {}; return `<tr><td class="nw">${esc(r.sku || '')}</td><td class="wrap-cell">${esc(r.product || '')}<small>${esc(r.title || '')}</small></td><td class="wrap-cell">${esc(f.error || '')}</td></tr>`; }).join(''))}${res.failed.length > 50 ? `<p class="muted">…y ${res.failed.length - 50} más (consulta el Historial).</p>` : ''}</div>` : '');
+}
+async function applyValues() {
+  const mf = vMf(), clear = $('#v-clear').checked, nv = clear ? '' : $('#v-new').value.trim();
+  const ids = [...V.sel].filter(id => V.byId.get(id) && V.byId.get(id).value !== nv);
+  if (!mf || (!nv && !clear) || !ids.length) return;
+  const before = new Map(ids.map(id => [id, V.byId.get(id).value]));
+  V.busy = true; updateSelection(); $('#v-result').innerHTML = '';
+  const res = await runPlan([{ value: nv, clear, ids }], 'Aplicando');
+  V.busy = false; shown.historial = false;
+  if (clear) { $('#v-clear').checked = false; $('#v-new').disabled = false; $('#v-new').value = ''; }
+  // Las variantes cambiadas se quedan visibles y seleccionadas (aunque ya no cumplan el filtro de valor) para poder corregirlas o deshacer.
+  V.last = { items: res.okIds.map(id => ({ id, before: before.get(id) })) };
+  if (res.okIds.length) { V.recent = new Set(res.okIds); V.filterValue = null; res.okIds.forEach(id => V.sel.add(id)); }
+  renderValues(); showResult(res, 'Resultado', true);
+}
+async function undoLast() {
+  if (!V.last || !V.last.items.length || V.busy) return;
+  const groups = new Map(); V.last.items.forEach(i => { if (V.byId.get(i.id)) (groups.get(i.before) || groups.set(i.before, []).get(i.before)).push(i.id); });
+  const plan = [...groups].map(([value, ids]) => ({ value, clear: value === '', ids }));
+  V.busy = true; updateSelection(); $('#v-result').innerHTML = '';
+  const res = await runPlan(plan, 'Deshaciendo');
+  V.busy = false; shown.historial = false; V.last = null;
+  if (res.okIds.length) { V.recent = new Set(res.okIds); V.filterValue = null; res.okIds.forEach(id => V.sel.add(id)); }
+  renderValues(); showResult(res, 'Cambio deshecho', false);
 }
 
 /* ---------- METACAMPOS: matriz ---------- */
