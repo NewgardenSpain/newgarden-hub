@@ -2462,6 +2462,148 @@ def admin_metafield_definitions(stores:str=''):
     return {'stores':[s['code'] for s in chosen],'rows':definition_matrix(per_store),
             'errors':[{'store':r['store'],'error':r['error']} for r in results if not r['ok']]+[{'store':c,'error':'Tienda inactiva o sin credenciales'} for c in unknown]}
 
+# --- Fase 2: edición en una sola tienda, con auditoría ---------------------------------
+def admin_audit(kind,store_code,gid,status,error=None,before=None,after=None,payload=None):
+    """Registra una operación de escritura. Un fallo de auditoría nunca debe ocultar el resultado de Shopify."""
+    try:
+        with pool.connection() as c:
+            op=c.execute("INSERT INTO admin_operations(operator,kind,mode,payload) VALUES(%s,%s,'single',%s) RETURNING id",(operator(),kind,Jsonb(payload or {}))).fetchone()[0]
+            c.execute("INSERT INTO admin_operation_items(op_id,store_code,entity_gid,status,error,before,after) VALUES(%s,%s,%s,%s,%s,%s,%s)",(op,store_code,gid,status,error,Jsonb(before) if before is not None else None,Jsonb(after) if after is not None else None))
+    except Exception:
+        logging.getLogger('hub.admin').exception('No se pudo registrar la auditoría')
+
+def admin_mutate(st,kind,gid,query,variables,root,before,after,payload=None):
+    """Ejecuta una mutación, lanza 400 con los userErrors y deja rastro en la auditoría en ambos casos."""
+    try:
+        result=(admin_gql(st,query,variables).get(root) or {})
+        errors=result.get('userErrors') or []
+        if errors: raise HTTPException(400,'Shopify: '+'; '.join(e.get('message','error') for e in errors)[:500])
+    except HTTPException as exc:
+        admin_audit(kind,st['code'],gid,'FAILED',str(exc.detail)[:500],before,None,payload)
+        raise
+    admin_audit(kind,st['code'],gid,'OK',None,before,after,payload)
+    logging.getLogger('hub.admin').info('%s %s %s',kind,st['code'],gid)
+    return result
+
+def _text(value): return value if isinstance(value,str) else ('' if value is None else str(value))
+
+def _flat_seo(node):
+    seo=node.get('seo') or {}
+    return {'seo_title':seo.get('title') or '','seo_description':seo.get('description') or ''}
+
+def _changed(current,fields,allowed):
+    unknown=[k for k in fields if k not in allowed]
+    if unknown: raise HTTPException(400,'Campos no editables: '+', '.join(unknown))
+    return {k:v for k,v in fields.items() if v!=current.get(k)}
+
+def _seo_input(current,changes):
+    if not any(k.startswith('seo_') for k in changes): return None
+    return {'title':changes.get('seo_title',current['seo_title']),'description':changes.get('seo_description',current['seo_description'])}
+
+class AdminEntityUpdate(BaseModel):
+    store:str
+    id:str
+    fields:dict
+
+ADMIN_PRODUCT_READ='query($id:ID!){product(id:$id){title descriptionHtml handle vendor productType status tags seo{title description}}}'
+ADMIN_PRODUCT_FIELDS={'title','descriptionHtml','handle','vendor','productType','status','tags','seo_title','seo_description'}
+
+@app.post('/api/admin/product/update')
+def admin_product_update(x:AdminEntityUpdate):
+    st=admin_store(x.store)
+    if not x.id.startswith('gid://shopify/Product/'): raise HTTPException(400,'Identificador de producto no válido')
+    node=admin_gql(st,ADMIN_PRODUCT_READ,{'id':x.id}).get('product')
+    if not node: raise HTTPException(404,'Producto no encontrado en la tienda')
+    current={**{k:_text(node.get(k)) for k in ('title','descriptionHtml','handle','vendor','productType','status')},'tags':sorted(node.get('tags') or []),**_flat_seo(node)}
+    fields=dict(x.fields)
+    if 'tags' in fields:
+        raw=fields['tags']; fields['tags']=sorted({t.strip() for t in (raw.split(',') if isinstance(raw,str) else raw) if str(t).strip()})
+    if 'status' in fields and fields['status'] not in ('ACTIVE','ARCHIVED','DRAFT'): raise HTTPException(400,'Estado no válido')
+    changes=_changed(current,fields,ADMIN_PRODUCT_FIELDS)
+    if not changes: return {'store':st['code'],'changed':[],'saved':False}
+    product={'id':x.id,**{k:v for k,v in changes.items() if not k.startswith('seo_')}}
+    seo=_seo_input(current,changes)
+    if seo is not None: product['seo']=seo  # ProductUpdateInput.seo sustituye el objeto: se reenvía el campo hermano
+    if 'handle' in changes: product['redirectNewHandle']=True
+    admin_mutate(st,'product.update',x.id,'mutation($product:ProductUpdateInput!){productUpdate(product:$product){product{id} userErrors{field message}}}',{'product':product},'productUpdate',{k:current[k] for k in changes},changes)
+    return {'store':st['code'],'changed':list(changes),'saved':True}
+
+ADMIN_COLLECTION_READ='query($id:ID!){collection(id:$id){title descriptionHtml handle seo{title description}}}'
+ADMIN_COLLECTION_FIELDS={'title','descriptionHtml','handle','seo_title','seo_description'}
+
+@app.get('/api/admin/collection')
+def admin_collection(store:str,id:str):
+    st=admin_store(store)
+    if not id.startswith('gid://shopify/Collection/'): raise HTTPException(400,'Identificador de colección no válido')
+    q='query($id:ID!){collection(id:$id){id title descriptionHtml handle seo{title description} metafields(first:100){nodes{id namespace key type value compareDigest}}}}'
+    node=admin_gql(st,q,{'id':id}).get('collection')
+    if not node: raise HTTPException(404,'Colección no encontrada en la tienda')
+    return {'store':st['code'],'collection':node}
+
+@app.post('/api/admin/collection/update')
+def admin_collection_update(x:AdminEntityUpdate):
+    st=admin_store(x.store)
+    if not x.id.startswith('gid://shopify/Collection/'): raise HTTPException(400,'Identificador de colección no válido')
+    node=admin_gql(st,ADMIN_COLLECTION_READ,{'id':x.id}).get('collection')
+    if not node: raise HTTPException(404,'Colección no encontrada en la tienda')
+    current={**{k:_text(node.get(k)) for k in ('title','descriptionHtml','handle')},**_flat_seo(node)}
+    changes=_changed(current,dict(x.fields),ADMIN_COLLECTION_FIELDS)
+    if not changes: return {'store':st['code'],'changed':[],'saved':False}
+    collection={'id':x.id,**{k:v for k,v in changes.items() if not k.startswith('seo_')}}
+    seo=_seo_input(current,changes)
+    if seo is not None: collection['seo']=seo
+    if 'handle' in changes: collection['redirectNewHandle']=True
+    admin_mutate(st,'collection.update',x.id,'mutation($input:CollectionInput!){collectionUpdate(input:$input){collection{id} userErrors{field message}}}',{'input':collection},'collectionUpdate',{k:current[k] for k in changes},changes)
+    return {'store':st['code'],'changed':list(changes),'saved':True}
+
+class AdminVariantUpdate(BaseModel):
+    store:str
+    id:str
+    fields:dict
+
+@app.post('/api/admin/variant/update')
+def admin_variant_update(x:AdminVariantUpdate):
+    st=admin_store(x.store)
+    if not x.id.startswith('gid://shopify/ProductVariant/'): raise HTTPException(400,'Identificador de variante no válido')
+    node=admin_gql(st,'query($id:ID!){productVariant(id:$id){sku barcode product{id}}}',{'id':x.id}).get('productVariant')
+    if not node: raise HTTPException(404,'Variante no encontrada en la tienda')
+    current={'sku':_text(node.get('sku')),'barcode':_text(node.get('barcode'))}
+    changes=_changed(current,{k:_text(v).strip() for k,v in x.fields.items()},{'sku','barcode'})
+    if not changes: return {'store':st['code'],'changed':[],'saved':False}
+    variant={'id':x.id}
+    if 'barcode' in changes: variant['barcode']=changes['barcode']
+    if 'sku' in changes: variant['inventoryItem']={'sku':changes['sku']}
+    admin_mutate(st,'variant.update',x.id,'mutation($productId:ID!,$variants:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$productId,variants:$variants){productVariants{id} userErrors{field message}}}',{'productId':node['product']['id'],'variants':[variant]},'productVariantsBulkUpdate',{k:current[k] for k in changes},changes)
+    return {'store':st['code'],'changed':list(changes),'saved':True}
+
+class AdminMetafieldSet(BaseModel):
+    store:str
+    owner_id:str
+    namespace:str=Field(pattern=r'^[A-Za-z0-9_-]{2,255}$')
+    key:str=Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
+    type:str=Field(min_length=3,max_length=80)
+    value:str
+    compare_digest:str|None=None
+
+ADMIN_MF_READ='query($id:ID!,$ns:String!,$key:String!){node(id:$id){... on Product{metafield(namespace:$ns,key:$key){value type}} ... on ProductVariant{metafield(namespace:$ns,key:$key){value type}} ... on Collection{metafield(namespace:$ns,key:$key){value type}}}}'
+
+@app.post('/api/admin/metafield/set')
+def admin_metafield_set(x:AdminMetafieldSet):
+    st=admin_store(x.store)
+    if not x.owner_id.startswith(('gid://shopify/Product/','gid://shopify/ProductVariant/','gid://shopify/Collection/')): raise HTTPException(400,'Propietario de metacampo no admitido')
+    current=((admin_gql(st,ADMIN_MF_READ,{'id':x.owner_id,'ns':x.namespace,'key':x.key}).get('node') or {}).get('metafield')) or {}
+    if current.get('value')==x.value: return {'store':st['code'],'saved':False}
+    entry={'ownerId':x.owner_id,'namespace':x.namespace,'key':x.key,'type':x.type,'value':x.value}
+    if x.compare_digest: entry['compareDigest']=x.compare_digest
+    admin_mutate(st,'metafield.set',x.owner_id,'mutation($metafields:[MetafieldsSetInput!]!){metafieldsSet(metafields:$metafields){metafields{id} userErrors{field message}}}',{'metafields':[entry]},'metafieldsSet',{f'{x.namespace}.{x.key}':current.get('value')},{f'{x.namespace}.{x.key}':x.value})
+    return {'store':st['code'],'saved':True}
+
+@app.get('/api/admin/operations')
+def admin_operations(limit:int=50):
+    with pool.connection() as c:
+        rows=c.execute("SELECT o.id,o.created_at,o.kind,i.store_code,i.entity_gid,i.status,i.error FROM admin_operations o JOIN admin_operation_items i ON i.op_id=o.id ORDER BY o.id DESC LIMIT %s",(max(1,min(limit,200)),)).fetchall()
+    return {'operations':[{'id':r[0],'at':r[1].isoformat(),'kind':r[2],'store':r[3],'entity':r[4],'status':r[5],'error':r[6]} for r in rows]}
+
 @app.get('/admin',response_class=HTMLResponse)
 def admin_page():
     body='''<style>
@@ -2469,6 +2611,7 @@ def admin_page():
 #result th,#result td,#detail th,#detail td{overflow-wrap:normal;word-break:normal;white-space:nowrap;padding:12px 16px;vertical-align:middle}
 #result td.wrap-cell,#detail td.wrap-cell{white-space:normal;min-width:16rem;max-width:36rem;overflow-wrap:anywhere}
 #result .badge,#detail .badge{white-space:nowrap}
+#detail input,#detail textarea,#detail select{width:100%}
 #store-tabs [hidden],#sections [hidden],#search[hidden],#more[hidden],#detail[hidden]{display:none!important}
 </style><main class="wrap"><h1>Administración multitienda</h1><p class="lede">Consulta cada tienda como en su panel de Shopify, o compara todas a la vez en la pestaña Global.</p>
 <div class="actions" role="tablist" aria-label="Tiendas" id="store-tabs"></div>
@@ -2497,13 +2640,24 @@ const d=await fetchJSON(url);cursor=d.cursor;$('#more').hidden=!d.has_next;
 if(section==='products'){rows=rows.concat(d.products);st.textContent=(d.total!=null?d.total+' productos':'')
 res.innerHTML=table(['Producto','Estado','SKU','Etiquetas','Stock'],rows.map(p=>'<tr><td><a href="#" data-id="'+esc(p.id)+'">'+esc(p.title)+'</a><br><small class="muted">'+esc(p.handle)+'</small></td><td><span class="badge">'+esc(p.status)+'</span></td><td>'+esc(p.skus.slice(0,3).join(', '))+(p.skus.length>3?' …':'')+'</td><td class="wrap-cell">'+esc(p.tags.join(', '))+'</td><td>'+esc(p.inventory)+'</td></tr>').join(''));
 res.querySelectorAll('a[data-id]').forEach(a=>a.onclick=e=>{e.preventDefault();openProduct(a.dataset.id)})}
-else{rows=rows.concat(d.collections);res.innerHTML=table(['Colección','Handle','Productos'],rows.map(c=>'<tr><td>'+esc(c.title)+'</td><td>'+esc(c.handle)+'</td><td>'+esc(c.products)+'</td></tr>').join(''))}
+else{rows=rows.concat(d.collections);res.innerHTML=table(['Colección','Handle','Productos'],rows.map(c=>'<tr><td><a href="#" data-cid="'+esc(c.id)+'">'+esc(c.title)+'</a></td><td>'+esc(c.handle)+'</td><td>'+esc(c.products)+'</td></tr>').join(''));res.querySelectorAll('a[data-cid]').forEach(a=>a.onclick=e=>{e.preventDefault();openCollection(a.dataset.cid)})}
 }catch(err){res.innerHTML='';st.textContent=err.message}}
+const fld=(id,label,val,area)=>'<div class="field"><label for="'+id+'">'+label+'</label>'+(area?'<textarea id="'+id+'" rows="6">'+esc(val)+'</textarea>':'<input id="'+id+'" value="'+esc(val)+'">')+'</div>';
+async function post(path,body,btn){const st=$('#detail-status');btn.disabled=true;st.textContent='Guardando…';try{const d=await fetchJSON(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});st.textContent=d.saved?'Guardado en '+tab+(d.changed&&d.changed.length?' ('+d.changed.join(', ')+')':'')+'.':'Sin cambios.';return d}catch(err){st.textContent=err.message}finally{btn.disabled=false}}
+function mfRows(nodes){return nodes.map(m=>'<tr><td>'+esc(m.namespace+'.'+m.key)+'</td><td><span class="badge">'+esc(m.type)+'</span></td><td class="wrap-cell"><textarea rows="2" data-mf-ns="'+esc(m.namespace)+'" data-mf-key="'+esc(m.key)+'" data-mf-type="'+esc(m.type)+'" data-mf-digest="'+esc(m.compareDigest||'')+'" data-mf-orig="'+esc(m.value)+'">'+esc(m.value)+'</textarea></td><td><button class="button secondary" data-mf-save>Guardar</button></td></tr>').join('')||'<tr><td colspan="4" class="muted">Sin metacampos</td></tr>'}
+function bindMetafields(owner,root){root.querySelectorAll('[data-mf-save]').forEach(b=>b.onclick=async()=>{const t=b.closest('tr').querySelector('textarea');const d=await post('/api/admin/metafield/set',{store:tab,owner_id:owner,namespace:t.dataset.mfNs,key:t.dataset.mfKey,type:t.dataset.mfType,value:t.value,compare_digest:t.dataset.mfDigest||null},b);if(d&&d.saved)t.dataset.mfDigest=''})}
 async function openProduct(id){const box=$('#detail');box.hidden=false;box.innerHTML='<p class="muted">Cargando…</p>';
 try{const p=(await fetchJSON('/api/admin/product?store='+encodeURIComponent(tab)+'&id='+encodeURIComponent(id))).product;
-const mf=m=>'<tr><td>'+esc(m.namespace+'.'+m.key)+'</td><td><span class="badge">'+esc(m.type)+'</span></td><td class="wrap-cell">'+esc(m.value)+'</td></tr>';
-box.innerHTML='<h2>'+esc(p.title)+'</h2><p class="muted">'+esc(p.handle)+' · '+esc(p.status)+' · '+esc(p.vendor)+' · '+esc(p.productType)+'</p><h3>Variantes</h3>'+table(['SKU','Título','Código de barras'],p.variants.nodes.map(v=>'<tr><td>'+esc(v.sku)+'</td><td>'+esc(v.title)+'</td><td>'+esc(v.barcode)+'</td></tr>').join(''))+'<h3>Metacampos del producto</h3>'+table(['Clave','Tipo','Valor'],p.metafields.nodes.map(mf).join('')||'<tr><td colspan="3" class="muted">Sin metacampos</td></tr>');
+box.innerHTML='<h2>'+esc(p.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('f-title','Título',p.title)+fld('f-handle','Handle (crea redirección)',p.handle)+fld('f-vendor','Proveedor',p.vendor)+fld('f-type','Tipo de producto',p.productType)+'<div class="field"><label for="f-status">Estado</label><select id="f-status">'+['ACTIVE','DRAFT','ARCHIVED'].map(s=>'<option'+(s===p.status?' selected':'')+'>'+s+'</option>').join('')+'</select></div>'+fld('f-tags','Etiquetas (separadas por coma)',(p.tags||[]).join(', '))+fld('f-seot','Título SEO',(p.seo||{}).title||'')+fld('f-seod','Descripción SEO',(p.seo||{}).description||'')+'</div>'+fld('f-desc','Descripción (HTML)',p.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-product">Guardar producto</button></div><h3>Variantes</h3>'+table(['SKU','Título','Código de barras',''],p.variants.nodes.map(v=>'<tr data-variant="'+esc(v.id)+'"><td><input data-v="sku" value="'+esc(v.sku)+'"></td><td>'+esc(v.title)+'</td><td><input data-v="barcode" value="'+esc(v.barcode)+'"></td><td><button class="button secondary" data-v-save>Guardar</button></td></tr>').join(''))+'<h3>Metacampos del producto</h3>'+table(['Clave','Tipo','Valor',''],mfRows(p.metafields.nodes));
+$('#save-product').onclick=async e=>{const d=await post('/api/admin/product/update',{store:tab,id,fields:{title:$('#f-title').value,handle:$('#f-handle').value,vendor:$('#f-vendor').value,productType:$('#f-type').value,status:$('#f-status').value,tags:$('#f-tags').value,seo_title:$('#f-seot').value,seo_description:$('#f-seod').value,descriptionHtml:$('#f-desc').value}},e.target);void d};
+box.querySelectorAll('[data-v-save]').forEach(b=>b.onclick=()=>{const r=b.closest('tr');post('/api/admin/variant/update',{store:tab,id:r.dataset.variant,fields:{sku:r.querySelector('[data-v=sku]').value,barcode:r.querySelector('[data-v=barcode]').value}},b)});
+bindMetafields(id,box);
 box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
+async function openCollection(id){const box=$('#detail');box.hidden=false;box.innerHTML='<p class="muted">Cargando…</p>';
+try{const c=(await fetchJSON('/api/admin/collection?store='+encodeURIComponent(tab)+'&id='+encodeURIComponent(id))).collection;
+box.innerHTML='<h2>'+esc(c.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('c-title','Título',c.title)+fld('c-handle','Handle (crea redirección)',c.handle)+fld('c-seot','Título SEO',(c.seo||{}).title||'')+fld('c-seod','Descripción SEO',(c.seo||{}).description||'')+'</div>'+fld('c-desc','Descripción (HTML)',c.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-collection">Guardar colección</button></div><h3>Metacampos de la colección</h3>'+table(['Clave','Tipo','Valor',''],mfRows(c.metafields.nodes));
+$('#save-collection').onclick=async e=>{const d=await post('/api/admin/collection/update',{store:tab,id,fields:{title:$('#c-title').value,handle:$('#c-handle').value,seo_title:$('#c-seot').value,seo_description:$('#c-seod').value,descriptionHtml:$('#c-desc').value}},e.target);void d};
+bindMetafields(id,box);box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
 (async()=>{try{stores=(await fetchJSON('/api/admin/stores')).stores;section='metafields';renderTabs();renderSections();load(true)}catch(err){$('#result').innerHTML='<p class="status">'+esc(err.message)+'</p>'}})();
 </script>'''
     return shell('Administración',body,'admin')
