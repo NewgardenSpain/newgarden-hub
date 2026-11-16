@@ -2641,6 +2641,31 @@ def admin_variant_update(x:AdminVariantUpdate):
     admin_mutate(st,'variant.update',x.id,'mutation($productId:ID!,$variants:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$productId,variants:$variants){productVariants{id} userErrors{field message}}}',{'productId':node['product']['id'],'variants':[variant]},'productVariantsBulkUpdate',{k:current[k] for k in changes},changes)
     return {'store':st['code'],'changed':list(changes),'saved':True}
 
+def admin_metafield_value(mtype,value):
+    """Valida/convierte el valor según el tipo del metacampo. El texto enriquecido admite texto plano (un párrafo por línea)."""
+    if mtype=='rich_text_field':
+        try:
+            doc=json.loads(value)
+            if isinstance(doc,dict) and doc.get('type')=='root': return value
+        except ValueError: pass
+        paragraphs=[{'type':'paragraph','children':[{'type':'text','value':line}]} for line in value.split(chr(10)) if line.strip()]
+        if not paragraphs: raise HTTPException(400,'El texto enriquecido no puede quedar vacío')
+        return json.dumps({'type':'root','children':paragraphs},ensure_ascii=False,separators=(',',':'))
+    if mtype=='json' or mtype.startswith('list.'):
+        try: json.loads(value)
+        except ValueError: raise HTTPException(400,f'El valor de tipo {mtype} debe ser JSON válido (por ejemplo ["a","b"])')
+    elif mtype=='number_integer':
+        if not re.fullmatch(r'-?\d+',value.strip()): raise HTTPException(400,'Debe ser un número entero')
+        return value.strip()
+    elif mtype=='number_decimal':
+        try: float(value.strip().replace(',','.'))
+        except ValueError: raise HTTPException(400,'Debe ser un número')
+        return value.strip().replace(',','.')
+    elif mtype=='boolean':
+        if value.strip().lower() not in ('true','false'): raise HTTPException(400,'Debe ser true o false')
+        return value.strip().lower()
+    return value
+
 class AdminMetafieldSet(BaseModel):
     store:str
     owner_id:str
@@ -2656,6 +2681,7 @@ ADMIN_MF_READ='query($id:ID!,$ns:String!,$key:String!){node(id:$id){... on Produ
 def admin_metafield_set(x:AdminMetafieldSet):
     st=admin_store(x.store)
     if not x.owner_id.startswith(('gid://shopify/Product/','gid://shopify/ProductVariant/','gid://shopify/Collection/')): raise HTTPException(400,'Propietario de metacampo no admitido')
+    x.value=admin_metafield_value(x.type,x.value)
     current=((admin_gql(st,ADMIN_MF_READ,{'id':x.owner_id,'ns':x.namespace,'key':x.key}).get('node') or {}).get('metafield')) or {}
     if current.get('value')==x.value: return {'store':st['code'],'saved':False}
     entry={'ownerId':x.owner_id,'namespace':x.namespace,'key':x.key,'type':x.type,'value':x.value}
@@ -2693,7 +2719,7 @@ def admin_global_change(scope,c):
     if c.kind=='metafield':
         if not (c.namespace and c.key and c.type): raise HTTPException(400,'Metacampo incompleto: faltan namespace, clave o tipo')
         if not isinstance(c.value,str): raise HTTPException(400,f'Valor no válido para {c.namespace}.{c.key}')
-        return {'kind':'metafield','label':f'{c.namespace}.{c.key}','namespace':c.namespace,'key':c.key,'type':c.type,'value':c.value}
+        return {'kind':'metafield','label':f'{c.namespace}.{c.key}','namespace':c.namespace,'key':c.key,'type':c.type,'value':admin_metafield_value(c.type,c.value)}
     if c.kind!='field' or c.field not in GLOBAL_FIELDS[scope]: raise HTTPException(400,f'Campo no editable en modo global: {c.field}')
     v=c.value
     if c.field=='status' and v not in ('ACTIVE','DRAFT','ARCHIVED'): raise HTTPException(400,'Estado no válido')
@@ -2940,7 +2966,8 @@ return {kind:'field',field:t.slice(2),value:val}})}
 function renderGStores(){$('#g-stores').innerHTML=stores.map(s=>'<label style="margin-right:1rem"><input type="checkbox" value="'+esc(s.code)+'" checked style="width:auto"> '+esc(s.code)+'</label>').join('')}
 function gBody(){const skus=$('#g-skus').value.split(String.fromCharCode(10)).flatMap(l=>l.split(',')).map(x=>x.trim()).filter(Boolean);
 return {scope:$('#g-scope').value,stores:[...document.querySelectorAll('#g-stores input:checked')].map(i=>i.value),skus,changes:collectChanges()}}
-function gShow(v){return typeof v==='boolean'?(v?'Sí':'No'):(v===''||v==null?'(vacío)':String(v))}
+function richText(n){return n.type==='text'?n.value:(n.children||[]).map(richText).join(n.type==='root'?' / ':'')}
+function gShow(v){if(typeof v==='boolean')return v?'Sí':'No';if(v===''||v==null)return '(vacío)';const t=String(v);if(t.startsWith('{"type":"root"')){try{return richText(JSON.parse(t))}catch(e){}}return t}
 function renderGlobal(d,applied){const sym={OK:'Aplicado',FAILED:'Error',SKIPPED:'Sin cambios'};
 $('#g-result').innerHTML=d.stores.map(s=>{const items=s.results||s.items||[];const real=items.filter(i=>(i.changes||[]).length);
 const ok=items.filter(i=>i.status==='OK').length,fail=items.filter(i=>i.status==='FAILED').length;
