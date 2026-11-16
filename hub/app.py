@@ -2698,7 +2698,8 @@ def admin_operations(limit:int=50):
 # --- Fase 3: modo Global (varias tiendas, emparejado por SKU, con preflight) ---------------
 GLOBAL_FIELD_LABELS={'status':'Estado','vendor':'Proveedor','productType':'Tipo de producto','weight':'Peso','weightUnit':'Unidad de peso','taxable':'Cobrar impuestos','inventoryPolicy':'Si no hay stock','tracked':'Seguimiento de stock','requiresShipping':'Requiere envío'}
 # Precios y costes quedan fuera a propósito: cada tienda puede tener otra moneda.
-GLOBAL_FIELDS={'product':{'status','vendor','productType'},'variant':{'weight','weightUnit','taxable','inventoryPolicy','tracked','requiresShipping'}}
+_GLOBAL_VARIANT_FIELDS={'weight','weightUnit','taxable','inventoryPolicy','tracked','requiresShipping'}
+GLOBAL_FIELDS={'product':{'status','vendor','productType'},'variant':_GLOBAL_VARIANT_FIELDS,'product_variants':_GLOBAL_VARIANT_FIELDS}
 GLOBAL_MAX_SKUS=200
 
 class AdminGlobalChange(BaseModel):
@@ -2733,7 +2734,7 @@ def admin_global_change(scope,c):
     return {'kind':'field','label':GLOBAL_FIELD_LABELS[c.field],'field':c.field,'value':v}
 
 def admin_global_prepare(x):
-    if x.scope not in ('product','variant'): raise HTTPException(400,'Ámbito no válido')
+    if x.scope not in ('product','variant','product_variants'): raise HTTPException(400,'Ámbito no válido')
     skus=list(dict.fromkeys(s.strip() for s in x.skus if s.strip()))
     if not skus: raise HTTPException(400,'Indica al menos un SKU')
     if len(skus)>GLOBAL_MAX_SKUS: raise HTTPException(400,f'Máximo {GLOBAL_MAX_SKUS} SKU por operación')
@@ -2772,6 +2773,26 @@ def admin_global_fetch(st,scope,ids,changes):
             if n: nodes[n['id']]=n
     return nodes
 
+ADMIN_PV_FIELDS='id title sku product { id title } '
+def admin_global_fetch_product_variants(st,product_ids,changes):
+    """{id_variante: nodo} con TODAS las variantes de los productos indicados (con los campos y metacampos de los cambios)."""
+    aliases=' '.join('m%d:metafield(namespace:%s,key:%s){ value }'%(i,json.dumps(c['namespace']),json.dumps(c['key'])) for i,c in enumerate(changes) if c['kind']=='metafield')
+    sel=f'{ADMIN_PV_FIELDS}{ADMIN_VARIANT_FIELDS_GQL} {aliases}'
+    page_q='query($id:ID!,$after:String){ product(id:$id){ id title variants(first:100,after:$after){ nodes{ %s } pageInfo{ hasNextPage endCursor } } } }'%sel
+    out={}
+    def add(product_title,nodes):
+        for n in nodes:
+            out[n['id']]=n
+    for i in range(0,len(product_ids),5):
+        data=admin_gql(st,'query($ids:[ID!]!){ nodes(ids:$ids){ ... on Product { id title variants(first:100){ nodes{ %s } pageInfo{ hasNextPage endCursor } } } } }'%sel,{'ids':product_ids[i:i+5]})
+        for p in data.get('nodes') or []:
+            if not p: continue
+            add(p['title'],p['variants']['nodes']); info=p['variants']['pageInfo']
+            while info.get('hasNextPage') and info.get('endCursor'):  # productos con más de 100 variantes
+                more=(admin_gql(st,page_q,{'id':p['id'],'after':info['endCursor']}).get('product') or {}).get('variants') or {}
+                add(p['title'],more.get('nodes',[])); info=more.get('pageInfo') or {}
+    return out
+
 def admin_global_plan_store(st,scope,skus,changes):
     """Preflight de una tienda: no escribe. Las excepciones de tienda la bloquean; las de SKU solo omiten ese elemento."""
     plan={'store':st['code'],'blocked':False,'exceptions':[],'items':[]}
@@ -2796,26 +2817,36 @@ def admin_global_plan_store(st,scope,skus,changes):
         matches=resolved.get(sku.lower(),[])
         if not matches:
             plan['exceptions'].append({'code':'SKU_NOT_FOUND','sku':sku,'message':f'El SKU {sku} no existe en {st["code"]}'}); continue
-        targets={(m['id'] if scope=='variant' else m['product']['id']):m for m in matches}
-        if len(targets)>1:
-            plan['exceptions'].append({'code':'SKU_AMBIGUOUS','sku':sku,'message':f'El SKU {sku} corresponde a varios elementos en {st["code"]}'}); continue
-        eid,m=next(iter(targets.items()))
-        entities.setdefault(eid,{'id':eid,'skus':[],'product_id':m['product']['id']})['skus'].append(sku)
-    nodes=admin_global_fetch(st,scope,list(entities),changes) if entities else {}
-    for eid,e in entities.items():
-        node=nodes.get(eid)
-        if not node:
-            plan['exceptions'].append({'code':'ENTITY_UNREADABLE','sku':e['skus'][0],'message':f'No se pudo leer {e["skus"][0]} en {st["code"]}'}); continue
-        flat=admin_variant_flat(node) if scope=='variant' else None
+        for m in matches:  # si un SKU está repetido, se aplica a todas sus instancias
+            eid=m['id'] if scope=='variant' else m['product']['id']
+            e=entities.setdefault(eid,{'id':eid,'skus':[],'product_id':m['product']['id']})
+            if sku not in e['skus']: e['skus'].append(sku)
+    if scope=='product_variants':
+        nodes=admin_global_fetch_product_variants(st,list(entities),changes) if entities else {}
+        by_product={}
+        for vid,n in nodes.items(): by_product.setdefault(n['product']['id'],[]).append(n)
+        for pid,e in entities.items():
+            if not by_product.get(pid): plan['exceptions'].append({'code':'ENTITY_UNREADABLE','sku':e['skus'][0],'message':f'No se pudieron leer las variantes de {e["skus"][0]} en {st["code"]}'})
+        work=[(n['id'],n,[n.get('sku') or '(sin SKU)'],n['product']['id']) for pid in entities for n in by_product.get(pid,[])]
+    else:
+        nodes=admin_global_fetch(st,scope,list(entities),changes) if entities else {}
+        work=[]
+        for eid,e in entities.items():
+            node=nodes.get(eid)
+            if not node: plan['exceptions'].append({'code':'ENTITY_UNREADABLE','sku':e['skus'][0],'message':f'No se pudo leer {e["skus"][0]} en {st["code"]}'}); continue
+            work.append((eid,node,e['skus'],e['product_id']))
+    is_variant=scope in ('variant','product_variants')
+    for eid,node,item_skus,product_id in work:
+        flat=admin_variant_flat(node) if is_variant else None
         diff=[]
         for i,c in enumerate(changes):
             if c['kind']=='metafield': before=(node.get(f'm{i}') or {}).get('value') or ''
-            elif scope=='product': before=_text(node.get(c['field']))
+            elif not is_variant: before=_text(node.get(c['field']))
             else: before=flat[c['field']]
             if before!=c['value']: diff.append({'i':i,'label':c['label'],'before':before,'after':c['value']})
         title=node['title'] if scope=='product' else f"{(node.get('product') or {}).get('title','')} · {node.get('title','')}"
-        item={'id':eid,'skus':e['skus'],'product_id':e['product_id'],'title':title,'changes':diff}
-        if scope=='variant': item['current']={'weight':flat['weight'],'weightUnit':flat['weightUnit']}
+        item={'id':eid,'skus':item_skus,'product_id':product_id,'title':title,'changes':diff}
+        if is_variant: item['current']={'weight':flat['weight'],'weightUnit':flat['weightUnit']}
         plan['items'].append(item)
     return plan
 

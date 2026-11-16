@@ -139,3 +139,5 @@
 #v-summary .table-wrap { max-height: 300px; overflow: auto; }
 #v-table .table-wrap { max-height: 70vh; overflow: auto; }
 #v-table thead th, #v-summary thead th { position: sticky; top: 0; z-index: 2; }
+.subrow td { background: #fafbfa; }
+.subrow td:nth-child(2) { padding-left: 36px; }

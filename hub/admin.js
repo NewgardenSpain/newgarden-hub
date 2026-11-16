@@ -269,7 +269,7 @@ async function openCollection(id) {
 }
 
 /* ---------- VALORES DE UN METACAMPO ---------- */
-const V = { store: null, rows: [], byId: new Map(), total: 0, definition: null, loaded: false, busy: false, seq: 0, filterValue: null, recent: null, last: null, q: '', collIds: null, collName: '', collMap: {}, sel: new Set(), limit: 200 };
+const V = { store: null, rows: [], byId: new Map(), byProduct: new Map(), group: false, expanded: new Set(), total: 0, definition: null, loaded: false, busy: false, seq: 0, filterValue: null, recent: null, last: null, q: '', collIds: null, collName: '', collMap: {}, sel: new Set(), limit: 200 };
 const vMf = () => { const raw = $('#v-mf').value.trim(), i = raw.indexOf('.'); return i > 0 && i < raw.length - 1 ? { ns: raw.slice(0, i), key: raw.slice(i + 1) } : null; };
 const vShow = v => v === '' ? '(vacío)' : v;
 
@@ -292,7 +292,9 @@ function initValues() {
     try { const d = await api(`/api/admin/collection/product-ids?store=${enc(V.store)}&id=${enc(id)}`); V.collIds = new Set(d.ids); V.collName = name; V.recent = null; V.limit = 200; renderValues(); }
     catch (err) { $('#v-count').textContent = err.message; }
   });
-  $('#v-sel-all').onclick = () => { vFiltered().forEach(r => V.sel.add(r.id)); updateSelection(); };
+  $('#v-sel-all').onclick = () => { vMatchingIds().forEach(id => V.sel.add(id)); updateSelection(); };
+  $$('[data-vview]').forEach(b => b.onclick = () => { V.group = b.dataset.vview === 'group'; $$('[data-vview]').forEach(x => x.setAttribute('aria-pressed', x === b)); V.limit = 200; renderValues(); });
+  $('#v-table').addEventListener('click', e => { const t = e.target.closest('[data-toggle]'); if (!t) return; const id = t.dataset.toggle; V.expanded.has(id) ? V.expanded.delete(id) : V.expanded.add(id); renderValues(); });
   $('#v-sel-none').onclick = () => { V.sel.clear(); updateSelection(); };
   $('#v-more').onclick = () => { V.limit += 300; renderValues(); };
   $('#v-new').addEventListener('input', updateSelection); $('#v-clear').addEventListener('change', () => { $('#v-new').disabled = $('#v-clear').checked; updateSelection(); });
@@ -311,7 +313,9 @@ function initValues() {
   $('#v-table').addEventListener('change', e => {
     const one = e.target.closest('[data-vid]');
     if (one) { one.checked ? V.sel.add(one.dataset.vid) : V.sel.delete(one.dataset.vid); updateSelection(); return; }
-    if (e.target.id === 'v-all') { vShownRows().forEach(r => e.target.checked ? V.sel.add(r.id) : V.sel.delete(r.id)); updateSelection(); }
+    const prod = e.target.closest('[data-pid]');
+    if (prod) { (V.byProduct.get(prod.dataset.pid) || []).forEach(r => prod.checked ? V.sel.add(r.id) : V.sel.delete(r.id)); updateSelection(); return; }
+    if (e.target.id === 'v-all') { vShownIds().forEach(id => e.target.checked ? V.sel.add(id) : V.sel.delete(id)); updateSelection(); }
   });
   loadDefs().then(d => {
     $('#v-mf-list').innerHTML = d.rows.filter(r => r.owner === 'PRODUCTVARIANT' && !((Object.values(r.stores).find(Boolean) || {}).type || '').includes('reference')).map(r => `<option value="${esc(r.namespace + '.' + r.key)}" label="${esc(r.name || '')}">`).join('');
@@ -325,7 +329,7 @@ async function loadValues() {
   if (!V.store) { st.textContent = 'No hay tiendas disponibles.'; return; }
   if (!mf) { st.textContent = 'Escribe el metacampo como namespace.clave (por ejemplo custom.tiempo_de_entrega).'; return; }
   const seq = ++V.seq;
-  Object.assign(V, { rows: [], byId: new Map(), filterValue: null, recent: null, last: null, loaded: false, limit: 200 }); V.sel.clear();
+  Object.assign(V, { rows: [], byId: new Map(), byProduct: new Map(), expanded: new Set(), filterValue: null, recent: null, last: null, loaded: false, limit: 200 }); V.sel.clear();
   $('#v-main').hidden = true; $('#v-bar').hidden = true; $('#v-result').innerHTML = '';
   let after = null, first = true;
   try {
@@ -333,7 +337,7 @@ async function loadValues() {
       const d = await api(`/api/admin/values/page?store=${enc(V.store)}&namespace=${enc(mf.ns)}&key=${enc(mf.key)}${after ? '&after=' + enc(after) : ''}`);
       if (seq !== V.seq) return;
       if (first) { V.total = d.total || 0; V.definition = d.definition; first = false; }
-      d.variants.forEach(v => { V.rows.push(v); V.byId.set(v.id, v); });
+      d.variants.forEach(v => { V.rows.push(v); V.byId.set(v.id, v); (V.byProduct.get(v.product_id) || V.byProduct.set(v.product_id, []).get(v.product_id)).push(v); });
       st.textContent = `Cargando variantes… ${V.rows.length}${V.total ? ' de ' + V.total : ''}`;
       after = d.has_next ? d.cursor : null;
     } while (after);
@@ -346,29 +350,58 @@ async function loadValues() {
 function vFiltered() {
   return V.rows.filter(r => (V.filterValue === null || r.value === V.filterValue) && (!V.recent || V.recent.has(r.id)) && (!V.q || norm(`${r.sku} ${r.product} ${r.title}`).includes(V.q)) && (!V.collIds || V.collIds.has(r.product_id)));
 }
-const vShownRows = () => vFiltered().slice(0, V.limit);
+// Productos con alguna variante que cumple los filtros, con TODAS sus variantes.
+function vProducts() { const seen = new Map(); vFiltered().forEach(r => { if (!seen.has(r.product_id)) seen.set(r.product_id, V.byProduct.get(r.product_id) || [r]); }); return [...seen.values()]; }
+const vShownIds = () => V.group ? vProducts().slice(0, V.limit).flat().map(r => r.id) : vFiltered().slice(0, V.limit).map(r => r.id);
+const vMatchingIds = () => V.group ? vProducts().flat().map(r => r.id) : vFiltered().map(r => r.id);
+
+function productRows(vs) {
+  const pid = vs[0].product_id, open = V.expanded.has(pid), counts = new Map();
+  vs.forEach(v => counts.set(v.value, (counts.get(v.value) || 0) + 1));
+  const sum = [...counts].map(([v, c]) => `${v === '' ? '<em>(vacío)</em>' : esc(v)} <span class="muted">(${c})</span>`).join(', ');
+  let h = `<tr data-prod="${esc(pid)}"><td class="chk"><input type="checkbox" data-pid="${esc(pid)}" aria-label="Seleccionar todas las variantes de ${esc(vs[0].product)}"></td><td class="wrap-cell"><button type="button" class="row-link" data-toggle="${esc(pid)}" aria-expanded="${open}">${open ? '▾' : '▸'} ${esc(vs[0].product)}</button><small>${vs.length} ${vs.length === 1 ? 'variante' : 'variantes'}</small></td><td class="wrap-cell">${sum}</td><td class="wrap-cell after"></td></tr>`;
+  if (open) h += vs.map(r => `<tr class="subrow" data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}" aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="wrap-cell"><small>${esc(r.sku)} · ${esc(r.title)}</small></td><td class="wrap-cell">${r.value === '' ? '<span class="muted">(vacío)</span>' : esc(r.value)}</td><td class="wrap-cell after"></td></tr>`).join('');
+  return h;
+}
 
 function renderValues() {
   const counts = new Map(); V.rows.forEach(r => counts.set(r.value, (counts.get(r.value) || 0) + 1));
   const list = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   $('#v-summary').innerHTML = table(['Valor', 'Variantes', ''], list.map(([v, n]) => `<tr${V.filterValue === v ? ' class="vrow-sel"' : ''}><td class="wrap-cell">${v === '' ? '<em>(vacío)</em>' : esc(v)}</td><td class="nw">${n}</td><td class="nw"><button type="button" class="button secondary" data-vfilter="${esc(v)}" aria-pressed="${V.filterValue === v}">${V.filterValue === v ? 'Quitar filtro' : 'Ver'}</button> ${V.definition ? `<button type="button" class="button secondary" data-vreplace="${esc(v)}">Reemplazar…</button>` : ''}</td></tr>`).join(''));
   $('#v-filters').innerHTML = (V.filterValue !== null ? `<span class="vchip">Valor: «${esc(vShow(V.filterValue))}» <button type="button" class="button secondary" data-clear="value" aria-label="Quitar filtro de valor">✕</button></span>` : '') + (V.recent ? `<span class="vchip">Cambiadas ahora: ${V.recent.size} <button type="button" class="button secondary" data-clear="recent" aria-label="Quitar filtro de cambiadas">✕</button></span>` : '') + (V.collIds ? `<span class="vchip">Colección: ${esc(V.collName)} <button type="button" class="button secondary" data-clear="coll" aria-label="Quitar filtro de colección">✕</button></span>` : '');
-  const f = vFiltered(), shownRows = f.slice(0, V.limit);
-  $('#v-table').innerHTML = f.length ? table(['<input type="checkbox" id="v-all" aria-label="Seleccionar las variantes mostradas">', 'SKU', 'Producto', 'Valor actual', 'Después'], shownRows.map(r => `<tr data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}" aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="nw">${esc(r.sku)}</td><td class="wrap-cell">${esc(r.product)}<small>${esc(r.title)}</small></td><td class="wrap-cell">${r.value === '' ? '<span class="muted">(vacío)</span>' : esc(r.value)}</td><td class="wrap-cell after"></td></tr>`).join('')) : '<p class="muted">Ninguna variante coincide con los filtros.</p>';
-  $('#v-more').hidden = f.length <= V.limit;
+  $('#v-sel-all').textContent = V.group ? 'Seleccionar los productos que coinciden' : 'Seleccionar las que coinciden';
+  $('#v-view-hint').textContent = V.group ? 'Marcar un producto selecciona todas sus variantes, tengan el valor que tengan.' : '';
+  const f = vFiltered(); let more = false;
+  if (!f.length) $('#v-table').innerHTML = '<p class="muted">Ninguna variante coincide con los filtros.</p>';
+  else if (!V.group) {
+    $('#v-table').innerHTML = table(['<input type="checkbox" id="v-all" aria-label="Seleccionar las variantes mostradas">', 'SKU', 'Producto', 'Valor actual', 'Después'], f.slice(0, V.limit).map(r => `<tr data-row="${esc(r.id)}"><td class="chk"><input type="checkbox" data-vid="${esc(r.id)}" aria-label="Seleccionar ${esc(r.sku || r.title)}"></td><td class="nw">${esc(r.sku)}</td><td class="wrap-cell">${esc(r.product)}<small>${esc(r.title)}</small></td><td class="wrap-cell">${r.value === '' ? '<span class="muted">(vacío)</span>' : esc(r.value)}</td><td class="wrap-cell after"></td></tr>`).join(''));
+    more = f.length > V.limit;
+  } else {
+    const prods = vProducts();
+    $('#v-table').innerHTML = table(['<input type="checkbox" id="v-all" aria-label="Seleccionar las variantes de los productos mostrados">', 'Producto', 'Valores actuales', 'Después'], prods.slice(0, V.limit).map(productRows).join(''));
+    more = prods.length > V.limit;
+  }
+  $('#v-more').hidden = !more;
   updateSelection();
 }
 
 function updateSelection() {
   const f = vFiltered(), clear = $('#v-clear').checked, nv = clear ? '' : $('#v-new').value.trim();
   $$('#v-table tbody tr').forEach(tr => {
+    if (tr.dataset.prod) {
+      const vs = V.byProduct.get(tr.dataset.prod) || [], n = vs.filter(r => V.sel.has(r.id)).length, cb = $('[data-pid]', tr), todo = vs.filter(r => V.sel.has(r.id) && r.value !== nv).length;
+      cb.checked = n > 0 && n === vs.length; cb.indeterminate = n > 0 && n < vs.length; tr.classList.toggle('vrow-sel', n > 0);
+      $('.after', tr).innerHTML = n && (nv || clear) ? (todo ? `<span class="vnew">${clear ? '(vacío)' : esc(nv)}</span> <small>${todo} de ${vs.length} se cambian</small>` : '<span class="muted">sin cambios</span>') : '<span class="muted">—</span>';
+      return;
+    }
     const id = tr.dataset.row, on = V.sel.has(id), r = V.byId.get(id);
     tr.classList.toggle('vrow-sel', on); $('[data-vid]', tr).checked = on;
     $('.after', tr).innerHTML = on && (nv || clear) ? (r && r.value === nv ? '<span class="muted">sin cambios</span>' : `<span class="vnew">${clear ? '(vacío)' : esc(nv)}</span>`) : '<span class="muted">—</span>';
   });
-  const all = $('#v-all'), shownRows = vShownRows(), n = shownRows.filter(r => V.sel.has(r.id)).length;
-  if (all) { all.checked = n > 0 && n === shownRows.length; all.indeterminate = n > 0 && n < shownRows.length; }
-  $('#v-count').textContent = `${f.length} de ${V.rows.length} variantes coinciden · ${V.sel.size} seleccionadas` + (() => { const out = [...V.sel].filter(id => !f.some(r => r.id === id)).length; return out ? ` (${out} fuera del filtro actual)` : ''; })() + (f.length > V.limit ? ` (se muestran ${V.limit})` : '');
+  const all = $('#v-all'), shownIds = vShownIds(), n = shownIds.filter(id => V.sel.has(id)).length;
+  if (all) { all.checked = n > 0 && n === shownIds.length; all.indeterminate = n > 0 && n < shownIds.length; }
+  const matching = new Set(vMatchingIds()), out = [...V.sel].filter(id => !matching.has(id)).length;
+  $('#v-count').textContent = (V.group ? `${vProducts().length} productos (${f.length} variantes) coinciden` : `${f.length} de ${V.rows.length} variantes coinciden`) + ` · ${V.sel.size} variantes seleccionadas` + (out ? ` (${out} fuera del filtro actual)` : '') + (V.group ? '' : (f.length > V.limit ? ` (se muestran ${V.limit})` : ''));
   const groups = new Map(); V.sel.forEach(id => { const r = V.byId.get(id); if (r) groups.set(r.value, (groups.get(r.value) || 0) + 1); });
   const changing = [...V.sel].filter(id => V.byId.get(id) && V.byId.get(id).value !== nv).length;
   $('#v-bar').hidden = !V.loaded;
@@ -477,12 +510,13 @@ const FIELDS = {
     { id: 'f:tracked', key: 'tracked', label: 'Seguimiento de stock', control: 'bool' },
     { id: 'f:requiresShipping', key: 'requiresShipping', label: 'Requiere envío', control: 'bool' }],
 };
-const SCOPE_HINT = { product: 'Se modifica el producto que contiene cada SKU.', variant: 'Se modifica solo la variante que tiene ese SKU.' };
+FIELDS.product_variants = FIELDS.variant;
+const SCOPE_HINT = { product: 'Se modifica el producto que contiene cada SKU.', variant: 'Se modifica solo la variante que tiene ese SKU.', product_variants: 'Se modifican todas las variantes del producto que contiene cada SKU. Si un SKU está repetido, se aplica a todas sus instancias.' };
 let scope = 'product', comboSeq = 0;
 const OPEN_ROWS = () => $$('#g-changes .change');
 
 function scopeOptions() {
-  const out = FIELDS[scope].map(f => ({ ...f, kind: 'field', sub: '', group: scope === 'product' ? 'Campos del producto' : 'Campos de la variante', tagText: '' }));
+  const out = FIELDS[scope].map(f => ({ ...f, kind: 'field', sub: '', group: scope === 'product' ? 'Campos del producto' : 'Campos de las variantes', tagText: '' }));
   if (state.defs) {
     const owner = scope === 'product' ? 'PRODUCT' : 'PRODUCTVARIANT';
     state.defs.rows.filter(r => r.owner === owner).forEach(r => {

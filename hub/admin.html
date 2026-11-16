@@ -46,7 +46,7 @@
 
   <div class="step">
     <div class="step-head"><span class="step-n">1</span><h2>¿Qué elementos?</h2></div>
-    <div class="seg" role="group" aria-label="Ámbito"><button type="button" data-scope="product" aria-pressed="true">Productos</button><button type="button" data-scope="variant" aria-pressed="false">Variantes</button></div>
+    <div class="seg" role="group" aria-label="Ámbito"><button type="button" data-scope="product" aria-pressed="true">Productos</button><button type="button" data-scope="variant" aria-pressed="false">Variantes</button><button type="button" data-scope="product_variants" aria-pressed="false">Todas las variantes de un producto</button></div>
     <p class="step-hint" id="scope-hint"></p>
     <div class="field"><label for="g-skus">SKU <span class="muted">(uno por línea o separados por comas)</span></label><textarea id="g-skus" rows="4" spellcheck="false"></textarea><p class="muted" id="sku-count">0 SKU</p></div>
   </div>
@@ -90,6 +90,7 @@
     </div>
     <div class="step">
       <div class="step-head"><h2>Variantes</h2></div>
+      <div class="adm-bar"><div class="seg" role="group" aria-label="Vista de la lista"><button type="button" data-vview="list" aria-pressed="true">Por variante</button><button type="button" data-vview="group" aria-pressed="false">Por producto</button></div><p class="muted" id="v-view-hint" style="margin:0"></p></div>
       <div class="adm-bar">
         <div class="adm-search"><input id="v-q" type="search" placeholder="Buscar por nombre o SKU" aria-label="Buscar por nombre, SKU o variante"><input id="v-coll" list="v-coll-list" type="search" placeholder="Filtrar por colección" aria-label="Filtrar por colección" autocomplete="off"><datalist id="v-coll-list"></datalist></div>
         <div class="actions" style="margin:0"><button type="button" class="button secondary" id="v-sel-all">Seleccionar las que coinciden</button><button type="button" class="button secondary" id="v-sel-none">Quitar selección</button></div>
