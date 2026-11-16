@@ -1,3 +1,4 @@
+from decimal import Decimal
 import hashlib, json, logging, os, html, re, threading, time, uuid
 import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2440,6 +2441,18 @@ def admin_product(store:str,id:str):
     product=shopify_product(st,id,[])
     if not product: raise HTTPException(404,'Producto no encontrado en la tienda')
     for key in ('translation_error','translations_by_locale'): product.pop(key,None)
+    # Datos comerciales de las variantes (precio, coste, peso…): si faltan permisos, el resto del detalle sigue funcionando.
+    try:
+        extras={}; after=None
+        while True:
+            page=((admin_gql(st,ADMIN_VARIANT_EXTRA,{'id':id,'after':after}).get('product') or {}).get('variants')) or {}
+            for n in page.get('nodes',[]): extras[n['id']]=admin_variant_flat(n)
+            info=page.get('pageInfo') or {}
+            if not info.get('hasNextPage') or not info.get('endCursor'): break
+            after=info['endCursor']
+        for v in product.get('variants',{}).get('nodes',[]): v['extra']=extras.get(v['id'])
+    except HTTPException as exc:
+        product['variant_extra_error']=str(exc.detail)[:300]
     return {'store':st['code'],'product':product}
 
 @app.get('/api/admin/collections')
@@ -2556,23 +2569,71 @@ def admin_collection_update(x:AdminEntityUpdate):
     admin_mutate(st,'collection.update',x.id,'mutation($input:CollectionInput!){collectionUpdate(input:$input){collection{id} userErrors{field message}}}',{'input':collection},'collectionUpdate',{k:current[k] for k in changes},changes)
     return {'store':st['code'],'changed':list(changes),'saved':True}
 
+ADMIN_VARIANT_FIELDS_GQL='price compareAtPrice taxable inventoryPolicy inventoryItem { tracked requiresShipping unitCost { amount currencyCode } measurement { weight { value unit } } }'
+ADMIN_VARIANT_EXTRA='query($id:ID!,$after:String){product(id:$id){variants(first:100,after:$after){nodes{id '+ADMIN_VARIANT_FIELDS_GQL+'} pageInfo{hasNextPage endCursor}}}}'
+ADMIN_VARIANT_UNITS={'GRAMS','KILOGRAMS','OUNCES','POUNDS'}
+
+def _dec(value):
+    """Normaliza un número decimal para compararlo ('10', '10.00' y '10.0' son iguales). Vacío → ''."""
+    if value is None or str(value).strip()=='' : return ''
+    try: d=Decimal(str(value).strip().replace(',','.'))
+    except Exception: raise HTTPException(400,f'Número no válido: {value}')
+    if not d.is_finite() or d<0: raise HTTPException(400,f'Número no válido: {value}')
+    return format(d.normalize(),'f') if d!=0 else '0'
+
+def admin_variant_flat(node):
+    item=node.get('inventoryItem') or {}; weight=((item.get('measurement') or {}).get('weight')) or {}; cost=item.get('unitCost') or {}
+    return {'price':_dec(node.get('price')),'compareAtPrice':_dec(node.get('compareAtPrice')),'cost':_dec(cost.get('amount')),'currency':cost.get('currencyCode') or '',
+            'weight':_dec(weight.get('value')),'weightUnit':weight.get('unit') or 'KILOGRAMS','taxable':bool(node.get('taxable')),'inventoryPolicy':node.get('inventoryPolicy') or 'DENY',
+            'tracked':bool(item.get('tracked')),'requiresShipping':bool(item.get('requiresShipping'))}
+
 class AdminVariantUpdate(BaseModel):
     store:str
     id:str
     fields:dict
 
+ADMIN_VARIANT_TEXT={'sku','barcode'}
+ADMIN_VARIANT_DECIMAL={'price','compareAtPrice','cost','weight'}
+ADMIN_VARIANT_BOOL={'taxable','tracked','requiresShipping'}
+ADMIN_VARIANT_ALLOWED=ADMIN_VARIANT_TEXT|ADMIN_VARIANT_DECIMAL|ADMIN_VARIANT_BOOL|{'inventoryPolicy','weightUnit'}
+
 @app.post('/api/admin/variant/update')
 def admin_variant_update(x:AdminVariantUpdate):
     st=admin_store(x.store)
     if not x.id.startswith('gid://shopify/ProductVariant/'): raise HTTPException(400,'Identificador de variante no válido')
-    node=admin_gql(st,'query($id:ID!){productVariant(id:$id){sku barcode product{id}}}',{'id':x.id}).get('productVariant')
+    node=admin_gql(st,'query($id:ID!){productVariant(id:$id){sku barcode product{id} '+ADMIN_VARIANT_FIELDS_GQL+'}}',{'id':x.id}).get('productVariant')
     if not node: raise HTTPException(404,'Variante no encontrada en la tienda')
-    current={'sku':_text(node.get('sku')),'barcode':_text(node.get('barcode'))}
-    changes=_changed(current,{k:_text(v).strip() for k,v in x.fields.items()},{'sku','barcode'})
+    current={'sku':_text(node.get('sku')),'barcode':_text(node.get('barcode')),**admin_variant_flat(node)}
+    fields={}
+    for k,v in x.fields.items():
+        if k in ADMIN_VARIANT_TEXT: fields[k]=_text(v).strip()
+        elif k in ADMIN_VARIANT_DECIMAL: fields[k]=_dec(v)
+        elif k in ADMIN_VARIANT_BOOL:
+            if not isinstance(v,bool): raise HTTPException(400,f'{k} debe ser verdadero o falso')
+            fields[k]=v
+        else: fields[k]=v
+    if fields.get('inventoryPolicy',current['inventoryPolicy']) not in ('DENY','CONTINUE'): raise HTTPException(400,'Política de inventario no válida')
+    if fields.get('weightUnit',current['weightUnit']) not in ADMIN_VARIANT_UNITS: raise HTTPException(400,'Unidad de peso no válida')
+    changes=_changed(current,fields,ADMIN_VARIANT_ALLOWED)
     if not changes: return {'store':st['code'],'changed':[],'saved':False}
+    if 'price' in changes and changes['price']=='': raise HTTPException(400,'El precio no puede quedar vacío')
+    if 'cost' in changes and changes['cost']=='': raise HTTPException(400,'Shopify no permite vaciar el coste desde aquí')
     variant={'id':x.id}
     if 'barcode' in changes: variant['barcode']=changes['barcode']
-    if 'sku' in changes: variant['inventoryItem']={'sku':changes['sku']}
+    if 'price' in changes: variant['price']=changes['price']
+    if 'compareAtPrice' in changes: variant['compareAtPrice']=changes['compareAtPrice'] or None
+    if 'taxable' in changes: variant['taxable']=changes['taxable']
+    if 'inventoryPolicy' in changes: variant['inventoryPolicy']=changes['inventoryPolicy']
+    item={}
+    if 'sku' in changes: item['sku']=changes['sku']
+    if 'tracked' in changes: item['tracked']=changes['tracked']
+    if 'requiresShipping' in changes: item['requiresShipping']=changes['requiresShipping']
+    if 'cost' in changes: item['cost']=changes['cost']
+    if 'weight' in changes or 'weightUnit' in changes:
+        weight=changes.get('weight',current['weight'])
+        if weight=='': raise HTTPException(400,'Indica el peso para cambiar su unidad')
+        item['measurement']={'weight':{'value':float(weight),'unit':changes.get('weightUnit',current['weightUnit'])}}
+    if item: variant['inventoryItem']=item
     admin_mutate(st,'variant.update',x.id,'mutation($productId:ID!,$variants:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$productId,variants:$variants){productVariants{id} userErrors{field message}}}',{'productId':node['product']['id'],'variants':[variant]},'productVariantsBulkUpdate',{k:current[k] for k in changes},changes)
     return {'store':st['code'],'changed':list(changes),'saved':True}
 
@@ -2644,18 +2705,23 @@ else{rows=rows.concat(d.collections);res.innerHTML=table(['Colección','Handle',
 }catch(err){res.innerHTML='';st.textContent=err.message}}
 const fld=(id,label,val,area)=>'<div class="field"><label for="'+id+'">'+label+'</label>'+(area?'<textarea id="'+id+'" rows="6">'+esc(val)+'</textarea>':'<input id="'+id+'" value="'+esc(val)+'">')+'</div>';
 async function post(path,body,btn){const st=$('#detail-status');btn.disabled=true;st.textContent='Guardando…';try{const d=await fetchJSON(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});st.textContent=d.saved?'Guardado en '+tab+(d.changed&&d.changed.length?' ('+d.changed.join(', ')+')':'')+'.':'Sin cambios.';return d}catch(err){st.textContent=err.message}finally{btn.disabled=false}}
-function mfRows(nodes){return nodes.map(m=>'<tr><td>'+esc(m.namespace+'.'+m.key)+'</td><td><span class="badge">'+esc(m.type)+'</span></td><td class="wrap-cell"><textarea rows="2" data-mf-ns="'+esc(m.namespace)+'" data-mf-key="'+esc(m.key)+'" data-mf-type="'+esc(m.type)+'" data-mf-digest="'+esc(m.compareDigest||'')+'" data-mf-orig="'+esc(m.value)+'">'+esc(m.value)+'</textarea></td><td><button class="button secondary" data-mf-save>Guardar</button></td></tr>').join('')||'<tr><td colspan="4" class="muted">Sin metacampos</td></tr>'}
-function bindMetafields(owner,root){root.querySelectorAll('[data-mf-save]').forEach(b=>b.onclick=async()=>{const t=b.closest('tr').querySelector('textarea');const d=await post('/api/admin/metafield/set',{store:tab,owner_id:owner,namespace:t.dataset.mfNs,key:t.dataset.mfKey,type:t.dataset.mfType,value:t.value,compare_digest:t.dataset.mfDigest||null},b);if(d&&d.saved)t.dataset.mfDigest=''})}
+function mfRows(nodes,owner){return nodes.map(m=>'<tr><td>'+esc(m.namespace+'.'+m.key)+'</td><td><span class="badge">'+esc(m.type)+'</span></td><td class="wrap-cell"><textarea rows="2" data-mf-owner="'+esc(owner||'')+'" data-mf-ns="'+esc(m.namespace)+'" data-mf-key="'+esc(m.key)+'" data-mf-type="'+esc(m.type)+'" data-mf-digest="'+esc(m.compareDigest||'')+'" data-mf-orig="'+esc(m.value)+'">'+esc(m.value)+'</textarea></td><td><button class="button secondary" data-mf-save>Guardar</button></td></tr>').join('')||'<tr><td colspan="4" class="muted">Sin metacampos</td></tr>'}
+function bindMetafields(owner,root){root.querySelectorAll('[data-mf-save]').forEach(b=>b.onclick=async()=>{const t=b.closest('tr').querySelector('textarea');const d=await post('/api/admin/metafield/set',{store:tab,owner_id:t.dataset.mfOwner||owner,namespace:t.dataset.mfNs,key:t.dataset.mfKey,type:t.dataset.mfType,value:t.value,compare_digest:t.dataset.mfDigest||null},b);if(d&&d.saved)t.dataset.mfDigest=''})}
+function variantCard(v,total){const x=v.extra,chk=(k,l,val)=>'<div class="field"><label><input type="checkbox" data-v="'+k+'"'+(val?' checked':'')+' style="width:auto"> '+l+'</label></div>';
+const adv=x?'<div class="grid">'+fld2('price','Precio',x.price)+fld2('compareAtPrice','Precio de comparación',x.compareAtPrice)+fld2('cost','Coste por artículo ('+esc(x.currency)+')',x.cost)+fld2('weight','Peso',x.weight)+'<div class="field"><label>Unidad de peso</label><select data-v="weightUnit">'+['KILOGRAMS','GRAMS','POUNDS','OUNCES'].map(u=>'<option'+(u===x.weightUnit?' selected':'')+'>'+u+'</option>').join('')+'</select></div><div class="field"><label>Si no hay stock</label><select data-v="inventoryPolicy"><option value="DENY"'+(x.inventoryPolicy==='DENY'?' selected':'')+'>Dejar de vender</option><option value="CONTINUE"'+(x.inventoryPolicy==='CONTINUE'?' selected':'')+'>Seguir vendiendo</option></select></div></div><div class="actions">'+chk('taxable','Cobrar impuestos',x.taxable)+chk('tracked','Hacer seguimiento del stock',x.tracked)+chk('requiresShipping','Requiere envío',x.requiresShipping)+'</div>':'';
+return '<details class="card" data-variant="'+esc(v.id)+'"'+(total<=3?' open':'')+'><summary><strong>'+esc(v.title)+'</strong> · <span class="muted">'+esc(v.sku||'sin SKU')+'</span></summary><div class="grid">'+fld2('sku','SKU',v.sku)+fld2('barcode','Código de barras',v.barcode)+'</div>'+adv+'<div class="actions"><button class="button primary" data-v-save>Guardar variante</button></div><h4>Metacampos de la variante</h4>'+table(['Clave','Tipo','Valor',''],mfRows(v.metafields.nodes,v.id))+'</details>'}
+const fld2=(k,l,val)=>'<div class="field"><label>'+l+'</label><input data-v="'+k+'" value="'+esc(val)+'"></div>';
+function variantFields(card){const o={};card.querySelectorAll('[data-v]').forEach(e=>{o[e.dataset.v]=e.type==='checkbox'?e.checked:e.value});return o}
 async function openProduct(id){const box=$('#detail');box.hidden=false;box.innerHTML='<p class="muted">Cargando…</p>';
 try{const p=(await fetchJSON('/api/admin/product?store='+encodeURIComponent(tab)+'&id='+encodeURIComponent(id))).product;
-box.innerHTML='<h2>'+esc(p.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('f-title','Título',p.title)+fld('f-handle','Handle (crea redirección)',p.handle)+fld('f-vendor','Proveedor',p.vendor)+fld('f-type','Tipo de producto',p.productType)+'<div class="field"><label for="f-status">Estado</label><select id="f-status">'+['ACTIVE','DRAFT','ARCHIVED'].map(s=>'<option'+(s===p.status?' selected':'')+'>'+s+'</option>').join('')+'</select></div>'+fld('f-tags','Etiquetas (separadas por coma)',(p.tags||[]).join(', '))+fld('f-seot','Título SEO',(p.seo||{}).title||'')+fld('f-seod','Descripción SEO',(p.seo||{}).description||'')+'</div>'+fld('f-desc','Descripción (HTML)',p.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-product">Guardar producto</button></div><h3>Variantes</h3>'+table(['SKU','Título','Código de barras',''],p.variants.nodes.map(v=>'<tr data-variant="'+esc(v.id)+'"><td><input data-v="sku" value="'+esc(v.sku)+'"></td><td>'+esc(v.title)+'</td><td><input data-v="barcode" value="'+esc(v.barcode)+'"></td><td><button class="button secondary" data-v-save>Guardar</button></td></tr>').join(''))+'<h3>Metacampos del producto</h3>'+table(['Clave','Tipo','Valor',''],mfRows(p.metafields.nodes));
+box.innerHTML='<h2>'+esc(p.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('f-title','Título',p.title)+fld('f-handle','Handle (crea redirección)',p.handle)+fld('f-vendor','Proveedor',p.vendor)+fld('f-type','Tipo de producto',p.productType)+'<div class="field"><label for="f-status">Estado</label><select id="f-status">'+['ACTIVE','DRAFT','ARCHIVED'].map(s=>'<option'+(s===p.status?' selected':'')+'>'+s+'</option>').join('')+'</select></div>'+fld('f-tags','Etiquetas (separadas por coma)',(p.tags||[]).join(', '))+fld('f-seot','Título SEO',(p.seo||{}).title||'')+fld('f-seod','Descripción SEO',(p.seo||{}).description||'')+'</div>'+fld('f-desc','Descripción (HTML)',p.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-product">Guardar producto</button></div><h3>Variantes ('+p.variants.nodes.length+')</h3>'+(p.variant_extra_error?'<p class="status">No se pudieron leer precios y costes: '+esc(p.variant_extra_error)+'</p>':'')+p.variants.nodes.map((v,i)=>variantCard(v,p.variants.nodes.length)).join('')+'<h3>Metacampos del producto</h3>'+table(['Clave','Tipo','Valor',''],mfRows(p.metafields.nodes,p.id));
 $('#save-product').onclick=async e=>{const d=await post('/api/admin/product/update',{store:tab,id,fields:{title:$('#f-title').value,handle:$('#f-handle').value,vendor:$('#f-vendor').value,productType:$('#f-type').value,status:$('#f-status').value,tags:$('#f-tags').value,seo_title:$('#f-seot').value,seo_description:$('#f-seod').value,descriptionHtml:$('#f-desc').value}},e.target);void d};
-box.querySelectorAll('[data-v-save]').forEach(b=>b.onclick=()=>{const r=b.closest('tr');post('/api/admin/variant/update',{store:tab,id:r.dataset.variant,fields:{sku:r.querySelector('[data-v=sku]').value,barcode:r.querySelector('[data-v=barcode]').value}},b)});
+box.querySelectorAll('[data-v-save]').forEach(b=>b.onclick=()=>{const r=b.closest('details');post('/api/admin/variant/update',{store:tab,id:r.dataset.variant,fields:variantFields(r)},b)});
 bindMetafields(id,box);
 box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
 async function openCollection(id){const box=$('#detail');box.hidden=false;box.innerHTML='<p class="muted">Cargando…</p>';
 try{const c=(await fetchJSON('/api/admin/collection?store='+encodeURIComponent(tab)+'&id='+encodeURIComponent(id))).collection;
-box.innerHTML='<h2>'+esc(c.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('c-title','Título',c.title)+fld('c-handle','Handle (crea redirección)',c.handle)+fld('c-seot','Título SEO',(c.seo||{}).title||'')+fld('c-seod','Descripción SEO',(c.seo||{}).description||'')+'</div>'+fld('c-desc','Descripción (HTML)',c.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-collection">Guardar colección</button></div><h3>Metacampos de la colección</h3>'+table(['Clave','Tipo','Valor',''],mfRows(c.metafields.nodes));
+box.innerHTML='<h2>'+esc(c.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('c-title','Título',c.title)+fld('c-handle','Handle (crea redirección)',c.handle)+fld('c-seot','Título SEO',(c.seo||{}).title||'')+fld('c-seod','Descripción SEO',(c.seo||{}).description||'')+'</div>'+fld('c-desc','Descripción (HTML)',c.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-collection">Guardar colección</button></div><h3>Metacampos de la colección</h3>'+table(['Clave','Tipo','Valor',''],mfRows(c.metafields.nodes,c.id));
 $('#save-collection').onclick=async e=>{const d=await post('/api/admin/collection/update',{store:tab,id,fields:{title:$('#c-title').value,handle:$('#c-handle').value,seo_title:$('#c-seot').value,seo_description:$('#c-seod').value,descriptionHtml:$('#c-desc').value}},e.target);void d};
 bindMetafields(id,box);box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
 (async()=>{try{stores=(await fetchJSON('/api/admin/stores')).stores;section='metafields';renderTabs();renderSections();load(true)}catch(err){$('#result').innerHTML='<p class="status">'+esc(err.message)+'</p>'}})();
