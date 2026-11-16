@@ -619,12 +619,65 @@ function initMulti() {
   $('#g-stores').innerHTML = state.stores.map(s => `<label class="chip"><input type="checkbox" value="${esc(s.code)}" checked><span>${esc(s.code)}</span></label>`).join('');
   $$('[data-scope]').forEach(b => b.onclick = () => { if (b.dataset.scope !== scope) setScope(b.dataset.scope); });
   $('#g-skus').addEventListener('input', () => { const n = parseSkus().length; $('#sku-count').textContent = `${n} SKU`; });
+  $('#g-find').onclick = findByName; $('#g-check').onclick = checkDuplicates;
+  $('#g-find-q').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); findByName(); } });
   $('#g-all').onclick = () => $$('#g-stores input').forEach(i => i.checked = true);
   $('#g-none').onclick = () => $$('#g-stores input').forEach(i => i.checked = false);
   $('#g-add').onclick = () => { const r = addChange(); $('input', r).focus(); };
   $('#g-preview').onclick = e => runGlobal('/api/admin/global/preview', e.target, false);
   $('#g-apply').onclick = e => runGlobal('/api/admin/global/apply', e.target, true);
   setScope('product'); loadDefs().catch(() => {});
+}
+/* Búsqueda por nombre y control de SKU repetidos */
+const gStores = () => $$('#g-stores input:checked').map(i => i.value);
+const dupPlural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+function dupReport(stores) {
+  const bad = stores.filter(s => s.error), withDup = stores.filter(s => s.dup_skus);
+  let h = bad.map(s => `<div class="callout err"><strong>${esc(s.store)}</strong>: no se pudo comprobar (${esc(s.error)})</div>`).join('');
+  if (!withDup.length) return h + (stores.length > bad.length ? `<div class="callout ok">Ningún SKU está repetido en ${esc(stores.filter(s => !s.error).map(s => s.store).join(', '))}.</div>` : '');
+  const totalSkus = withDup.reduce((n, s) => n + s.dup_skus, 0);
+  h += `<div class="callout"><strong>SKU duplicados: ${dupPlural(totalSkus, 'caso', 'casos')} en ${dupPlural(withDup.length, 'tienda', 'tiendas')}.</strong> Un SKU repetido aplica el cambio a todas las variantes que lo comparten.</div>`;
+  h += withDup.map(s => `<details class="res-store" open><summary><strong>${esc(s.store)}</strong>${tag(`${dupPlural(s.dup_skus, 'SKU repetido', 'SKU repetidos')} · ${s.dup_variants} variantes`, 'warn')}</summary><div>${table(['SKU', 'Veces', 'Variantes que lo comparten'], s.duplicates.map(d => `<tr><td class="nw">${esc(d.sku)}</td><td class="nw">×${d.count}</td><td class="wrap-cell">${esc(d.items.join(' | '))}${d.count > d.items.length ? ' …' : ''}</td></tr>`).join(''))}</div></details>`).join('');
+  return h;
+}
+function addSkusToBox(skus) {
+  const set = new Set(parseSkus().map(x => x.toLowerCase())), add = skus.filter(x => !set.has(x.toLowerCase())), box = $('#g-skus');
+  box.value = (box.value.trim() ? box.value.trim() + '\n' : '') + add.join('\n');
+  box.dispatchEvent(new Event('input')); return add.length;
+}
+const finderBusy = on => $$('#g-find,#g-check').forEach(b => b.disabled = on);
+async function findByName() {
+  const q = $('#g-find-q').value.trim(), st = $('#g-find-status'), out = $('#g-find-result'), stores = gStores();
+  if (q.length < 2) { st.textContent = 'Escribe al menos 2 letras del nombre.'; return; }
+  if (!stores.length) { st.textContent = 'Paso 2: elige al menos una tienda.'; return; }
+  finderBusy(true); st.textContent = 'Buscando en las tiendas…'; out.innerHTML = '';
+  try {
+    const d = await post('/api/admin/global/find', { q, stores });
+    st.textContent = d.skus.length ? `${dupPlural(d.skus.length, 'SKU encontrado', 'SKU encontrados')}.` : 'No se encontró ningún producto con ese nombre.';
+    const warn = (d.errors || []).map(e => `<div class="callout err"><strong>${esc(e.store)}</strong>: ${esc(e.error)}</div>`).join('')
+      + (d.truncated.length ? `<div class="callout">Hay más resultados en ${esc(d.truncated.join(', '))}: afina el nombre para verlos todos.</div>` : '')
+      + (d.limited ? `<div class="callout">Solo se comprobaron duplicados en los primeros ${d.max} SKU.</div>` : '');
+    if (!d.skus.length) { out.innerHTML = warn; return; }
+    const dupMap = {}; d.stores.forEach(s => (s.duplicates || []).forEach(x => (dupMap[x.sku.toLowerCase()] = dupMap[x.sku.toLowerCase()] || []).push(`${s.store} ×${x.count}`)));
+    const rows = d.skus.map((e, i) => { const dp = dupMap[e.sku.toLowerCase()]; return `<tr><td class="chk"><input type="checkbox" data-i="${i}" checked aria-label="Elegir ${esc(e.sku)}"></td><td class="nw">${esc(e.sku)}${dp ? '<br>' + tag('SKU repetido: ' + dp.join(', '), 'warn') : ''}</td><td class="wrap-cell">${esc(e.title)}</td><td class="nw">${esc(e.stores.join(', '))}</td></tr>`; }).join('');
+    out.innerHTML = warn + dupReport(d.stores) + `<div class="actions"><button type="button" class="button primary" id="g-use">Usar los SKU marcados</button><label class="muted"><input type="checkbox" id="g-find-all" checked> Marcar todos</label></div>` + table(['', 'SKU', 'Producto', 'Encontrado en'], rows);
+    $('#g-find-all').onchange = e => $$('#g-find-result tbody input[data-i]').forEach(c => c.checked = e.target.checked);
+    $('#g-use').onclick = () => {
+      const picked = $$('#g-find-result tbody input[data-i]:checked').map(c => d.skus[+c.dataset.i].sku);
+      if (!picked.length) { st.textContent = 'Marca al menos un SKU.'; return; }
+      const n = addSkusToBox(picked); st.textContent = `${dupPlural(n, 'SKU añadido', 'SKU añadidos')} al paso 1${n < picked.length ? ' (el resto ya estaba)' : ''}.`;
+    };
+  } catch (err) { st.textContent = err.message; } finally { finderBusy(false); }
+}
+async function checkDuplicates() {
+  const skus = parseSkus(), st = $('#g-find-status'), out = $('#g-find-result'), stores = gStores();
+  if (!skus.length) { st.textContent = 'Escribe o añade primero algún SKU.'; return; }
+  if (!stores.length) { st.textContent = 'Paso 2: elige al menos una tienda.'; return; }
+  finderBusy(true); st.textContent = 'Comprobando SKU…'; out.innerHTML = '';
+  try {
+    const d = await post('/api/admin/global/sku-check', { skus, stores }); st.textContent = `${dupPlural(d.skus, 'SKU comprobado', 'SKU comprobados')}.`;
+    out.innerHTML = dupReport(d.stores) + d.stores.filter(s => s.missing).map(s => `<p class="muted">${esc(s.store)}: ${dupPlural(s.missing, 'SKU no existe', 'SKU no existen')}.</p>`).join('');
+  } catch (err) { st.textContent = err.message; } finally { finderBusy(false); }
 }
 function collectBody() {
   const skus = parseSkus(), stores = $$('#g-stores input:checked').map(i => i.value);
@@ -663,8 +716,9 @@ function renderResults(d, applied, box) {
     const blocking = (s.exceptions || []).filter(e => !e.sku), perSku = {};
     (s.exceptions || []).filter(e => e.sku).forEach(e => (perSku[e.code] = perSku[e.code] || []).push(e.sku));
     const exc = blocking.map(e => `<div class="callout">${esc(e.message)}</div>`).join('') + Object.entries(perSku).map(([c, skus]) => `<div class="callout"><strong>${esc(EXC[c] || c)} (${skus.length})</strong><div class="skus">${skus.map(x => tag(x)).join('')}</div></div>`).join('');
+    const dupBox = (s.duplicates || []).length ? `<div class="callout"><strong>SKU repetidos en ${esc(s.store)}: ${s.duplicates.length} (${s.duplicates.reduce((n, d) => n + d.count, 0)} variantes)</strong><div class="skus">${s.duplicates.map(d => tag(`${d.sku} ×${d.count}`, 'warn', d.items.join(' | '))).join('')}</div></div>` : '';
     const rows = items.map(i => `<tr><td class="nw">${esc((i.skus || []).join(', '))}</td><td class="wrap-cell">${esc(i.title)}</td><td class="wrap-cell diff">${(i.changes || []).map(c => `<div><strong>${esc(c.label)}</strong>: <span class="was">${esc(gShow(c.before))}</span><span class="arrow">→</span><strong>${esc(gShow(c.after))}</strong></div>`).join('') || '<span class="muted">Sin cambios</span>'}</td>${applied ? `<td class="wrap-cell">${i.status === 'OK' ? tag('Aplicado', 'ok') : i.status === 'FAILED' ? tag('Error', 'err') + `<small>${esc(i.error || '')}</small>` : tag('Sin cambios', 'muted')}</td>` : ''}</tr>`).join('');
-    return `<details class="res-store"${(s.blocked || fail || (s.exceptions || []).length) ? ' open' : ''}><summary><strong>${esc(s.store)}</strong>${badge}</summary><div>${exc}${rows ? `<div style="margin-top:14px">${table(['SKU', 'Elemento', 'Cambios', ...(applied ? ['Resultado'] : [])], rows)}</div>` : ''}</div></details>`;
+    return `<details class="res-store"${(s.blocked || fail || (s.exceptions || []).length) ? ' open' : ''}><summary><strong>${esc(s.store)}</strong>${badge}</summary><div>${exc}${dupBox}${rows ? `<div style="margin-top:14px">${table(['SKU', 'Elemento', 'Cambios', ...(applied ? ['Resultado'] : [])], rows)}</div>` : ''}</div></details>`;
   }).join('');
   const total = d.stores.reduce((n, s) => n + (s.results || s.items || []).filter(i => applied ? i.status === 'OK' : (i.changes || []).length).length, 0);
   const omitted = d.stores.filter(s => s.blocked).length;

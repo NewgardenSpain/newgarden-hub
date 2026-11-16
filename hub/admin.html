@@ -49,6 +49,12 @@
     <div class="seg" role="group" aria-label="Ámbito"><button type="button" data-scope="product" aria-pressed="true">Productos</button><button type="button" data-scope="variant" aria-pressed="false">Variantes</button><button type="button" data-scope="product_variants" aria-pressed="false">Todas las variantes de un producto</button></div>
     <p class="step-hint" id="scope-hint"></p>
     <div class="field"><label for="g-skus">SKU <span class="muted">(uno por línea o separados por comas)</span></label><textarea id="g-skus" rows="4" spellcheck="false"></textarea><p class="muted" id="sku-count">0 SKU</p></div>
+    <div class="finder">
+      <label for="g-find-q">O búscalos por nombre <span class="muted">(se busca en las tiendas marcadas en el paso 2)</span></label>
+      <div class="adm-search"><input id="g-find-q" type="search" placeholder="Parte del nombre del producto" autocomplete="off"><button type="button" class="button secondary" id="g-find">Buscar</button><button type="button" class="button secondary" id="g-check" title="Comprueba los SKU escritos arriba">Comprobar SKU duplicados</button></div>
+      <p class="muted" id="g-find-status" role="status" aria-live="polite"></p>
+      <div id="g-find-result"></div>
+    </div>
   </div>
 
   <div class="step">

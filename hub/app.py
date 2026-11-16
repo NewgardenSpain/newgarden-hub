@@ -2795,7 +2795,7 @@ def admin_global_fetch_product_variants(st,product_ids,changes):
 
 def admin_global_plan_store(st,scope,skus,changes):
     """Preflight de una tienda: no escribe. Las excepciones de tienda la bloquean; las de SKU solo omiten ese elemento."""
-    plan={'store':st['code'],'blocked':False,'exceptions':[],'items':[]}
+    plan={'store':st['code'],'blocked':False,'exceptions':[],'duplicates':[],'items':[]}
     def block(code,message,**extra):
         plan['blocked']=True; plan['exceptions'].append({'code':code,'message':message,**extra})
     owner='PRODUCT' if scope=='product' else 'PRODUCTVARIANT'
@@ -2817,6 +2817,7 @@ def admin_global_plan_store(st,scope,skus,changes):
         matches=resolved.get(sku.lower(),[])
         if not matches:
             plan['exceptions'].append({'code':'SKU_NOT_FOUND','sku':sku,'message':f'El SKU {sku} no existe en {st["code"]}'}); continue
+        if len(matches)>1: plan['duplicates'].append(admin_dup_entry(sku,matches))
         for m in matches:  # si un SKU está repetido, se aplica a todas sus instancias
             eid=m['id'] if scope=='variant' else m['product']['id']
             e=entities.setdefault(eid,{'id':eid,'skus':[],'product_id':m['product']['id']})
@@ -2921,6 +2922,85 @@ def admin_global_apply(x:AdminGlobalRequest):
     op=admin_audit_global('global.apply',{'scope':x.scope,'skus':skus,'stores':[s['store'] for s in stores_out],'changes':changes},stores_out)
     logging.getLogger('hub.admin').info('global.apply %s tiendas=%s skus=%d',x.scope,[s['store'] for s in stores_out],len(skus))
     return {'operation_id':op,'stores':stores_out}
+
+def admin_dup_entry(sku,matches):
+    return {'sku':sku,'count':len(matches),'items':[f"{(m.get('product') or {}).get('title','')} · {m.get('title','')}".strip(' ·') for m in matches[:6]]}
+
+def admin_dup_report(st,skus):
+    """SKU repetidos (varias variantes con el mismo SKU exacto) y SKU inexistentes de una tienda."""
+    resolved=admin_resolve_skus(st,skus) if skus else {}; dups=[]; missing=0
+    for sku in skus:
+        m=resolved.get(sku.lower(),[])
+        if not m: missing+=1
+        elif len(m)>1: dups.append(admin_dup_entry(sku,m))
+    return {'duplicates':dups,'missing':missing,'found':len(skus)-missing}
+
+def admin_dup_summary(results):
+    stores=[]
+    for r in results:
+        if r['ok']:
+            d=r['data']; stores.append({'store':r['store'],**d,'dup_skus':len(d['duplicates']),'dup_variants':sum(x['count'] for x in d['duplicates'])})
+        else: stores.append({'store':r['store'],'error':r['error'],'duplicates':[],'missing':0,'found':0,'dup_skus':0,'dup_variants':0})
+    return stores
+
+def admin_stores_from(codes):
+    available={s['code']:s for s in shopify_stores() if s['domain'] and s['token']}
+    wanted=list(dict.fromkeys(c.strip().upper() for c in codes if c.strip())) or list(available)
+    chosen=[available[c] for c in wanted if c in available]
+    if not chosen: raise HTTPException(400,'Elige al menos una tienda activa')
+    return chosen
+
+class AdminSkuCheck(BaseModel):
+    skus:list[str]
+    stores:list[str]=[]
+
+@app.post('/api/admin/global/sku-check')
+def admin_sku_check(x:AdminSkuCheck):
+    skus=list(dict.fromkeys(s.strip() for s in x.skus if s.strip()))
+    if not skus: raise HTTPException(400,'Indica al menos un SKU')
+    if len(skus)>GLOBAL_MAX_SKUS: raise HTTPException(400,f'Máximo {GLOBAL_MAX_SKUS} SKU por comprobación')
+    stores=admin_stores_from(x.stores)
+    return {'skus':len(skus),'stores':admin_dup_summary(run_per_store(stores,lambda st:admin_dup_report(st,skus)))}
+
+class AdminSkuFind(BaseModel):
+    q:str=Field(min_length=2,max_length=120)
+    stores:list[str]=[]
+
+ADMIN_FIND_QUERY='query($q:String,$after:String){products(first:50,query:$q,after:$after){nodes{id title variants(first:100){nodes{sku title}} } pageInfo{hasNextPage endCursor}}}'
+ADMIN_FIND_PAGES=4
+
+def admin_find_store(st,term):
+    found=[]; after=None; truncated=False
+    for page_no in range(ADMIN_FIND_PAGES):
+        data=admin_gql(st,ADMIN_FIND_QUERY,{'q':term,'after':after}).get('products') or {}
+        for p in data.get('nodes',[]):
+            for v in (p.get('variants') or {}).get('nodes',[]):
+                if (v.get('sku') or '').strip(): found.append({'sku':v['sku'].strip(),'product':p['title'],'variant':v.get('title') or ''})
+        info=data.get('pageInfo') or {}
+        if not info.get('hasNextPage') or not info.get('endCursor'): break
+        after=info['endCursor']
+        if page_no==ADMIN_FIND_PAGES-1: truncated=True
+    return {'found':found,'truncated':truncated}
+
+@app.post('/api/admin/global/find')
+def admin_sku_find(x:AdminSkuFind):
+    """Busca productos por nombre en las tiendas elegidas y devuelve sus SKU, con el aviso de SKU repetidos."""
+    stores=admin_stores_from(x.stores)
+    term=' '.join(f'title:{w}*' for w in re.findall(r'[\w-]+',x.q))
+    if not term: raise HTTPException(400,'Escribe parte del nombre del producto')
+    results=run_per_store(stores,lambda st:admin_find_store(st,term))
+    by_sku={}; errors=[]; truncated=[]
+    for r in results:
+        if not r['ok']: errors.append({'store':r['store'],'error':r['error']}); continue
+        if r['data']['truncated']: truncated.append(r['store'])
+        for f in r['data']['found']:
+            e=by_sku.setdefault(f['sku'].lower(),{'sku':f['sku'],'title':f['product'],'variant':f['variant'],'stores':[]})
+            if r['store'] not in e['stores']: e['stores'].append(r['store'])
+    skus=sorted(by_sku.values(),key=lambda e:(e['title'].lower(),e['sku'].lower()))
+    limited=len(skus)>GLOBAL_MAX_SKUS
+    check=[e['sku'] for e in skus[:GLOBAL_MAX_SKUS]]
+    summary=admin_dup_summary(run_per_store(stores,lambda st:admin_dup_report(st,check))) if check else []
+    return {'skus':skus,'limited':limited,'max':GLOBAL_MAX_SKUS,'truncated':truncated,'errors':errors,'stores':summary}
 
 # --- Fase 4: crear definiciones ausentes, historial y reintento de fallidos ---------------
 class AdminDefinitionCreate(BaseModel):

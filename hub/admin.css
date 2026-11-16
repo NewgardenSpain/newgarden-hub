@@ -141,3 +141,10 @@
 #v-table thead th, #v-summary thead th { position: sticky; top: 0; z-index: 2; }
 .subrow td { background: #fafbfa; }
 .subrow td:nth-child(2) { padding-left: 36px; }
+
+.finder { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
+.finder > label { display: block; margin-bottom: 6px; font-weight: 600; }
+.finder .adm-search { flex-wrap: wrap; }
+.finder .actions { display: flex; align-items: center; gap: 14px; margin: 12px 0; }
+.finder .actions label { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-weight: 400; }
+.callout.ok { border-left-color: #2f6b3a; background: #eef6ef; color: #1f4d2a; }
