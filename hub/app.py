@@ -1407,7 +1407,7 @@ def reopen_translation_batch_items(batch_id:int,x:TranslationBatchItemIds,user=D
 CREATE_ITEM_KEY='__create_product__'
 CREATE_TRANSLATE_TYPES={'single_line_text_field','multi_line_text_field','rich_text_field','list.single_line_text_field','list.multi_line_text_field'}
 CREATE_COPY_TYPES={'number_integer','number_decimal','boolean','date','date_time','dimension','weight','volume','rating','color','url','json','money','link'}
-TARGET_DEFINITIONS_QUERY='query TargetDefinitions($ownerType: MetafieldOwnerType!) { metafieldDefinitions(ownerType: $ownerType, first: 250) { nodes { namespace key type { name } validations { name value } } pageInfo { hasNextPage } } }'
+TARGET_DEFINITIONS_QUERY='query TargetDefinitions($ownerType: MetafieldOwnerType!) { metafieldDefinitions(ownerType: $ownerType, first: 250) { nodes { namespace key name type { name } validations { name value } } pageInfo { hasNextPage } } }'
 SOURCE_COMMERCIAL_QUERY='query SourceCommercial($id: ID!, $after: String) { product(id: $id) { options { name position values } variants(first: 100, after: $after) { nodes { id sku price compareAtPrice } pageInfo { hasNextPage endCursor } } } }'
 CREATE_PRODUCT_MUTATION='mutation CreateArchivedProduct($product: ProductCreateInput!, $media: [CreateMediaInput!]) { productCreate(product: $product, media: $media) { product { id status variants(first: 1) { nodes { id } } } userErrors { field message } } }'
 CREATE_VARIANTS_MUTATION='mutation CreateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!, $strategy: ProductVariantsBulkCreateStrategy) { productVariantsBulkCreate(productId: $productId, variants: $variants, strategy: $strategy) { productVariants { id } userErrors { field message } } }'
@@ -1429,7 +1429,7 @@ def metafield_definitions(store_code):
         try:
             for d in shopify_graphql(store['domain'],store['token'],TARGET_DEFINITIONS_QUERY,{'ownerType':owner}).get('metafieldDefinitions',{}).get('nodes',[]):
                 choices=next((json.loads(v['value']) for v in d.get('validations') or [] if v.get('name')=='choices'),None)
-                definitions[(owner,d['namespace'],d['key'])]={'type':(d.get('type') or {}).get('name'),'choices':choices}
+                definitions[(owner,d['namespace'],d['key'])]={'type':(d.get('type') or {}).get('name'),'choices':choices,'name':d.get('name') or ''}
         except (HTTPException,ValueError) as exc:
             raise HTTPException(502,f'No se pudieron leer las definiciones de metacampos de {store_code}: {getattr(exc,"detail",exc)}')
     _DEFINITIONS_CACHE[store_code]=(time.time(),definitions)
@@ -2974,116 +2974,9 @@ def admin_retry_failed(op_id:int):
     logging.getLogger('hub.admin').info('global.retry de #%s tiendas=%s',op_id,list(only))
     return {'operation_id':op_new,'stores':stores_out}
 
+ADMIN_ASSETS=Path(__file__).parent
+ADMIN_BODY='<style>'+(ADMIN_ASSETS/'admin.css').read_text(encoding='utf-8')+'</style>'+(ADMIN_ASSETS/'admin.html').read_text(encoding='utf-8')+'<script>'+(ADMIN_ASSETS/'admin.js').read_text(encoding='utf-8')+'</script>'
+
 @app.get('/admin',response_class=HTMLResponse)
 def admin_page():
-    body='''<style>
-#result table,#detail table{width:100%;min-width:max-content}
-#result th,#result td,#detail th,#detail td{overflow-wrap:normal;word-break:normal;white-space:nowrap;padding:12px 16px;vertical-align:middle}
-#result td.wrap-cell,#detail td.wrap-cell{white-space:normal;min-width:16rem;max-width:36rem;overflow-wrap:anywhere}
-#result .badge,#detail .badge{white-space:nowrap}
-#detail input,#detail textarea,#detail select{width:100%}
-#store-tabs [hidden],#sections [hidden],#search[hidden],#more[hidden],#detail[hidden],#global[hidden]{display:none!important}
-</style><main class="wrap"><h1>Administración multitienda</h1><p class="lede">Consulta cada tienda como en su panel de Shopify, o compara todas a la vez en la pestaña Global.</p>
-<div class="actions" role="tablist" aria-label="Tiendas" id="store-tabs"></div>
-<div class="actions" id="sections" style="margin-top:.75rem"><button class="button secondary" data-section="products" aria-pressed="true">Productos</button><button class="button secondary" data-section="collections" aria-pressed="false">Colecciones</button><button class="button secondary" data-section="metafields" aria-pressed="false">Metacampos</button></div>
-<section class="card" style="margin-top:1rem"><form id="search" class="actions"><input id="q" type="search" placeholder="Buscar por título o SKU" aria-label="Buscar"><button class="button primary">Buscar</button><span id="status" class="status" role="status" aria-live="polite"></span></form><div id="result"><p class="muted">Cargando…</p></div><div class="actions"><button class="button secondary" id="more" hidden>Cargar más</button></div></section>
-<section class="card" id="global" hidden><h2>Edición en varias tiendas</h2><p class="muted">Los productos se emparejan por SKU exacto. «Previsualizar» no escribe nada: muestra por tienda qué se cambiaría y qué excepciones hay (metacampo inexistente, SKU ausente…). Una tienda con excepciones se omite sin afectar a las demás. «Aplicar» escribe directamente en Shopify.</p>
-<div class="grid"><div class="field"><label for="g-scope">Ámbito</label><select id="g-scope"><option value="product">Producto</option><option value="variant">Variante</option></select></div><div class="field"><label for="g-skus">SKU (uno por línea o separados por comas)</label><textarea id="g-skus" rows="5"></textarea></div></div>
-<fieldset class="field"><legend>Tiendas</legend><div id="g-stores"></div><div class="actions"><button type="button" class="button secondary" id="g-all">Todas</button><button type="button" class="button secondary" id="g-none">Ninguna</button></div></fieldset>
-<h3>Cambios</h3><div id="g-changes"></div><div class="actions"><button type="button" class="button secondary" id="g-add">Añadir otro cambio</button></div>
-<div class="actions"><button type="button" class="button secondary" id="g-preview">Previsualizar</button><button type="button" class="button primary" id="g-apply">Aplicar</button><span id="g-status" class="status" role="status" aria-live="polite"></span></div><div id="g-missing"></div><div id="g-result"></div><h3>Historial de operaciones</h3><div class="actions"><button type="button" class="button secondary" id="g-hist-reload">Actualizar</button></div><div id="g-history"><p class="muted">Cargando…</p></div><div id="g-detail"></div></section>
-<section class="card" id="detail" hidden></section></main>
-<script>
-const $=s=>document.querySelector(s);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function fetchJSON(u,o){const r=await fetch(u,o);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(Array.isArray(d.detail)?d.detail.map(e=>e.msg).join('; '):(d.detail||('Error '+r.status)));return d}
-let stores=[],tab='GLOBAL',section='products',cursor=null,rows=[];
-function renderTabs(){const t=$('#store-tabs');t.innerHTML=['GLOBAL',...stores.map(s=>s.code)].map(c=>'<button role="tab" class="button '+(c===tab?'primary':'secondary')+'" aria-selected="'+(c===tab)+'" data-tab="'+esc(c)+'">'+(c==='GLOBAL'?'Global':esc(c))+'</button>').join('');
-t.querySelectorAll('button').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;if(tab==='GLOBAL')section='metafields';renderTabs();renderSections();load(true)})}
-function renderSections(){document.querySelectorAll('#sections button').forEach(b=>{const global=tab==='GLOBAL';b.hidden=global&&b.dataset.section!=='metafields';b.setAttribute('aria-pressed',b.dataset.section===section);});$('#search').hidden=false;$('#global').hidden=tab!=='GLOBAL';if(tab==='GLOBAL'&&typeof loadHistory==='function')loadHistory();$('#q').placeholder=section==='metafields'?'Filtrar por namespace.clave':'Buscar por título o SKU'}
-document.querySelectorAll('#sections button').forEach(b=>b.onclick=()=>{section=b.dataset.section;renderSections();load(true)});
-$('#search').onsubmit=e=>{e.preventDefault();load(true)};$('#more').onclick=()=>load(false);
-function table(head,body){return '<div class="table-wrap"><table><thead><tr>'+head.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+body+'</tbody></table></div>'}
-async function load(reset){const st=$('#status'),res=$('#result');$('#detail').hidden=true;if(reset){cursor=null;rows=[];res.innerHTML='<p class="muted">Cargando…</p>'}st.textContent='';
-try{
-if(section==='metafields'){const d=await fetchJSON('/api/admin/metafield-definitions'+(tab==='GLOBAL'?'':'?stores='+tab));$('#more').hidden=true;
-defRows=d.rows;if(tab==='GLOBAL'&&!$('#g-changes').children.length)resetChanges();const f=$('#q').value.trim().toLowerCase();d.rows=d.rows.filter(r=>!f||(r.namespace+'.'+r.key).toLowerCase().includes(f));
-const cell=c=>c?'<span class="badge">'+esc(c.type)+'</span>':'<span class="badge" style="color:#a15c00">no existe</span>';
-res.innerHTML=(d.errors.length?'<p class="muted">No se pudieron leer: '+d.errors.map(e=>esc(e.store+' ('+e.error+')')).join('; ')+'</p>':'')+table(['Propietario','Namespace.clave',...d.stores.map(esc),'Estado'],d.rows.map(r=>'<tr><td>'+esc(r.owner)+'</td><td>'+esc(r.namespace+'.'+r.key)+'</td>'+d.stores.map(s=>'<td>'+cell(r.stores[s])+'</td>').join('')+'<td>'+({ok:'Coherente',missing:'Falta en alguna tienda',type_mismatch:'Tipos distintos'}[r.status])+'</td></tr>').join(''));return}
-if(tab==='GLOBAL'){section='metafields';renderSections();return load(true)}
-const url='/api/admin/'+section+'?store='+encodeURIComponent(tab)+'&q='+encodeURIComponent($('#q').value)+(cursor?'&after='+encodeURIComponent(cursor):'');
-const d=await fetchJSON(url);cursor=d.cursor;$('#more').hidden=!d.has_next;
-if(section==='products'){rows=rows.concat(d.products);st.textContent=(d.total!=null?d.total+' productos':'')
-res.innerHTML=table(['Producto','Estado','SKU','Etiquetas','Stock'],rows.map(p=>'<tr><td><a href="#" data-id="'+esc(p.id)+'">'+esc(p.title)+'</a><br><small class="muted">'+esc(p.handle)+'</small></td><td><span class="badge">'+esc(p.status)+'</span></td><td>'+esc(p.skus.slice(0,3).join(', '))+(p.skus.length>3?' …':'')+'</td><td class="wrap-cell">'+esc(p.tags.join(', '))+'</td><td>'+esc(p.inventory)+'</td></tr>').join(''));
-res.querySelectorAll('a[data-id]').forEach(a=>a.onclick=e=>{e.preventDefault();openProduct(a.dataset.id)})}
-else{rows=rows.concat(d.collections);res.innerHTML=table(['Colección','Handle','Productos'],rows.map(c=>'<tr><td><a href="#" data-cid="'+esc(c.id)+'">'+esc(c.title)+'</a></td><td>'+esc(c.handle)+'</td><td>'+esc(c.products)+'</td></tr>').join(''));res.querySelectorAll('a[data-cid]').forEach(a=>a.onclick=e=>{e.preventDefault();openCollection(a.dataset.cid)})}
-}catch(err){res.innerHTML='';st.textContent=err.message}}
-const fld=(id,label,val,area)=>'<div class="field"><label for="'+id+'">'+label+'</label>'+(area?'<textarea id="'+id+'" rows="6">'+esc(val)+'</textarea>':'<input id="'+id+'" value="'+esc(val)+'">')+'</div>';
-async function post(path,body,btn){const st=$('#detail-status');btn.disabled=true;st.textContent='Guardando…';try{const d=await fetchJSON(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});st.textContent=d.saved?'Guardado en '+tab+(d.changed&&d.changed.length?' ('+d.changed.join(', ')+')':'')+'.':'Sin cambios.';return d}catch(err){st.textContent=err.message}finally{btn.disabled=false}}
-function mfRows(nodes,owner){return nodes.map(m=>'<tr><td>'+esc(m.namespace+'.'+m.key)+'</td><td><span class="badge">'+esc(m.type)+'</span></td><td class="wrap-cell"><textarea rows="2" data-mf-owner="'+esc(owner||'')+'" data-mf-ns="'+esc(m.namespace)+'" data-mf-key="'+esc(m.key)+'" data-mf-type="'+esc(m.type)+'" data-mf-digest="'+esc(m.compareDigest||'')+'" data-mf-orig="'+esc(m.value)+'">'+esc(m.value)+'</textarea></td><td><button class="button secondary" data-mf-save>Guardar</button></td></tr>').join('')||'<tr><td colspan="4" class="muted">Sin metacampos</td></tr>'}
-function bindMetafields(owner,root){root.querySelectorAll('[data-mf-save]').forEach(b=>b.onclick=async()=>{const t=b.closest('tr').querySelector('textarea');const d=await post('/api/admin/metafield/set',{store:tab,owner_id:t.dataset.mfOwner||owner,namespace:t.dataset.mfNs,key:t.dataset.mfKey,type:t.dataset.mfType,value:t.value,compare_digest:t.dataset.mfDigest||null},b);if(d&&d.saved)t.dataset.mfDigest=''})}
-function variantCard(v,total){const x=v.extra,chk=(k,l,val)=>'<div class="field"><label><input type="checkbox" data-v="'+k+'"'+(val?' checked':'')+' style="width:auto"> '+l+'</label></div>';
-const adv=x?'<div class="grid">'+fld2('price','Precio',x.price)+fld2('compareAtPrice','Precio de comparación',x.compareAtPrice)+fld2('cost','Coste por artículo ('+esc(x.currency)+')',x.cost)+fld2('weight','Peso',x.weight)+'<div class="field"><label>Unidad de peso</label><select data-v="weightUnit">'+['KILOGRAMS','GRAMS','POUNDS','OUNCES'].map(u=>'<option'+(u===x.weightUnit?' selected':'')+'>'+u+'</option>').join('')+'</select></div><div class="field"><label>Si no hay stock</label><select data-v="inventoryPolicy"><option value="DENY"'+(x.inventoryPolicy==='DENY'?' selected':'')+'>Dejar de vender</option><option value="CONTINUE"'+(x.inventoryPolicy==='CONTINUE'?' selected':'')+'>Seguir vendiendo</option></select></div></div><div class="actions">'+chk('taxable','Cobrar impuestos',x.taxable)+chk('tracked','Hacer seguimiento del stock',x.tracked)+chk('requiresShipping','Requiere envío',x.requiresShipping)+'</div>':'';
-return '<details class="card" data-variant="'+esc(v.id)+'"'+(total<=3?' open':'')+'><summary><strong>'+esc(v.title)+'</strong> · <span class="muted">'+esc(v.sku||'sin SKU')+'</span></summary><div class="grid">'+fld2('sku','SKU',v.sku)+fld2('barcode','Código de barras',v.barcode)+'</div>'+adv+'<div class="actions"><button class="button primary" data-v-save>Guardar variante</button></div><h4>Metacampos de la variante</h4>'+table(['Clave','Tipo','Valor',''],mfRows(v.metafields.nodes,v.id))+'</details>'}
-const fld2=(k,l,val)=>'<div class="field"><label>'+l+'</label><input data-v="'+k+'" value="'+esc(val)+'"></div>';
-function variantFields(card){const o={};card.querySelectorAll('[data-v]').forEach(e=>{o[e.dataset.v]=e.type==='checkbox'?e.checked:e.value});return o}
-async function openProduct(id){const box=$('#detail');box.hidden=false;box.innerHTML='<p class="muted">Cargando…</p>';
-try{const p=(await fetchJSON('/api/admin/product?store='+encodeURIComponent(tab)+'&id='+encodeURIComponent(id))).product;
-box.innerHTML='<h2>'+esc(p.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('f-title','Título',p.title)+fld('f-handle','Handle (crea redirección)',p.handle)+fld('f-vendor','Proveedor',p.vendor)+fld('f-type','Tipo de producto',p.productType)+'<div class="field"><label for="f-status">Estado</label><select id="f-status">'+['ACTIVE','DRAFT','ARCHIVED'].map(s=>'<option'+(s===p.status?' selected':'')+'>'+s+'</option>').join('')+'</select></div>'+fld('f-tags','Etiquetas (separadas por coma)',(p.tags||[]).join(', '))+fld('f-seot','Título SEO',(p.seo||{}).title||'')+fld('f-seod','Descripción SEO',(p.seo||{}).description||'')+'</div>'+fld('f-desc','Descripción (HTML)',p.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-product">Guardar producto</button></div><h3>Variantes ('+p.variants.nodes.length+')</h3>'+(p.variant_extra_error?'<p class="status">No se pudieron leer precios y costes: '+esc(p.variant_extra_error)+'</p>':'')+p.variants.nodes.map((v,i)=>variantCard(v,p.variants.nodes.length)).join('')+'<h3>Metacampos del producto</h3>'+table(['Clave','Tipo','Valor',''],mfRows(p.metafields.nodes,p.id));
-$('#save-product').onclick=async e=>{const d=await post('/api/admin/product/update',{store:tab,id,fields:{title:$('#f-title').value,handle:$('#f-handle').value,vendor:$('#f-vendor').value,productType:$('#f-type').value,status:$('#f-status').value,tags:$('#f-tags').value,seo_title:$('#f-seot').value,seo_description:$('#f-seod').value,descriptionHtml:$('#f-desc').value}},e.target);void d};
-box.querySelectorAll('[data-v-save]').forEach(b=>b.onclick=()=>{const r=b.closest('details');post('/api/admin/variant/update',{store:tab,id:r.dataset.variant,fields:variantFields(r)},b)});
-bindMetafields(id,box);
-box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
-async function openCollection(id){const box=$('#detail');box.hidden=false;box.innerHTML='<p class="muted">Cargando…</p>';
-try{const c=(await fetchJSON('/api/admin/collection?store='+encodeURIComponent(tab)+'&id='+encodeURIComponent(id))).collection;
-box.innerHTML='<h2>'+esc(c.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('c-title','Título',c.title)+fld('c-handle','Handle (crea redirección)',c.handle)+fld('c-seot','Título SEO',(c.seo||{}).title||'')+fld('c-seod','Descripción SEO',(c.seo||{}).description||'')+'</div>'+fld('c-desc','Descripción (HTML)',c.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-collection">Guardar colección</button></div><h3>Metacampos de la colección</h3>'+table(['Clave','Tipo','Valor',''],mfRows(c.metafields.nodes,c.id));
-$('#save-collection').onclick=async e=>{const d=await post('/api/admin/collection/update',{store:tab,id,fields:{title:$('#c-title').value,handle:$('#c-handle').value,seo_title:$('#c-seot').value,seo_description:$('#c-seod').value,descriptionHtml:$('#c-desc').value}},e.target);void d};
-bindMetafields(id,box);box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
-const GF={product:[['status','Estado','enum',['ACTIVE','DRAFT','ARCHIVED']],['vendor','Proveedor','text'],['productType','Tipo de producto','text']],variant:[['weight','Peso','text'],['weightUnit','Unidad de peso','enum',['KILOGRAMS','GRAMS','POUNDS','OUNCES']],['taxable','Cobrar impuestos','bool'],['inventoryPolicy','Si no hay stock','enum',['DENY','CONTINUE']],['tracked','Seguimiento de stock','bool'],['requiresShipping','Requiere envío','bool']]};
-let defRows=[];
-function gTargets(){const scope=$('#g-scope').value,owner=scope==='product'?'PRODUCT':'PRODUCTVARIANT';
-return GF[scope].map(f=>'<option value="f:'+f[0]+'">'+esc(f[1])+'</option>').join('')+defRows.filter(r=>r.owner===owner).map(r=>{const t=Object.values(r.stores).find(Boolean);return '<option value="m:'+esc(r.namespace+'.'+r.key+'|'+(t?t.type:''))+'">Metacampo '+esc(r.namespace+'.'+r.key)+'</option>'}).join('')}
-function gValue(row){const t=row.querySelector('select').value,box=row.querySelector('.g-val');const scope=$('#g-scope').value;
-if(t.startsWith('f:')){const f=GF[scope].find(x=>x[0]===t.slice(2));
-if(f[2]==='enum'){box.innerHTML='<select data-val>'+f[3].map(o=>'<option>'+o+'</option>').join('')+'</select>';return}
-if(f[2]==='bool'){box.innerHTML='<select data-val data-bool="1"><option value="true">Sí</option><option value="false">No</option></select>';return}}
-box.innerHTML='<textarea data-val rows="2" placeholder="Valor (las listas, como JSON)"></textarea>'}
-function addChange(){const row=document.createElement('div');row.className='actions';row.dataset.ch='1';row.innerHTML='<select aria-label="Campo">'+gTargets()+'</select><div class="g-val" style="flex:1;min-width:14rem"></div><button type="button" class="button secondary" aria-label="Quitar cambio">Quitar</button>';
-row.querySelector('select').onchange=()=>gValue(row);row.querySelector('button').onclick=()=>row.remove();$('#g-changes').appendChild(row);gValue(row)}
-function resetChanges(){$('#g-changes').innerHTML='';addChange()}
-function collectChanges(){return [...document.querySelectorAll('[data-ch]')].map(r=>{const t=r.querySelector('select').value,v=r.querySelector('[data-val]');const val=v.dataset.bool?v.value==='true':v.value;
-if(t.startsWith('m:')){const [nk,type]=t.slice(2).split('|'),i=nk.indexOf('.');return {kind:'metafield',namespace:nk.slice(0,i),key:nk.slice(i+1),type,value:String(val)}}
-return {kind:'field',field:t.slice(2),value:val}})}
-function renderGStores(){$('#g-stores').innerHTML=stores.map(s=>'<label style="margin-right:1rem"><input type="checkbox" value="'+esc(s.code)+'" checked style="width:auto"> '+esc(s.code)+'</label>').join('')}
-function gBody(){const skus=$('#g-skus').value.split(String.fromCharCode(10)).flatMap(l=>l.split(',')).map(x=>x.trim()).filter(Boolean);
-return {scope:$('#g-scope').value,stores:[...document.querySelectorAll('#g-stores input:checked')].map(i=>i.value),skus,changes:collectChanges()}}
-function richText(n){return n.type==='text'?n.value:(n.children||[]).map(richText).join(n.type==='root'?' / ':'')}
-function gShow(v){if(typeof v==='boolean')return v?'Sí':'No';if(v===''||v==null)return '(vacío)';const t=String(v);if(t.startsWith('{"type":"root"')){try{return richText(JSON.parse(t))}catch(e){}}return t}
-function renderGlobal(d,applied){const sym={OK:'Aplicado',FAILED:'Error',SKIPPED:'Sin cambios'};
-$('#g-result').innerHTML=d.stores.map(s=>{const items=s.results||s.items||[];const real=items.filter(i=>(i.changes||[]).length);
-const ok=items.filter(i=>i.status==='OK').length,fail=items.filter(i=>i.status==='FAILED').length;
-const head=s.blocked?'<span class="badge" style="color:#a15c00">Omitida</span>':applied?'<span class="badge">'+ok+' aplicados · '+fail+' con error</span>':'<span class="badge">'+real.length+' se modificarán · '+(items.length-real.length)+' sin cambios</span>';
-const exc=(s.exceptions||[]).map(e=>'<li><strong>'+esc(e.code)+'</strong> — '+esc(e.message)+'</li>').join('');
-const rows=items.map(i=>'<tr><td>'+esc((i.skus||[]).join(', '))+'</td><td class="wrap-cell">'+esc(i.title)+'</td><td class="wrap-cell">'+((i.changes||[]).map(c=>esc(c.label)+': '+esc(gShow(c.before))+' → <strong>'+esc(gShow(c.after))+'</strong>').join('<br>')||'<span class="muted">Sin cambios</span>')+'</td>'+(applied?'<td>'+esc(sym[i.status]||'')+(i.error?'<br><small class="status">'+esc(i.error)+'</small>':'')+'</td>':'')+'</tr>').join('');
-return '<article class="card"><h3>'+esc(s.store)+' '+head+'</h3>'+(exc?'<ul style="color:#a15c00">'+exc+'</ul>':'')+(rows?table(['SKU','Elemento','Cambios'].concat(applied?['Resultado']:[]),rows):'')+'</article>'}).join('')}
-async function gRun(path,btn,applied){const st=$('#g-status');btn.disabled=true;st.textContent=applied?'Aplicando en las tiendas…':'Comprobando…';$('#g-result').innerHTML='';
-try{const d=await fetchJSON(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(gBody())});renderGlobal(d,applied);renderMissing(d);if(applied)loadHistory();st.textContent=applied?'Operación terminada'+(d.operation_id?' (registro #'+d.operation_id+')':'')+'.':'Previsualización lista: no se ha escrito nada.'}
-catch(err){st.textContent=err.message}finally{btn.disabled=false}}
-function missingDefs(d){const m={};d.stores.forEach(s=>(s.exceptions||[]).forEach(e=>{if(e.code==='METAFIELD_DEFINITION_MISSING'){const k=e.owner+'|'+e.namespace+'|'+e.key;(m[k]=m[k]||{owner:e.owner,namespace:e.namespace,key:e.key,stores:[]}).stores.push(s.store)}}));return Object.values(m)}
-function renderMissing(d){const box=$('#g-missing'),list=missingDefs(d);if(!list.length){box.innerHTML='';return}
-box.innerHTML='<div class="card"><h3>Definiciones que faltan</h3><p class="muted">Se copia la definición (nombre, tipo y opciones) desde una tienda que ya la tiene. Después vuelve a previsualizar.</p>'+list.map((m,i)=>'<div class="actions"><span><strong>'+esc(m.namespace+'.'+m.key)+'</strong> falta en '+esc(m.stores.join(', '))+'</span><button type="button" class="button secondary" data-def="'+i+'">Crear en '+esc(m.stores.join(', '))+'</button></div>').join('')+'</div>';
-box.querySelectorAll('[data-def]').forEach(b=>b.onclick=async()=>{const m=list[+b.dataset.def],st=$('#g-status');b.disabled=true;st.textContent='Creando definición…';
-try{const r=await fetchJSON('/api/admin/definitions/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({owner:m.owner,namespace:m.namespace,key:m.key,stores:m.stores})});
-const bad=r.results.filter(x=>!x.ok);st.textContent=bad.length?'No se pudo en: '+bad.map(x=>x.store+' ('+x.error+')').join('; '):'Definición creada (copiada de '+r.source+'). Comprobando de nuevo…';
-if(!bad.length)gRun('/api/admin/global/preview',$('#g-preview'),false)}catch(err){st.textContent=err.message}finally{b.disabled=false}})}
-async function loadHistory(){const box=$('#g-history');try{const d=await fetchJSON('/api/admin/operations/summary');
-box.innerHTML=table(['#','Fecha','Tipo','Tiendas','Resultado',''],d.operations.map(o=>'<tr data-op="'+o.id+'"><td>'+o.id+'</td><td>'+esc(o.at.slice(0,16).replace('T',' '))+'</td><td>'+esc(o.kind)+'</td><td>'+esc(o.stores.join(', '))+'</td><td>'+o.ok+' ok · '+o.failed+' error · '+o.skipped+' omitidos</td><td><button class="button secondary" data-view>Ver</button> '+(o.retryable?'<button class="button secondary" data-retry>Reintentar fallidos</button>':'')+'</td></tr>').join('')||'<tr><td colspan="6" class="muted">Sin operaciones</td></tr>');
-box.querySelectorAll('[data-view]').forEach(b=>b.onclick=async()=>{const id=b.closest('tr').dataset.op,det=$('#g-detail');det.innerHTML='<p class="muted">Cargando…</p>';
-try{const o=await fetchJSON('/api/admin/operations/'+id);det.innerHTML='<h4>Operación #'+o.id+'</h4>'+table(['Tienda','Elemento','Estado','Cambios','Error'],o.items.map(i=>'<tr><td>'+esc(i.store)+'</td><td>'+esc((i.entity||'').split('/').pop())+'</td><td>'+esc(i.status)+'</td><td class="wrap-cell">'+esc(Object.keys(i.after||{}).map(k=>k+': '+gShow((i.before||{})[k])+' → '+gShow(i.after[k])).join(' | '))+'</td><td class="wrap-cell">'+esc(i.error||'')+'</td></tr>').join(''))}catch(err){det.innerHTML='<p class="status">'+esc(err.message)+'</p>'}});
-box.querySelectorAll('[data-retry]').forEach(b=>b.onclick=async()=>{const id=b.closest('tr').dataset.op,st=$('#g-status');b.disabled=true;st.textContent='Reintentando lo fallido de #'+id+'…';
-try{const r=await fetchJSON('/api/admin/operations/'+id+'/retry-failed',{method:'POST'});renderGlobal(r,true);renderMissing(r);st.textContent='Reintento terminado (registro #'+r.operation_id+').';loadHistory()}catch(err){st.textContent=err.message}finally{b.disabled=false}})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
-$('#g-hist-reload').onclick=loadHistory;$('#g-preview').onclick=e=>gRun('/api/admin/global/preview',e.target,false);$('#g-apply').onclick=e=>gRun('/api/admin/global/apply',e.target,true);
-$('#g-add').onclick=addChange;$('#g-scope').onchange=resetChanges;
-$('#g-all').onclick=()=>document.querySelectorAll('#g-stores input').forEach(i=>i.checked=true);$('#g-none').onclick=()=>document.querySelectorAll('#g-stores input').forEach(i=>i.checked=false);
-(async()=>{try{stores=(await fetchJSON('/api/admin/stores')).stores;renderGStores();section='metafields';renderTabs();renderSections();load(true)}catch(err){$('#result').innerHTML='<p class="status">'+esc(err.message)+'</p>'}})();
-</script>'''
-    return shell('Administración',body,'admin')
+    return shell('Administración',ADMIN_BODY,'admin')

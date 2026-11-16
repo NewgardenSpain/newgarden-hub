@@ -68,5 +68,6 @@ def definition_matrix(per_store):
             status = 'missing'
         elif len({c['type'] for c in present}) > 1:
             status = 'type_mismatch'
-        rows.append({'owner': owner, 'namespace': namespace, 'key': key, 'stores': cells, 'status': status})
+        name = next((c.get('name') for c in present if c.get('name')), '')
+        rows.append({'owner': owner, 'namespace': namespace, 'key': key, 'name': name, 'stores': cells, 'status': status})
     return rows

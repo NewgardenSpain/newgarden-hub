@@ -1,0 +1,90 @@
+<main class="wrap adm" id="main-content" tabindex="-1">
+<h1>Administración multitienda</h1>
+<p class="lede">Consulta y edita el catálogo de cada tienda, o aplica el mismo cambio en varias a la vez.</p>
+
+<div class="adm-tabs" role="tablist" aria-label="Secciones">
+  <button type="button" role="tab" id="tab-tienda" data-tab="tienda" aria-controls="panel-tienda">Una tienda</button>
+  <button type="button" role="tab" id="tab-varias" data-tab="varias" aria-controls="panel-varias">Varias tiendas</button>
+  <button type="button" role="tab" id="tab-metacampos" data-tab="metacampos" aria-controls="panel-metacampos">Metacampos</button>
+  <button type="button" role="tab" id="tab-historial" data-tab="historial" aria-controls="panel-historial">Historial</button>
+</div>
+
+<!-- UNA TIENDA -->
+<section id="panel-tienda" role="tabpanel" aria-labelledby="tab-tienda" hidden>
+  <div id="list-view">
+    <div class="adm-bar">
+      <div><span class="adm-label" id="store-label">Tienda</span><div class="chips" id="store-chips" role="radiogroup" aria-labelledby="store-label"></div></div>
+    </div>
+    <div class="adm-bar">
+      <div class="seg" role="group" aria-label="Qué listar"><button type="button" data-kind="products" aria-pressed="true">Productos</button><button type="button" data-kind="collections" aria-pressed="false">Colecciones</button></div>
+      <form id="search" role="search" class="adm-search"><input id="q" type="search" placeholder="Buscar por título o SKU" aria-label="Buscar"><button class="button primary">Buscar</button></form>
+    </div>
+    <p id="list-status" class="muted" role="status" aria-live="polite"></p>
+    <div class="table-wrap" id="list"></div>
+    <div class="actions"><button type="button" class="button secondary" id="more" hidden>Cargar más</button></div>
+  </div>
+
+  <div id="editor-view" hidden>
+    <button type="button" class="adm-back" id="back">← Volver al listado</button>
+    <header class="ed-head">
+      <h2 id="ed-title" tabindex="-1"></h2>
+      <p class="muted" id="ed-sub"></p>
+    </header>
+    <div class="seg" id="ed-tabs" role="group" aria-label="Secciones del elemento"></div>
+    <div id="ed-body"></div>
+    <div class="actionbar" id="ed-savebar" hidden>
+      <button type="button" class="button primary" id="ed-save" disabled>Guardar cambios</button>
+      <span id="ed-status" class="muted" role="status" aria-live="polite"></span>
+    </div>
+  </div>
+</section>
+
+<!-- VARIAS TIENDAS -->
+<section id="panel-varias" role="tabpanel" aria-labelledby="tab-varias" hidden>
+  <p class="adm-intro">Los elementos se emparejan por <strong>SKU exacto</strong>. «Previsualizar» no escribe nada: te dice qué cambiaría en cada tienda y qué excepciones hay. «Aplicar» escribe directamente en Shopify.</p>
+
+  <div class="step">
+    <div class="step-head"><span class="step-n">1</span><h2>¿Qué elementos?</h2></div>
+    <div class="seg" role="group" aria-label="Ámbito"><button type="button" data-scope="product" aria-pressed="true">Productos</button><button type="button" data-scope="variant" aria-pressed="false">Variantes</button></div>
+    <p class="step-hint" id="scope-hint"></p>
+    <div class="field"><label for="g-skus">SKU <span class="muted">(uno por línea o separados por comas)</span></label><textarea id="g-skus" rows="4" spellcheck="false"></textarea><p class="muted" id="sku-count">0 SKU</p></div>
+  </div>
+
+  <div class="step">
+    <div class="step-head"><span class="step-n">2</span><h2>¿En qué tiendas?</h2></div>
+    <div class="chips" id="g-stores" role="group" aria-label="Tiendas"></div>
+    <div class="actions"><button type="button" class="button secondary" id="g-all">Todas</button><button type="button" class="button secondary" id="g-none">Ninguna</button></div>
+  </div>
+
+  <div class="step">
+    <div class="step-head"><span class="step-n">3</span><h2>¿Qué quieres cambiar?</h2></div>
+    <p class="step-hint">Elige un campo (escribe para buscar) y el valor nuevo. Puedes añadir varios cambios.</p>
+    <div id="g-changes"></div>
+    <div class="actions"><button type="button" class="button secondary" id="g-add">+ Añadir otro cambio</button></div>
+  </div>
+
+  <div class="actionbar">
+    <button type="button" class="button secondary" id="g-preview">Previsualizar</button>
+    <button type="button" class="button primary" id="g-apply">Aplicar en Shopify</button>
+    <span id="g-status" class="muted" role="status" aria-live="polite"></span>
+  </div>
+
+  <div id="g-result" aria-live="polite"></div>
+</section>
+
+<!-- METACAMPOS -->
+<section id="panel-metacampos" role="tabpanel" aria-labelledby="tab-metacampos" hidden>
+  <div class="adm-bar">
+    <div class="seg" role="group" aria-label="Propietario"><button type="button" data-owner="PRODUCT" aria-pressed="true">Producto</button><button type="button" data-owner="PRODUCTVARIANT" aria-pressed="false">Variante</button></div>
+    <div class="adm-search"><input id="mf-q" type="search" placeholder="Filtrar por nombre o clave" aria-label="Filtrar metacampos"><label class="adm-check"><input type="checkbox" id="mf-diff"> Solo diferencias entre tiendas</label><button type="button" class="button secondary" id="mf-reload">Actualizar</button></div>
+  </div>
+  <p id="mf-status" class="muted" role="status" aria-live="polite"></p>
+  <div id="mf-matrix"></div>
+</section>
+
+<!-- HISTORIAL -->
+<section id="panel-historial" role="tabpanel" aria-labelledby="tab-historial" hidden>
+  <div class="adm-bar"><p class="muted" id="hist-status" role="status" aria-live="polite"></p><button type="button" class="button secondary" id="hist-reload">Actualizar</button></div>
+  <div id="hist"></div>
+</section>
+</main>
