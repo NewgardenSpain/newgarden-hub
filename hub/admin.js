@@ -645,6 +645,11 @@ function addSkusToBox(skus) {
   box.value = (box.value.trim() ? box.value.trim() + '\n' : '') + add.join('\n');
   box.dispatchEvent(new Event('input')); return add.length;
 }
+function removeSkusFromBox(skus) {
+  const drop = new Set(skus.map(x => x.toLowerCase())), box = $('#g-skus');
+  box.value = parseSkus().filter(x => !drop.has(x.toLowerCase())).join('\n');
+  box.dispatchEvent(new Event('input'));
+}
 const finderBusy = on => $$('#g-find,#g-check').forEach(b => b.disabled = on);
 async function findByName() {
   const q = $('#g-find-q').value.trim(), st = $('#g-find-status'), out = $('#g-find-result'), stores = gStores();
@@ -661,7 +666,13 @@ async function findByName() {
     const dupMap = {}; d.stores.forEach(s => (s.duplicates || []).forEach(x => (dupMap[x.sku.toLowerCase()] = dupMap[x.sku.toLowerCase()] || []).push(`${s.store} ×${x.count}`)));
     const rows = d.skus.map((e, i) => { const dp = dupMap[e.sku.toLowerCase()]; return `<tr><td class="chk"><input type="checkbox" data-i="${i}" checked aria-label="Elegir ${esc(e.sku)}"></td><td class="nw">${esc(e.sku)}${dp ? '<br>' + tag('SKU repetido: ' + dp.join(', '), 'warn') : ''}</td><td class="wrap-cell">${esc(e.title)}</td><td class="nw">${esc(e.stores.join(', '))}</td></tr>`; }).join('');
     out.innerHTML = warn + dupReport(d.stores) + `<div class="actions"><button type="button" class="button primary" id="g-use">Usar los SKU marcados</button><label class="muted"><input type="checkbox" id="g-find-all" checked> Marcar todos</label></div>` + table(['', 'SKU', 'Producto', 'Encontrado en'], rows);
-    $('#g-find-all').onchange = e => $$('#g-find-result tbody input[data-i]').forEach(c => c.checked = e.target.checked);
+    const sync = () => {
+      const all = $$('#g-find-result tbody input[data-i]'), sku = c => d.skus[+c.dataset.i].sku;
+      removeSkusFromBox(all.filter(c => !c.checked).map(sku)); addSkusToBox(all.filter(c => c.checked).map(sku));
+    };
+    $('#g-find-all').onchange = e => { $$('#g-find-result tbody input[data-i]').forEach(c => c.checked = e.target.checked); sync(); };
+    $$('#g-find-result tbody input[data-i]').forEach(c => c.addEventListener('change', sync));
+    sync(); st.textContent += ' Los marcados se añaden al paso 1.';
     $('#g-use').onclick = () => {
       const picked = $$('#g-find-result tbody input[data-i]:checked').map(c => d.skus[+c.dataset.i].sku);
       if (!picked.length) { st.textContent = 'Marca al menos un SKU.'; return; }
