@@ -343,8 +343,9 @@ def shell(title, body, active=''):
         'stores': '<path d="M3 10v11h18V10M2 10l2-7h16l2 7M2 10h20M9 21v-7h6v7"/>',
         'stock': '<path d="M3 7h18v13H3zM3 7l3-4h12l3 4M9 12h6"/>',
         'tags': '<path d="M3 12V3h9l9 9-9 9-9-9Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',        'collections': '<rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/>',
+        'admin': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v16"/>',
     }
-    items = [('home','/','Resumen'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
+    items = [('home','/','Resumen'),('admin','/admin','Administración'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
@@ -2395,3 +2396,106 @@ res.innerHTML='<div class="table-wrap"><table><thead><tr><th>Campo</th><th>Antes
 catch(err){st.textContent=err.message}finally{b.disabled=false}});
 </script>'''
     return shell('Traducir colecciones',body,'collections')
+
+
+# ---------------------------------------------------------------------------
+# Panel de administración multitienda (/admin) — fase 1: lectura
+# ---------------------------------------------------------------------------
+from .multistore import run_per_store, graphql_with_retry, definition_matrix
+
+def admin_store(code):
+    st=shopify_store_by_code((code or '').strip().upper())
+    if not st or not st['domain'] or not st['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales')
+    return st
+
+def admin_gql(st,query,variables=None):
+    return graphql_with_retry(shopify_graphql_payload,st['domain'],st['token'],query,variables)
+
+ADMIN_PRODUCTS_QUERY='''query AdminProducts($query:String,$after:String) { productsCount(query:$query,limit:10000) { count } products(first:25,query:$query,after:$after,sortKey:UPDATED_AT,reverse:true) { nodes { id title handle status vendor productType tags totalInventory variants(first:50) { nodes { sku } } } pageInfo { hasNextPage endCursor } } }'''
+ADMIN_COLLECTIONS_QUERY='''query AdminCollections($query:String,$after:String) { collections(first:25,query:$query,after:$after,sortKey:TITLE) { nodes { id title handle productsCount { count } updatedAt } pageInfo { hasNextPage endCursor } } }'''
+
+def admin_search_term(q):
+    q=(q or '').strip()
+    if not q: return None
+    safe=q.replace('\\','\\\\').replace('"','\\"')
+    words=' '.join(f'title:{w}*' for w in re.findall(r'[\w-]+',q))
+    return f'(sku:"{safe}") OR ({words})' if words else f'sku:"{safe}"'
+
+@app.get('/api/admin/stores')
+def admin_stores():
+    return {'stores':[{'code':s['code'],'domain':s['domain'],'locales':s['locales']} for s in shopify_stores() if s['domain'] and s['token']]}
+
+@app.get('/api/admin/products')
+def admin_products(store:str,q:str='',after:str|None=None):
+    st=admin_store(store)
+    data=admin_gql(st,ADMIN_PRODUCTS_QUERY,{'query':admin_search_term(q),'after':after})
+    page=(data.get('products') or {}).get('pageInfo') or {}
+    return {'store':st['code'],'total':(data.get('productsCount') or {}).get('count'),'has_next':bool(page.get('hasNextPage')),'cursor':page.get('endCursor'),
+            'products':[{'id':n['id'],'title':n['title'],'handle':n['handle'],'status':n['status'],'vendor':n.get('vendor'),'type':n.get('productType'),'tags':n.get('tags') or [],'inventory':n.get('totalInventory'),'skus':[v['sku'] for v in n['variants']['nodes'] if v.get('sku')]} for n in (data.get('products') or {}).get('nodes',[])]}
+
+@app.get('/api/admin/product')
+def admin_product(store:str,id:str):
+    st=admin_store(store)
+    if not id.startswith('gid://shopify/Product/'): raise HTTPException(400,'Identificador de producto no válido')
+    product=shopify_product(st,id,[])
+    if not product: raise HTTPException(404,'Producto no encontrado en la tienda')
+    for key in ('translation_error','translations_by_locale'): product.pop(key,None)
+    return {'store':st['code'],'product':product}
+
+@app.get('/api/admin/collections')
+def admin_collections(store:str,q:str='',after:str|None=None):
+    st=admin_store(store)
+    words=' '.join(f'title:{w}*' for w in re.findall(r'[\w-]+',q)) or None
+    data=(admin_gql(st,ADMIN_COLLECTIONS_QUERY,{'query':words,'after':after}).get('collections') or {})
+    page=data.get('pageInfo') or {}
+    return {'store':st['code'],'has_next':bool(page.get('hasNextPage')),'cursor':page.get('endCursor'),
+            'collections':[{'id':n['id'],'title':n['title'],'handle':n['handle'],'products':(n.get('productsCount') or {}).get('count'),'updated':n.get('updatedAt')} for n in data.get('nodes',[])]}
+
+@app.get('/api/admin/metafield-definitions')
+def admin_metafield_definitions(stores:str=''):
+    wanted=[c.strip().upper() for c in stores.split(',') if c.strip()]
+    available={s['code']:s for s in shopify_stores() if s['domain'] and s['token']}
+    unknown=[c for c in wanted if c not in available]
+    chosen=[available[c] for c in (wanted or available) if c in available]
+    results=run_per_store(chosen,lambda s:metafield_definitions(s['code']))
+    per_store={r['store']:r['data'] for r in results if r['ok']}
+    return {'stores':[s['code'] for s in chosen],'rows':definition_matrix(per_store),
+            'errors':[{'store':r['store'],'error':r['error']} for r in results if not r['ok']]+[{'store':c,'error':'Tienda inactiva o sin credenciales'} for c in unknown]}
+
+@app.get('/admin',response_class=HTMLResponse)
+def admin_page():
+    body='''<main class="wrap"><h1>Administración multitienda</h1><p class="lede">Consulta cada tienda como en su panel de Shopify, o compara todas a la vez en la pestaña Global.</p>
+<div class="actions" role="tablist" aria-label="Tiendas" id="store-tabs"></div>
+<div class="actions" id="sections" style="margin-top:.75rem"><button class="button secondary" data-section="products" aria-pressed="true">Productos</button><button class="button secondary" data-section="collections" aria-pressed="false">Colecciones</button><button class="button secondary" data-section="metafields" aria-pressed="false">Metacampos</button></div>
+<section class="card" style="margin-top:1rem"><form id="search" class="actions"><input id="q" type="search" placeholder="Buscar por título o SKU" aria-label="Buscar"><button class="button primary">Buscar</button><span id="status" class="status" role="status" aria-live="polite"></span></form><div id="result"><p class="muted">Cargando…</p></div><div class="actions"><button class="button secondary" id="more" hidden>Cargar más</button></div></section>
+<section class="card" id="detail" hidden></section></main>
+<script>
+const $=s=>document.querySelector(s);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function fetchJSON(u,o){const r=await fetch(u,o);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||('Error '+r.status));return d}
+let stores=[],tab='GLOBAL',section='products',cursor=null,rows=[];
+function renderTabs(){const t=$('#store-tabs');t.innerHTML=['GLOBAL',...stores.map(s=>s.code)].map(c=>'<button role="tab" class="button '+(c===tab?'primary':'secondary')+'" aria-selected="'+(c===tab)+'" data-tab="'+esc(c)+'">'+(c==='GLOBAL'?'Global':esc(c))+'</button>').join('');
+t.querySelectorAll('button').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;if(tab==='GLOBAL')section='metafields';renderTabs();renderSections();load(true)})}
+function renderSections(){document.querySelectorAll('#sections button').forEach(b=>{const global=tab==='GLOBAL';b.hidden=global&&b.dataset.section!=='metafields';b.setAttribute('aria-pressed',b.dataset.section===section);});$('#search').hidden=section==='metafields'}
+document.querySelectorAll('#sections button').forEach(b=>b.onclick=()=>{section=b.dataset.section;renderSections();load(true)});
+$('#search').onsubmit=e=>{e.preventDefault();load(true)};$('#more').onclick=()=>load(false);
+function table(head,body){return '<div class="table-wrap"><table><thead><tr>'+head.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+body+'</tbody></table></div>'}
+async function load(reset){const st=$('#status'),res=$('#result');$('#detail').hidden=true;if(reset){cursor=null;rows=[];res.innerHTML='<p class="muted">Cargando…</p>'}st.textContent='';
+try{
+if(section==='metafields'){const d=await fetchJSON('/api/admin/metafield-definitions'+(tab==='GLOBAL'?'':'?stores='+tab));$('#more').hidden=true;
+const cell=c=>c?'<span class="badge">'+esc(c.type)+'</span>':'<span class="badge" style="color:#a15c00">no existe</span>';
+res.innerHTML=(d.errors.length?'<p class="muted">No se pudieron leer: '+d.errors.map(e=>esc(e.store+' ('+e.error+')')).join('; ')+'</p>':'')+table(['Propietario','Namespace.clave',...d.stores.map(esc),'Estado'],d.rows.map(r=>'<tr><td>'+esc(r.owner)+'</td><td>'+esc(r.namespace+'.'+r.key)+'</td>'+d.stores.map(s=>'<td>'+cell(r.stores[s])+'</td>').join('')+'<td>'+({ok:'Coherente',missing:'Falta en alguna tienda',type_mismatch:'Tipos distintos'}[r.status])+'</td></tr>').join(''));return}
+const url='/api/admin/'+section+'?store='+encodeURIComponent(tab)+'&q='+encodeURIComponent($('#q').value)+(cursor?'&after='+encodeURIComponent(cursor):'');
+const d=await fetchJSON(url);cursor=d.cursor;$('#more').hidden=!d.has_next;
+if(section==='products'){rows=rows.concat(d.products);st.textContent=(d.total!=null?d.total+' productos':'')
+res.innerHTML=table(['Producto','Estado','SKU','Etiquetas','Stock'],rows.map(p=>'<tr><td><a href="#" data-id="'+esc(p.id)+'">'+esc(p.title)+'</a><br><small class="muted">'+esc(p.handle)+'</small></td><td><span class="badge">'+esc(p.status)+'</span></td><td>'+esc(p.skus.slice(0,3).join(', '))+(p.skus.length>3?' …':'')+'</td><td>'+esc(p.tags.join(', '))+'</td><td>'+esc(p.inventory)+'</td></tr>').join(''));
+res.querySelectorAll('a[data-id]').forEach(a=>a.onclick=e=>{e.preventDefault();openProduct(a.dataset.id)})}
+else{rows=rows.concat(d.collections);res.innerHTML=table(['Colección','Handle','Productos'],rows.map(c=>'<tr><td>'+esc(c.title)+'</td><td>'+esc(c.handle)+'</td><td>'+esc(c.products)+'</td></tr>').join(''))}
+}catch(err){res.innerHTML='';st.textContent=err.message}}
+async function openProduct(id){const box=$('#detail');box.hidden=false;box.innerHTML='<p class="muted">Cargando…</p>';
+try{const p=(await fetchJSON('/api/admin/product?store='+encodeURIComponent(tab)+'&id='+encodeURIComponent(id))).product;
+const mf=m=>'<tr><td>'+esc(m.namespace+'.'+m.key)+'</td><td><span class="badge">'+esc(m.type)+'</span></td><td style="white-space:normal">'+esc(m.value)+'</td></tr>';
+box.innerHTML='<h2>'+esc(p.title)+'</h2><p class="muted">'+esc(p.handle)+' · '+esc(p.status)+' · '+esc(p.vendor)+' · '+esc(p.productType)+'</p><h3>Variantes</h3>'+table(['SKU','Título','Código de barras'],p.variants.nodes.map(v=>'<tr><td>'+esc(v.sku)+'</td><td>'+esc(v.title)+'</td><td>'+esc(v.barcode)+'</td></tr>').join(''))+'<h3>Metacampos del producto</h3>'+table(['Clave','Tipo','Valor'],p.metafields.nodes.map(mf).join('')||'<tr><td colspan="3" class="muted">Sin metacampos</td></tr>');
+box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
+(async()=>{try{stores=(await fetchJSON('/api/admin/stores')).stores;section='metafields';renderTabs();renderSections();load(true)}catch(err){$('#result').innerHTML='<p class="status">'+esc(err.message)+'</p>'}})();
+</script>'''
+    return shell('Administración',body,'admin')
