@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Any
 import hashlib, json, logging, os, html, re, threading, time, uuid
 import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2488,9 +2489,7 @@ def admin_audit(kind,store_code,gid,status,error=None,before=None,after=None,pay
 def admin_mutate(st,kind,gid,query,variables,root,before,after,payload=None):
     """Ejecuta una mutación, lanza 400 con los userErrors y deja rastro en la auditoría en ambos casos."""
     try:
-        result=(admin_gql(st,query,variables).get(root) or {})
-        errors=result.get('userErrors') or []
-        if errors: raise HTTPException(400,'Shopify: '+'; '.join(e.get('message','error') for e in errors)[:500])
+        result=admin_exec(st,query,variables,root)
     except HTTPException as exc:
         admin_audit(kind,st['code'],gid,'FAILED',str(exc.detail)[:500],before,None,payload)
         raise
@@ -2587,6 +2586,26 @@ def admin_variant_flat(node):
             'weight':_dec(weight.get('value')),'weightUnit':weight.get('unit') or 'KILOGRAMS','taxable':bool(node.get('taxable')),'inventoryPolicy':node.get('inventoryPolicy') or 'DENY',
             'tracked':bool(item.get('tracked')),'requiresShipping':bool(item.get('requiresShipping'))}
 
+def admin_variant_input(vid,changes,current):
+    """ProductVariantsBulkInput a partir de los campos cambiados (peso y unidad se combinan con el valor actual)."""
+    variant={'id':vid}
+    if 'barcode' in changes: variant['barcode']=changes['barcode']
+    if 'price' in changes: variant['price']=changes['price']
+    if 'compareAtPrice' in changes: variant['compareAtPrice']=changes['compareAtPrice'] or None
+    if 'taxable' in changes: variant['taxable']=changes['taxable']
+    if 'inventoryPolicy' in changes: variant['inventoryPolicy']=changes['inventoryPolicy']
+    item={}
+    if 'sku' in changes: item['sku']=changes['sku']
+    if 'tracked' in changes: item['tracked']=changes['tracked']
+    if 'requiresShipping' in changes: item['requiresShipping']=changes['requiresShipping']
+    if 'cost' in changes: item['cost']=changes['cost']
+    if 'weight' in changes or 'weightUnit' in changes:
+        weight=changes.get('weight',current['weight'])
+        if weight=='': raise HTTPException(400,'Indica el peso para cambiar su unidad')
+        item['measurement']={'weight':{'value':float(weight),'unit':changes.get('weightUnit',current['weightUnit'])}}
+    if item: variant['inventoryItem']=item
+    return variant
+
 class AdminVariantUpdate(BaseModel):
     store:str
     id:str
@@ -2618,22 +2637,7 @@ def admin_variant_update(x:AdminVariantUpdate):
     if not changes: return {'store':st['code'],'changed':[],'saved':False}
     if 'price' in changes and changes['price']=='': raise HTTPException(400,'El precio no puede quedar vacío')
     if 'cost' in changes and changes['cost']=='': raise HTTPException(400,'Shopify no permite vaciar el coste desde aquí')
-    variant={'id':x.id}
-    if 'barcode' in changes: variant['barcode']=changes['barcode']
-    if 'price' in changes: variant['price']=changes['price']
-    if 'compareAtPrice' in changes: variant['compareAtPrice']=changes['compareAtPrice'] or None
-    if 'taxable' in changes: variant['taxable']=changes['taxable']
-    if 'inventoryPolicy' in changes: variant['inventoryPolicy']=changes['inventoryPolicy']
-    item={}
-    if 'sku' in changes: item['sku']=changes['sku']
-    if 'tracked' in changes: item['tracked']=changes['tracked']
-    if 'requiresShipping' in changes: item['requiresShipping']=changes['requiresShipping']
-    if 'cost' in changes: item['cost']=changes['cost']
-    if 'weight' in changes or 'weightUnit' in changes:
-        weight=changes.get('weight',current['weight'])
-        if weight=='': raise HTTPException(400,'Indica el peso para cambiar su unidad')
-        item['measurement']={'weight':{'value':float(weight),'unit':changes.get('weightUnit',current['weightUnit'])}}
-    if item: variant['inventoryItem']=item
+    variant=admin_variant_input(x.id,changes,current)
     admin_mutate(st,'variant.update',x.id,'mutation($productId:ID!,$variants:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$productId,variants:$variants){productVariants{id} userErrors{field message}}}',{'productId':node['product']['id'],'variants':[variant]},'productVariantsBulkUpdate',{k:current[k] for k in changes},changes)
     return {'store':st['code'],'changed':list(changes),'saved':True}
 
@@ -2665,6 +2669,195 @@ def admin_operations(limit:int=50):
         rows=c.execute("SELECT o.id,o.created_at,o.kind,i.store_code,i.entity_gid,i.status,i.error FROM admin_operations o JOIN admin_operation_items i ON i.op_id=o.id ORDER BY o.id DESC LIMIT %s",(max(1,min(limit,200)),)).fetchall()
     return {'operations':[{'id':r[0],'at':r[1].isoformat(),'kind':r[2],'store':r[3],'entity':r[4],'status':r[5],'error':r[6]} for r in rows]}
 
+# --- Fase 3: modo Global (varias tiendas, emparejado por SKU, con preflight) ---------------
+GLOBAL_FIELD_LABELS={'status':'Estado','vendor':'Proveedor','productType':'Tipo de producto','weight':'Peso','weightUnit':'Unidad de peso','taxable':'Cobrar impuestos','inventoryPolicy':'Si no hay stock','tracked':'Seguimiento de stock','requiresShipping':'Requiere envío'}
+# Precios y costes quedan fuera a propósito: cada tienda puede tener otra moneda.
+GLOBAL_FIELDS={'product':{'status','vendor','productType'},'variant':{'weight','weightUnit','taxable','inventoryPolicy','tracked','requiresShipping'}}
+GLOBAL_MAX_SKUS=200
+
+class AdminGlobalChange(BaseModel):
+    kind:str
+    field:str|None=None
+    namespace:str|None=Field(None,pattern=r'^[A-Za-z0-9_-]{2,255}$')
+    key:str|None=Field(None,pattern=r'^[A-Za-z0-9_-]{1,64}$')
+    type:str|None=Field(None,max_length=80)
+    value:Any=None
+
+class AdminGlobalRequest(BaseModel):
+    scope:str
+    stores:list[str]=[]
+    skus:list[str]
+    changes:list[AdminGlobalChange]
+
+def admin_global_change(scope,c):
+    if c.kind=='metafield':
+        if not (c.namespace and c.key and c.type): raise HTTPException(400,'Metacampo incompleto: faltan namespace, clave o tipo')
+        if not isinstance(c.value,str): raise HTTPException(400,f'Valor no válido para {c.namespace}.{c.key}')
+        return {'kind':'metafield','label':f'{c.namespace}.{c.key}','namespace':c.namespace,'key':c.key,'type':c.type,'value':c.value}
+    if c.kind!='field' or c.field not in GLOBAL_FIELDS[scope]: raise HTTPException(400,f'Campo no editable en modo global: {c.field}')
+    v=c.value
+    if c.field=='status' and v not in ('ACTIVE','DRAFT','ARCHIVED'): raise HTTPException(400,'Estado no válido')
+    if c.field=='inventoryPolicy' and v not in ('DENY','CONTINUE'): raise HTTPException(400,'Política de inventario no válida')
+    if c.field=='weightUnit' and v not in ADMIN_VARIANT_UNITS: raise HTTPException(400,'Unidad de peso no válida')
+    if c.field=='weight':
+        v=_dec(v)
+        if v=='': raise HTTPException(400,'Indica el peso')
+    if c.field in ADMIN_VARIANT_BOOL and not isinstance(v,bool): raise HTTPException(400,f'{c.field} debe ser verdadero o falso')
+    if c.field in ('vendor','productType'): v=_text(v).strip()
+    return {'kind':'field','label':GLOBAL_FIELD_LABELS[c.field],'field':c.field,'value':v}
+
+def admin_global_prepare(x):
+    if x.scope not in ('product','variant'): raise HTTPException(400,'Ámbito no válido')
+    skus=list(dict.fromkeys(s.strip() for s in x.skus if s.strip()))
+    if not skus: raise HTTPException(400,'Indica al menos un SKU')
+    if len(skus)>GLOBAL_MAX_SKUS: raise HTTPException(400,f'Máximo {GLOBAL_MAX_SKUS} SKU por operación')
+    if not x.changes or len(x.changes)>20: raise HTTPException(400,'Indica entre 1 y 20 cambios')
+    changes=[admin_global_change(x.scope,c) for c in x.changes]
+    targets=[(c['kind'],c.get('field') or c['label']) for c in changes]
+    if len(set(targets))!=len(targets): raise HTTPException(400,'Hay cambios repetidos sobre el mismo campo')
+    available={s['code']:s for s in shopify_stores() if s['domain'] and s['token']}
+    wanted=list(dict.fromkeys(c.strip().upper() for c in x.stores if c.strip())) or list(available)
+    unknown=[{'store':c,'blocked':True,'exceptions':[{'code':'STORE_NO_CREDENTIALS','message':f'La tienda {c} no está activa o no tiene credenciales'}],'items':[]} for c in wanted if c not in available]
+    return skus,changes,[available[c] for c in wanted if c in available],unknown
+
+def admin_resolve_skus(st,skus):
+    """{sku_en_minúsculas: [variantes]} con coincidencia exacta de SKU en la tienda."""
+    found={}
+    query='query($q:String!,$after:String){productVariants(first:100,query:$q,after:$after){nodes{id sku product{id title}} pageInfo{hasNextPage endCursor}}}'
+    for i in range(0,len(skus),10):
+        q=' OR '.join('sku:"%s"'%s.replace('\\','\\\\').replace('"','\\"') for s in skus[i:i+10]); after=None
+        while True:
+            data=admin_gql(st,query,{'q':q,'after':after}).get('productVariants') or {}
+            for n in data.get('nodes',[]):
+                if n.get('sku'): found.setdefault(n['sku'].strip().lower(),[]).append(n)
+            info=data.get('pageInfo') or {}
+            if not info.get('hasNextPage') or not info.get('endCursor'): break
+            after=info['endCursor']
+    return found
+
+def admin_global_fetch(st,scope,ids,changes):
+    aliases=' '.join('m%d:metafield(namespace:%s,key:%s){ value }'%(i,json.dumps(c['namespace']),json.dumps(c['key'])) for i,c in enumerate(changes) if c['kind']=='metafield')
+    if scope=='product': frag,sel='Product',f'id title status vendor productType {aliases}'
+    else: frag,sel='ProductVariant',f'id title sku product {{ id title }} {ADMIN_VARIANT_FIELDS_GQL} {aliases}'
+    nodes={}
+    for i in range(0,len(ids),50):
+        data=admin_gql(st,'query($ids:[ID!]!){ nodes(ids:$ids){ ... on %s { %s } } }'%(frag,sel),{'ids':ids[i:i+50]})
+        for n in data.get('nodes') or []:
+            if n: nodes[n['id']]=n
+    return nodes
+
+def admin_global_plan_store(st,scope,skus,changes):
+    """Preflight de una tienda: no escribe. Las excepciones de tienda la bloquean; las de SKU solo omiten ese elemento."""
+    plan={'store':st['code'],'blocked':False,'exceptions':[],'items':[]}
+    def block(code,message):
+        plan['blocked']=True; plan['exceptions'].append({'code':code,'message':message})
+    owner='PRODUCT' if scope=='product' else 'PRODUCTVARIANT'
+    mfs=[c for c in changes if c['kind']=='metafield']
+    if mfs:
+        defs=metafield_definitions(st['code'])
+        for c in mfs:
+            d=defs.get((owner,c['namespace'],c['key']))
+            if not d: block('METAFIELD_DEFINITION_MISSING',f'El metacampo {c["label"]} no existe en {st["code"]}'); continue
+            if d['type']!=c['type']: block('METAFIELD_TYPE_MISMATCH',f'{c["label"]} es de tipo {d["type"]} en {st["code"]} (se esperaba {c["type"]})'); continue
+            if d.get('choices'):
+                try: values=json.loads(c['value']) if c['type'].startswith('list.') else [c['value']]
+                except ValueError: values=[None]
+                bad=[v for v in values if v not in d['choices']]
+                if bad: block('INVALID_CHOICE',f'El valor de {c["label"]} no está entre las opciones de {st["code"]}: {", ".join(d["choices"])}'[:400])
+    if plan['blocked']: return plan
+    resolved=admin_resolve_skus(st,skus); entities={}
+    for sku in skus:
+        matches=resolved.get(sku.lower(),[])
+        if not matches:
+            plan['exceptions'].append({'code':'SKU_NOT_FOUND','sku':sku,'message':f'El SKU {sku} no existe en {st["code"]}'}); continue
+        targets={(m['id'] if scope=='variant' else m['product']['id']):m for m in matches}
+        if len(targets)>1:
+            plan['exceptions'].append({'code':'SKU_AMBIGUOUS','sku':sku,'message':f'El SKU {sku} corresponde a varios elementos en {st["code"]}'}); continue
+        eid,m=next(iter(targets.items()))
+        entities.setdefault(eid,{'id':eid,'skus':[],'product_id':m['product']['id']})['skus'].append(sku)
+    nodes=admin_global_fetch(st,scope,list(entities),changes) if entities else {}
+    for eid,e in entities.items():
+        node=nodes.get(eid)
+        if not node:
+            plan['exceptions'].append({'code':'ENTITY_UNREADABLE','sku':e['skus'][0],'message':f'No se pudo leer {e["skus"][0]} en {st["code"]}'}); continue
+        flat=admin_variant_flat(node) if scope=='variant' else None
+        diff=[]
+        for i,c in enumerate(changes):
+            if c['kind']=='metafield': before=(node.get(f'm{i}') or {}).get('value') or ''
+            elif scope=='product': before=_text(node.get(c['field']))
+            else: before=flat[c['field']]
+            if before!=c['value']: diff.append({'i':i,'label':c['label'],'before':before,'after':c['value']})
+        title=node['title'] if scope=='product' else f"{(node.get('product') or {}).get('title','')} · {node.get('title','')}"
+        item={'id':eid,'skus':e['skus'],'product_id':e['product_id'],'title':title,'changes':diff}
+        if scope=='variant': item['current']={'weight':flat['weight'],'weightUnit':flat['weightUnit']}
+        plan['items'].append(item)
+    return plan
+
+def admin_exec(st,query,variables,root):
+    result=(admin_gql(st,query,variables).get(root) or {})
+    errors=result.get('userErrors') or []
+    if errors: raise HTTPException(400,'Shopify: '+'; '.join(e.get('message','error') for e in errors)[:500])
+    return result
+
+def admin_global_apply_store(st,scope,plan,changes):
+    """Aplica el plan de una tienda elemento a elemento: un fallo no detiene los demás."""
+    results=[]
+    for item in plan['items']:
+        if not item['changes']:
+            results.append({**item,'status':'SKIPPED'}); continue
+        try:
+            fields={changes[d['i']]['field']:changes[d['i']]['value'] for d in item['changes'] if changes[d['i']]['kind']=='field'}
+            entries=[{'ownerId':item['id'],'namespace':changes[d['i']]['namespace'],'key':changes[d['i']]['key'],'type':changes[d['i']]['type'],'value':changes[d['i']]['value']} for d in item['changes'] if changes[d['i']]['kind']=='metafield']
+            if fields and scope=='product':
+                admin_exec(st,'mutation($product:ProductUpdateInput!){productUpdate(product:$product){product{id} userErrors{field message}}}',{'product':{'id':item['id'],**fields}},'productUpdate')
+            elif fields:
+                variant=admin_variant_input(item['id'],fields,item['current'])
+                admin_exec(st,'mutation($productId:ID!,$variants:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$productId,variants:$variants){productVariants{id} userErrors{field message}}}',{'productId':item['product_id'],'variants':[variant]},'productVariantsBulkUpdate')
+            if entries:
+                admin_exec(st,'mutation($metafields:[MetafieldsSetInput!]!){metafieldsSet(metafields:$metafields){metafields{id} userErrors{field message}}}',{'metafields':entries},'metafieldsSet')
+            results.append({**item,'status':'OK'})
+        except HTTPException as exc:
+            results.append({**item,'status':'FAILED','error':str(exc.detail)[:400]})
+        except Exception as exc:
+            results.append({**item,'status':'FAILED','error':f'{type(exc).__name__}: {exc}'[:400]})
+    return {**plan,'results':results,'items':[]}
+
+def admin_audit_global(x,changes,stores_out):
+    try:
+        with pool.connection() as c:
+            op=c.execute("INSERT INTO admin_operations(operator,kind,mode,payload) VALUES(%s,'global.apply','global',%s) RETURNING id",(operator(),Jsonb({'scope':x.scope,'skus':x.skus,'stores':[s['store'] for s in stores_out],'changes':[{k:v for k,v in c_.items()} for c_ in changes]}))).fetchone()[0]
+            for s in stores_out:
+                if not s.get('results'):
+                    c.execute("INSERT INTO admin_operation_items(op_id,store_code,entity_gid,status,error) VALUES(%s,%s,NULL,%s,%s)",(op,s['store'],'SKIPPED' if s.get('blocked') else 'FAILED',(s.get('error') or '; '.join(e['message'] for e in s.get('exceptions',[])))[:500]))
+                for r in s.get('results',[]):
+                    c.execute("INSERT INTO admin_operation_items(op_id,store_code,entity_gid,status,error,before,after) VALUES(%s,%s,%s,%s,%s,%s,%s)",(op,s['store'],r['id'],r['status'],r.get('error'),Jsonb({d['label']:d['before'] for d in r['changes']}),Jsonb({d['label']:d['after'] for d in r['changes']})))
+            return op
+    except Exception:
+        logging.getLogger('hub.admin').exception('No se pudo registrar la auditoría global')
+
+def admin_global_collect(results,unknown):
+    out=list(unknown)
+    for r in results:
+        out.append(r['data'] if r['ok'] else {'store':r['store'],'blocked':True,'error':r['error'],'exceptions':[{'code':'STORE_ERROR','message':r['error']}],'items':[]})
+    return out
+
+@app.post('/api/admin/global/preview')
+def admin_global_preview(x:AdminGlobalRequest):
+    skus,changes,stores,unknown=admin_global_prepare(x)
+    results=run_per_store(stores,lambda st:admin_global_plan_store(st,x.scope,skus,changes))
+    return {'stores':admin_global_collect(results,unknown)}
+
+@app.post('/api/admin/global/apply')
+def admin_global_apply(x:AdminGlobalRequest):
+    skus,changes,stores,unknown=admin_global_prepare(x)
+    def run(st):
+        plan=admin_global_plan_store(st,x.scope,skus,changes)  # se recalcula: lo aplicado coincide con el estado real de ahora
+        return plan if plan['blocked'] else admin_global_apply_store(st,x.scope,plan,changes)
+    stores_out=admin_global_collect(run_per_store(stores,run),unknown)
+    op=admin_audit_global(x,changes,stores_out)
+    logging.getLogger('hub.admin').info('global.apply %s tiendas=%s skus=%d',x.scope,[s['store'] for s in stores_out],len(skus))
+    return {'operation_id':op,'stores':stores_out}
+
 @app.get('/admin',response_class=HTMLResponse)
 def admin_page():
     body='''<style>
@@ -2673,26 +2866,31 @@ def admin_page():
 #result td.wrap-cell,#detail td.wrap-cell{white-space:normal;min-width:16rem;max-width:36rem;overflow-wrap:anywhere}
 #result .badge,#detail .badge{white-space:nowrap}
 #detail input,#detail textarea,#detail select{width:100%}
-#store-tabs [hidden],#sections [hidden],#search[hidden],#more[hidden],#detail[hidden]{display:none!important}
+#store-tabs [hidden],#sections [hidden],#search[hidden],#more[hidden],#detail[hidden],#global[hidden]{display:none!important}
 </style><main class="wrap"><h1>Administración multitienda</h1><p class="lede">Consulta cada tienda como en su panel de Shopify, o compara todas a la vez en la pestaña Global.</p>
 <div class="actions" role="tablist" aria-label="Tiendas" id="store-tabs"></div>
 <div class="actions" id="sections" style="margin-top:.75rem"><button class="button secondary" data-section="products" aria-pressed="true">Productos</button><button class="button secondary" data-section="collections" aria-pressed="false">Colecciones</button><button class="button secondary" data-section="metafields" aria-pressed="false">Metacampos</button></div>
 <section class="card" style="margin-top:1rem"><form id="search" class="actions"><input id="q" type="search" placeholder="Buscar por título o SKU" aria-label="Buscar"><button class="button primary">Buscar</button><span id="status" class="status" role="status" aria-live="polite"></span></form><div id="result"><p class="muted">Cargando…</p></div><div class="actions"><button class="button secondary" id="more" hidden>Cargar más</button></div></section>
+<section class="card" id="global" hidden><h2>Edición en varias tiendas</h2><p class="muted">Los productos se emparejan por SKU exacto. «Previsualizar» no escribe nada: muestra por tienda qué se cambiaría y qué excepciones hay (metacampo inexistente, SKU ausente…). Una tienda con excepciones se omite sin afectar a las demás. «Aplicar» escribe directamente en Shopify.</p>
+<div class="grid"><div class="field"><label for="g-scope">Ámbito</label><select id="g-scope"><option value="product">Producto</option><option value="variant">Variante</option></select></div><div class="field"><label for="g-skus">SKU (uno por línea o separados por comas)</label><textarea id="g-skus" rows="5"></textarea></div></div>
+<fieldset class="field"><legend>Tiendas</legend><div id="g-stores"></div><div class="actions"><button type="button" class="button secondary" id="g-all">Todas</button><button type="button" class="button secondary" id="g-none">Ninguna</button></div></fieldset>
+<h3>Cambios</h3><div id="g-changes"></div><div class="actions"><button type="button" class="button secondary" id="g-add">Añadir otro cambio</button></div>
+<div class="actions"><button type="button" class="button secondary" id="g-preview">Previsualizar</button><button type="button" class="button primary" id="g-apply">Aplicar</button><span id="g-status" class="status" role="status" aria-live="polite"></span></div><div id="g-result"></div></section>
 <section class="card" id="detail" hidden></section></main>
 <script>
 const $=s=>document.querySelector(s);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function fetchJSON(u,o){const r=await fetch(u,o);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||('Error '+r.status));return d}
+async function fetchJSON(u,o){const r=await fetch(u,o);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(Array.isArray(d.detail)?d.detail.map(e=>e.msg).join('; '):(d.detail||('Error '+r.status)));return d}
 let stores=[],tab='GLOBAL',section='products',cursor=null,rows=[];
 function renderTabs(){const t=$('#store-tabs');t.innerHTML=['GLOBAL',...stores.map(s=>s.code)].map(c=>'<button role="tab" class="button '+(c===tab?'primary':'secondary')+'" aria-selected="'+(c===tab)+'" data-tab="'+esc(c)+'">'+(c==='GLOBAL'?'Global':esc(c))+'</button>').join('');
 t.querySelectorAll('button').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;if(tab==='GLOBAL')section='metafields';renderTabs();renderSections();load(true)})}
-function renderSections(){document.querySelectorAll('#sections button').forEach(b=>{const global=tab==='GLOBAL';b.hidden=global&&b.dataset.section!=='metafields';b.setAttribute('aria-pressed',b.dataset.section===section);});$('#search').hidden=false;$('#q').placeholder=section==='metafields'?'Filtrar por namespace.clave':'Buscar por título o SKU'}
+function renderSections(){document.querySelectorAll('#sections button').forEach(b=>{const global=tab==='GLOBAL';b.hidden=global&&b.dataset.section!=='metafields';b.setAttribute('aria-pressed',b.dataset.section===section);});$('#search').hidden=false;$('#global').hidden=tab!=='GLOBAL';$('#q').placeholder=section==='metafields'?'Filtrar por namespace.clave':'Buscar por título o SKU'}
 document.querySelectorAll('#sections button').forEach(b=>b.onclick=()=>{section=b.dataset.section;renderSections();load(true)});
 $('#search').onsubmit=e=>{e.preventDefault();load(true)};$('#more').onclick=()=>load(false);
 function table(head,body){return '<div class="table-wrap"><table><thead><tr>'+head.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+body+'</tbody></table></div>'}
 async function load(reset){const st=$('#status'),res=$('#result');$('#detail').hidden=true;if(reset){cursor=null;rows=[];res.innerHTML='<p class="muted">Cargando…</p>'}st.textContent='';
 try{
 if(section==='metafields'){const d=await fetchJSON('/api/admin/metafield-definitions'+(tab==='GLOBAL'?'':'?stores='+tab));$('#more').hidden=true;
-const f=$('#q').value.trim().toLowerCase();d.rows=d.rows.filter(r=>!f||(r.namespace+'.'+r.key).toLowerCase().includes(f));
+defRows=d.rows;if(tab==='GLOBAL'&&!$('#g-changes').children.length)resetChanges();const f=$('#q').value.trim().toLowerCase();d.rows=d.rows.filter(r=>!f||(r.namespace+'.'+r.key).toLowerCase().includes(f));
 const cell=c=>c?'<span class="badge">'+esc(c.type)+'</span>':'<span class="badge" style="color:#a15c00">no existe</span>';
 res.innerHTML=(d.errors.length?'<p class="muted">No se pudieron leer: '+d.errors.map(e=>esc(e.store+' ('+e.error+')')).join('; ')+'</p>':'')+table(['Propietario','Namespace.clave',...d.stores.map(esc),'Estado'],d.rows.map(r=>'<tr><td>'+esc(r.owner)+'</td><td>'+esc(r.namespace+'.'+r.key)+'</td>'+d.stores.map(s=>'<td>'+cell(r.stores[s])+'</td>').join('')+'<td>'+({ok:'Coherente',missing:'Falta en alguna tienda',type_mismatch:'Tipos distintos'}[r.status])+'</td></tr>').join(''));return}
 if(tab==='GLOBAL'){section='metafields';renderSections();return load(true)}
@@ -2724,6 +2922,38 @@ try{const c=(await fetchJSON('/api/admin/collection?store='+encodeURIComponent(t
 box.innerHTML='<h2>'+esc(c.title)+'</h2><p class="muted">Se guarda directamente en la tienda '+esc(tab)+'. <span id="detail-status" class="status" role="status" aria-live="polite"></span></p><div class="grid">'+fld('c-title','Título',c.title)+fld('c-handle','Handle (crea redirección)',c.handle)+fld('c-seot','Título SEO',(c.seo||{}).title||'')+fld('c-seod','Descripción SEO',(c.seo||{}).description||'')+'</div>'+fld('c-desc','Descripción (HTML)',c.descriptionHtml,true)+'<div class="actions"><button class="button primary" id="save-collection">Guardar colección</button></div><h3>Metacampos de la colección</h3>'+table(['Clave','Tipo','Valor',''],mfRows(c.metafields.nodes,c.id));
 $('#save-collection').onclick=async e=>{const d=await post('/api/admin/collection/update',{store:tab,id,fields:{title:$('#c-title').value,handle:$('#c-handle').value,seo_title:$('#c-seot').value,seo_description:$('#c-seod').value,descriptionHtml:$('#c-desc').value}},e.target);void d};
 bindMetafields(id,box);box.scrollIntoView({behavior:'smooth'})}catch(err){box.innerHTML='<p class="status">'+esc(err.message)+'</p>'}}
-(async()=>{try{stores=(await fetchJSON('/api/admin/stores')).stores;section='metafields';renderTabs();renderSections();load(true)}catch(err){$('#result').innerHTML='<p class="status">'+esc(err.message)+'</p>'}})();
+const GF={product:[['status','Estado','enum',['ACTIVE','DRAFT','ARCHIVED']],['vendor','Proveedor','text'],['productType','Tipo de producto','text']],variant:[['weight','Peso','text'],['weightUnit','Unidad de peso','enum',['KILOGRAMS','GRAMS','POUNDS','OUNCES']],['taxable','Cobrar impuestos','bool'],['inventoryPolicy','Si no hay stock','enum',['DENY','CONTINUE']],['tracked','Seguimiento de stock','bool'],['requiresShipping','Requiere envío','bool']]};
+let defRows=[];
+function gTargets(){const scope=$('#g-scope').value,owner=scope==='product'?'PRODUCT':'PRODUCTVARIANT';
+return GF[scope].map(f=>'<option value="f:'+f[0]+'">'+esc(f[1])+'</option>').join('')+defRows.filter(r=>r.owner===owner).map(r=>{const t=Object.values(r.stores).find(Boolean);return '<option value="m:'+esc(r.namespace+'.'+r.key+'|'+(t?t.type:''))+'">Metacampo '+esc(r.namespace+'.'+r.key)+'</option>'}).join('')}
+function gValue(row){const t=row.querySelector('select').value,box=row.querySelector('.g-val');const scope=$('#g-scope').value;
+if(t.startsWith('f:')){const f=GF[scope].find(x=>x[0]===t.slice(2));
+if(f[2]==='enum'){box.innerHTML='<select data-val>'+f[3].map(o=>'<option>'+o+'</option>').join('')+'</select>';return}
+if(f[2]==='bool'){box.innerHTML='<select data-val data-bool="1"><option value="true">Sí</option><option value="false">No</option></select>';return}}
+box.innerHTML='<textarea data-val rows="2" placeholder="Valor (las listas, como JSON)"></textarea>'}
+function addChange(){const row=document.createElement('div');row.className='actions';row.dataset.ch='1';row.innerHTML='<select aria-label="Campo">'+gTargets()+'</select><div class="g-val" style="flex:1;min-width:14rem"></div><button type="button" class="button secondary" aria-label="Quitar cambio">Quitar</button>';
+row.querySelector('select').onchange=()=>gValue(row);row.querySelector('button').onclick=()=>row.remove();$('#g-changes').appendChild(row);gValue(row)}
+function resetChanges(){$('#g-changes').innerHTML='';addChange()}
+function collectChanges(){return [...document.querySelectorAll('[data-ch]')].map(r=>{const t=r.querySelector('select').value,v=r.querySelector('[data-val]');const val=v.dataset.bool?v.value==='true':v.value;
+if(t.startsWith('m:')){const [nk,type]=t.slice(2).split('|'),i=nk.indexOf('.');return {kind:'metafield',namespace:nk.slice(0,i),key:nk.slice(i+1),type,value:String(val)}}
+return {kind:'field',field:t.slice(2),value:val}})}
+function renderGStores(){$('#g-stores').innerHTML=stores.map(s=>'<label style="margin-right:1rem"><input type="checkbox" value="'+esc(s.code)+'" checked style="width:auto"> '+esc(s.code)+'</label>').join('')}
+function gBody(){const skus=$('#g-skus').value.split(String.fromCharCode(10)).flatMap(l=>l.split(',')).map(x=>x.trim()).filter(Boolean);
+return {scope:$('#g-scope').value,stores:[...document.querySelectorAll('#g-stores input:checked')].map(i=>i.value),skus,changes:collectChanges()}}
+function gShow(v){return typeof v==='boolean'?(v?'Sí':'No'):(v===''||v==null?'(vacío)':String(v))}
+function renderGlobal(d,applied){const sym={OK:'Aplicado',FAILED:'Error',SKIPPED:'Sin cambios'};
+$('#g-result').innerHTML=d.stores.map(s=>{const items=s.results||s.items||[];const real=items.filter(i=>(i.changes||[]).length);
+const ok=items.filter(i=>i.status==='OK').length,fail=items.filter(i=>i.status==='FAILED').length;
+const head=s.blocked?'<span class="badge" style="color:#a15c00">Omitida</span>':applied?'<span class="badge">'+ok+' aplicados · '+fail+' con error</span>':'<span class="badge">'+real.length+' se modificarán · '+(items.length-real.length)+' sin cambios</span>';
+const exc=(s.exceptions||[]).map(e=>'<li><strong>'+esc(e.code)+'</strong> — '+esc(e.message)+'</li>').join('');
+const rows=items.map(i=>'<tr><td>'+esc((i.skus||[]).join(', '))+'</td><td class="wrap-cell">'+esc(i.title)+'</td><td class="wrap-cell">'+((i.changes||[]).map(c=>esc(c.label)+': '+esc(gShow(c.before))+' → <strong>'+esc(gShow(c.after))+'</strong>').join('<br>')||'<span class="muted">Sin cambios</span>')+'</td>'+(applied?'<td>'+esc(sym[i.status]||'')+(i.error?'<br><small class="status">'+esc(i.error)+'</small>':'')+'</td>':'')+'</tr>').join('');
+return '<article class="card"><h3>'+esc(s.store)+' '+head+'</h3>'+(exc?'<ul style="color:#a15c00">'+exc+'</ul>':'')+(rows?table(['SKU','Elemento','Cambios'].concat(applied?['Resultado']:[]),rows):'')+'</article>'}).join('')}
+async function gRun(path,btn,applied){const st=$('#g-status');btn.disabled=true;st.textContent=applied?'Aplicando en las tiendas…':'Comprobando…';$('#g-result').innerHTML='';
+try{const d=await fetchJSON(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(gBody())});renderGlobal(d,applied);st.textContent=applied?'Operación terminada'+(d.operation_id?' (registro #'+d.operation_id+')':'')+'.':'Previsualización lista: no se ha escrito nada.'}
+catch(err){st.textContent=err.message}finally{btn.disabled=false}}
+$('#g-preview').onclick=e=>gRun('/api/admin/global/preview',e.target,false);$('#g-apply').onclick=e=>gRun('/api/admin/global/apply',e.target,true);
+$('#g-add').onclick=addChange;$('#g-scope').onchange=resetChanges;
+$('#g-all').onclick=()=>document.querySelectorAll('#g-stores input').forEach(i=>i.checked=true);$('#g-none').onclick=()=>document.querySelectorAll('#g-stores input').forEach(i=>i.checked=false);
+(async()=>{try{stores=(await fetchJSON('/api/admin/stores')).stores;renderGStores();section='metafields';renderTabs();renderSections();load(true)}catch(err){$('#result').innerHTML='<p class="status">'+esc(err.message)+'</p>'}})();
 </script>'''
     return shell('Administración',body,'admin')
