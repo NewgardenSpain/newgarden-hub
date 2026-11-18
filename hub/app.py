@@ -727,6 +727,12 @@ def search_shopify_products(q:str):
     result.sort(key=lambda p:(p['store']!='ES',p['store'],p['sku'],p['candidates'][0]['title']))
     return {'products':result,'notices':notices}
 
+def prefer_active_products(matches):
+    """Si un SKU está en varios productos y solo uno está activo, se usa ese; los borradores o archivados
+    con el mismo SKU no cuentan. Si hay 0 o 2+ activos se devuelven todos y el llamador decide (409)."""
+    active={k:p for k,p in matches.items() if p.get('status')=='ACTIVE'}
+    return active if len(matches)>1 and len(active)==1 else matches
+
 @app.get('/api/shopify/products/by-sku')
 def get_shopify_product_by_sku(store:str,sku:str):
     store_code=store.strip().upper(); exact_sku=sku.strip()
@@ -736,6 +742,7 @@ def get_shopify_product_by_sku(store:str,sku:str):
     hits=shopify_search(selected,exact_sku,50)
     matches={p['id']:p for p in hits if any((v.get('sku') or '').strip().casefold()==exact_sku.casefold() for v in (p.get('variants') or {}).get('nodes',[]))}
     if not matches: raise HTTPException(404,f'No se encontró el SKU exacto {exact_sku} en {store_code}')
+    matches=prefer_active_products(matches)
     if len(matches)>1: raise HTTPException(409,f'El SKU {exact_sku} coincide con varios productos en {store_code}')
     product=shopify_product(selected,next(iter(matches)),selected['locales'])
     return {'store':store_code,'sku':exact_sku,'product':product}
@@ -1224,6 +1231,7 @@ def resolve_es_product_by_sku(source_store,sku:str):
     hits=shopify_search(source_store,sku,20)
     unique={p['id']:p for p in hits if any((v.get('sku') or '').strip().casefold()==sku.casefold() for v in p.get('variants',{}).get('nodes',[]))}
     if not unique: raise HTTPException(404,'No se encontró un producto ES con ese SKU exacto')
+    unique=prefer_active_products(unique)
     if len(unique)>1: raise HTTPException(409,'El SKU coincide con varios productos de ES')
     return next(iter(unique.values()))
 

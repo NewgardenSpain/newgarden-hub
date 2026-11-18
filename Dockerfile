@@ -5,5 +5,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY hub ./hub
 COPY migrations ./migrations
+COPY scripts ./scripts
 USER 10001:10001
 CMD ["uvicorn", "hub.app:app", "--host", "0.0.0.0", "--port", "8080"]

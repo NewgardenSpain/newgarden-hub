@@ -47,9 +47,26 @@ services:
       db: {condition: service_healthy}
     restart: unless-stopped
     networks: [private]
+  mcp:
+    build: .
+    command: ["uvicorn", "scripts.content_hub_mcp_http:app", "--host", "0.0.0.0", "--port", "8765"]
+    environment:
+      CONTENT_HUB_URL: http://app:8080
+    ports:
+      - "${MCP_BIND:-192.168.1.202}:${MCP_PORT:-8766}:8765"
+    depends_on:
+      app: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks: [private]
 networks:
   private:
-    # No container ports are published except the internal web API.
+    # Only the API and MCP ports are published; DB and worker remain private.
     # Outbound access is needed for DeepL API and future Shopify integration.
     driver: bridge
 volumes:

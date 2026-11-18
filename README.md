@@ -10,7 +10,7 @@ Servicio separado del Compose existente del directorio padre. Cola persistente s
 
 ## Requisitos
 
-Docker Engine y Docker Compose v2. Crea este directorio en una ruta con acceso limitado al operador (la propuesta original `/opt/newgarden/content-hub` puede usarse si se despliega allí). `HUB_BIND=127.0.0.1` requiere proxy interno para acceso LAN. Si se publica directamente en LAN, sustituirlo por una IP LAN protegida por firewall. No conectar la red de n8n hasta acordar ese cambio.
+Docker Engine y Docker Compose v2. Crea este directorio en una ruta con acceso limitado al operador (la propuesta original `/opt/newgarden/content-hub` puede usarse si se despliega allí). La API web queda enlazada a `127.0.0.1`; el servicio MCP se publica en `192.168.1.202:8766` para el equipo de desarrollo de la LAN. El MCP no tiene autenticación propia, así que no publiques ese puerto fuera de la red local ni lo reenvíes desde el router. No conectar la red de n8n hasta acordar ese cambio.
 
 ```sh
 cd /opt/newgarden/content-hub
@@ -22,15 +22,35 @@ docker compose ps
 curl -fsS http://127.0.0.1:8787/health
 ```
 
-La app es de uso interno y no requiere login. La interfaz está en `/`, el explorador Shopify en `/products` y la configuración de tiendas en `/stores`; Swagger está en `/docs`. En cada tienda, `Consultar locales Shopify` muestra los códigos exactos habilitados, si son principales y si están publicados. El token necesita el scope `read_locales` para esa consulta; se pueden cargar todos los locales publicados y seleccionar los que se van a usar. Cada tienda conserva sus propios códigos, sin conversiones inferidas por país. El explorador busca por SKU, texto/nombre o GID en todas las tiendas activas, lee producto, variantes, imágenes, SEO y metacampos, y compara las traducciones registradas para locales adicionales con los campos actuales de los productos equivalentes en otras tiendas. Lee todas las páginas de metacampos de producto y variante del producto español, ignorando los de Yotpo; las variantes destino se emparejan por SKU (o título si no tienen SKU). Para cada metacampo de origen muestra `Falta el metacampo` si no existe en destino y `Metacampo vacío` si existe sin contenido. Editar el locale principal de una tienda actualiza solo el contenido base del producto o metacampo elegido; editar cualquier locale secundario registra una traducción Shopify, sin cambiar sus equivalentes. El editor de descripción conserva el HTML. La comparación requiere permisos Admin GraphQL de lectura de productos, `read_translations` y `read_locales`; las traducciones requieren `write_translations` y las actualizaciones del contenido base requieren `write_products`. La versión API se controla con `SHOPIFY_API_VERSION` (por defecto `2026-07`). Por defecto, Compose enlaza el servicio a `127.0.0.1`. Para acceso desde la LAN, configura `HUB_BIND` con la IP local del servidor y limita el acceso con el firewall de la red. No expongas el puerto a Internet. `.env` queda excluido de Git. La base de datos y worker no publican puertos; el worker mantiene concurrencia uno con un advisory lock PostgreSQL y no reanuda trabajos al arrancar.
+La app es de uso interno y no requiere login. La interfaz está en `/`, el explorador Shopify en `/products` y la configuración de tiendas en `/stores`; Swagger está en `/docs`. En cada tienda, `Consultar locales Shopify` muestra los códigos exactos habilitados, si son principales y si están publicados. El token necesita el scope `read_locales` para esa consulta; se pueden cargar todos los locales publicados y seleccionar los que se van a usar. Cada tienda conserva sus propios códigos, sin conversiones inferidas por país. El explorador busca por SKU, texto/nombre o GID en todas las tiendas activas, lee producto, variantes, imágenes, SEO y metacampos, y compara las traducciones registradas para locales adicionales con los campos actuales de los productos equivalentes en otras tiendas. Lee todas las páginas de metacampos de producto y variante del producto español, ignorando los de Yotpo; las variantes destino se emparejan por SKU (o título si no tienen SKU). Para cada metacampo de origen muestra `Falta el metacampo` si no existe en destino y `Metacampo vacío` si existe sin contenido. Editar el locale principal de una tienda actualiza solo el contenido base del producto o metacampo elegido; editar cualquier locale secundario registra una traducción Shopify, sin cambiar sus equivalentes. El editor de descripción conserva el HTML. La comparación requiere permisos Admin GraphQL de lectura de productos, `read_translations` y `read_locales`; las traducciones requieren `write_translations` y las actualizaciones del contenido base requieren `write_products`. La versión API se controla con `SHOPIFY_API_VERSION` (por defecto `2026-07`). La API web está enlazada a `127.0.0.1:8787`; el MCP HTTP usa `MCP_BIND=192.168.1.202` y `MCP_PORT=8766` por defecto. Solo se publica ese puerto MCP en la LAN; no lo expongas a Internet. `.env` queda excluido de Git. La base de datos y worker no publican puertos; el worker mantiene concurrencia uno con un advisory lock PostgreSQL y no reanuda trabajos al arrancar.
 
-## MCP stdio para Codex y Claude Code
+## MCP HTTP y stdio para Codex y Claude Code
 
-`scripts/content_hub_mcp.py` publica herramientas MCP sobre stdio y llama a la API indicada por `CONTENT_HUB_URL` (por defecto `http://127.0.0.1:8787`); no necesita dependencias Python adicionales. El proceso MCP corre en el host, por lo que puede usar el puerto Docker publicado. Regístralo en Codex desde este checkout:
+Compose publica un MCP remoto con transporte Streamable HTTP en `http://192.168.1.202:8766/mcp`. El servicio MCP tiene su propio puerto y llama a la API por la red privada de Docker; la API web permanece en localhost. No requiere que el checkout exista en los equipos cliente.
+
+En Codex, añade el servidor remoto:
+
+```sh
+codex mcp add newgarden-content-hub --url http://192.168.1.202:8766/mcp
+codex mcp list
+```
+
+En Claude Code:
+
+```sh
+claude mcp add --transport http newgarden-content-hub http://192.168.1.202:8766/mcp
+claude mcp list
+```
+
+El puerto MCP no tiene autenticación y permite las escrituras Shopify de las herramientas existentes. Debe permanecer accesible solo desde la LAN de desarrollo.
+
+### Alternativa local por stdio
+
+`scripts/content_hub_mcp.py` sigue publicando las mismas herramientas sobre stdio y llama a la API indicada por `CONTENT_HUB_URL` (por defecto `http://127.0.0.1:8787`); no necesita dependencias Python adicionales. Regístralo en Codex desde un equipo que tenga el checkout:
 
 ```sh
 codex mcp add newgarden-content-hub \\
-  --env CONTENT_HUB_URL=http://192.168.1.202:8787 \\
+  --env CONTENT_HUB_URL=http://127.0.0.1:8787 \\
   -- python3 /srv/services/newgarden-content-hub/scripts/content_hub_mcp.py
 codex mcp list
 ```
@@ -39,11 +59,11 @@ En Claude Code:
 
 ```sh
 claude mcp add newgarden-content-hub \\
-  --env CONTENT_HUB_URL=http://192.168.1.202:8787 \\
+  --env CONTENT_HUB_URL=http://127.0.0.1:8787 \\
   -- python3 /srv/services/newgarden-content-hub/scripts/content_hub_mcp.py
 ```
 
-Herramientas disponibles: `list_stores`, `list_shop_locales`, `get_product_by_sku`, `get_translation_context`, `search_products`, `search_shop_products`, `search_orders`, `get_inventory_levels`, `shopify_admin_graphql`, comparar productos, consultar lotes y guardar ediciones en Shopify. En una solicitud de traducción, el modelo del agente lee el producto con `get_product_by_sku`, consulta términos y locale con `get_translation_context`, traduce con su propio modelo y escribe con `edit_translation` o `shopify_admin_graphql`. No se expone al MCP el flujo de traducción del servidor (`translate_product`/`translate_catalog`), que depende de `TRANSLATION_PROVIDER`. `shopify_admin_graphql` ejecuta queries y mutations Admin con variables y nombre de operación opcional; devuelve `data`, `errors` y `extensions`, incluidos los `userErrors` de mutations. La API usa `SHOPIFY_API_VERSION` y los scopes existentes de cada instalación. El backend resuelve el token solo para la tienda solicitada y nunca lo devuelve al proceso MCP. Por decisión de gerencia no se exige aprobación humana previa a las escrituras, y el MCP no añade confirmaciones: las herramientas de escritura actúan según la operación solicitada y Shopify aplica los permisos concedidos a esa app. Si el puerto o servicio no está activo, devuelve el error de conexión. Cambia `192.168.1.202` por la IP del host si el despliegue publica el servicio en otra dirección; para un binding localhost basta usar `127.0.0.1`.
+Herramientas disponibles: `list_stores`, `list_shop_locales`, `get_product_by_sku`, `get_translation_context`, `search_products`, `search_shop_products`, `search_orders`, `get_inventory_levels`, `shopify_admin_graphql`, comparar productos, consultar lotes y guardar ediciones en Shopify. En una solicitud de traducción, el modelo del agente lee el producto con `get_product_by_sku`, consulta términos y locale con `get_translation_context`, traduce con su propio modelo y escribe con `edit_translation` o `shopify_admin_graphql`. No se expone al MCP el flujo de traducción del servidor (`translate_product`/`translate_catalog`), que depende de `TRANSLATION_PROVIDER`. `shopify_admin_graphql` ejecuta queries y mutations Admin con variables y nombre de operación opcional; devuelve `data`, `errors` y `extensions`, incluidos los `userErrors` de mutations. La API usa `SHOPIFY_API_VERSION` y los scopes existentes de cada instalación. El backend resuelve el token solo para la tienda solicitada y nunca lo devuelve al proceso MCP. Por decisión de gerencia no se exige aprobación humana previa a las escrituras, y el MCP no añade confirmaciones: las herramientas de escritura actúan según la operación solicitada y Shopify aplica los permisos concedidos a esa app. Si el puerto o servicio no está activo, el cliente informa del error de conexión.
 
 Las migraciones SQL se registran y aplican una sola vez al iniciar la app o el worker. La migración `002` elimina las tiendas independientes NL/PT, sus correspondencias y reglas; cancela los trabajos aún en cola y conserva el historial ya generado y los locales NL/PT de ES.
 
