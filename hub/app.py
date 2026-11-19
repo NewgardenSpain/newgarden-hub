@@ -338,6 +338,7 @@ def shell(title, body, active=''):
     icons = {
         'home': '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
         'products': '<path d="m12 3 9 5v8l-9 5-9-5V8l9-5Z"/><path d="m3 8 9 5 9-5M12 13v8M7.5 5.5l9 5"/>',
+        'gallery': '<path d="M14 3h7v7M21 3l-9 9M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/>',
         'batch': '<rect x="7" y="7" width="14" height="14" rx="2"/><path d="M17 7V3H3v14h4M11 12h6M11 16h6"/>',
         'campaigns': '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
         'review': '<path d="M4 4h16v16H4zM8 9h8M8 13h5"/><path d="m14 17 2 2 4-4"/>',
@@ -347,7 +348,9 @@ def shell(title, body, active=''):
         'tags': '<path d="M3 12V3h9l9 9-9 9-9-9Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',        'collections': '<rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/>',
         'admin': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v16"/>',
     }
-    items = [('home','/','Resumen'),('admin','/admin','Administración'),('products','/products','Gestión de productos'),('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
+    items = [('home','/','Resumen'),('admin','/admin','Administración'),('products','/products','Gestión de productos'),
+             ('gallery','http://192.168.1.202:5678/webhook/panel-galeria','Panel de galería'),
+             ('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
