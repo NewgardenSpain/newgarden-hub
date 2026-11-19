@@ -635,7 +635,7 @@ document.querySelector('#batch-form').addEventListener('submit',async e=>{e.prev
 
 @app.get('/translation-batches',response_class=HTMLResponse)
 def translation_batches_page():
-    body='''<main class="wrap"><h1>Revisión de lotes</h1><p class="lede">Revisa cada propuesta antes de aprobarla. Solo los campos aprobados se podrán aplicar a Shopify.</p><section class="card" aria-labelledby="batch-list-title"><div class="section-heading"><h2 id="batch-list-title">Lotes recientes</h2><button id="refresh-batches" class="secondary" type="button">Actualizar lotes</button></div><p id="batch-list-status" class="muted" role="status" aria-live="polite">Cargando lotes…</p><div id="batch-list"></div></section><section id="batch-detail" aria-label="Detalle del lote"></section></main><script>
+    body='''<main class="wrap"><h1>Revisión de lotes</h1><p class="lede">Revisa cada propuesta antes de aprobarla. Solo los campos aprobados se podrán aplicar a Shopify.</p><section class="card" aria-labelledby="batch-search-title"><h2 id="batch-search-title">Buscar histórico por SKU</h2><form id="batch-search" class="actions" role="search"><label for="batch-search-sku" class="sr-only">SKU</label><input id="batch-search-sku" type="search" maxlength="120" required placeholder="LUMLNA040BEWLNW" autocomplete="off" style="max-width:24rem"><button type="submit">Buscar</button></form><p id="batch-search-status" class="muted" role="status" aria-live="polite"></p><div id="batch-search-results"></div></section><details class="card" id="recent-batches"><summary><strong>Lotes recientes</strong> <span class="muted">(últimos 200; pulsa para ver la tabla)</span></summary><div class="section-heading"><span></span><button id="refresh-batches" class="secondary" type="button">Actualizar lotes</button></div><p id="batch-list-status" class="muted" role="status" aria-live="polite"></p><div id="batch-list"></div></details><section id="batch-detail" aria-label="Detalle del lote"></section></main><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const list=document.querySelector('#batch-list'),listStatus=document.querySelector('#batch-list-status'),detail=document.querySelector('#batch-detail');let current=null;
 async function request(url,options){const r=await fetch(url,options);let d={};try{d=await r.json()}catch{}if(!r.ok)throw new Error(d.detail||'No se pudo completar la solicitud');return d}
@@ -652,7 +652,10 @@ detail.querySelector('#approve-selected')?.addEventListener('click',async()=>{co
 detail.querySelector('#reject-batch')?.addEventListener('click',async()=>{if(!confirm('¿Rechazar el lote #'+b.id+'? Se descartarán todas las propuestas no aplicadas; lo ya subido a Shopify no se toca.'))return;const button=detail.querySelector('#reject-batch');button.disabled=true;actionStatus.textContent='Rechazando lote…';try{await request(`/api/translation-batches/${b.id}/reject`,{method:'POST'});await loadDetail(b.id);await loadBatches();detail.querySelector('#batch-action-status').textContent='Lote rechazado. Las propuestas no aplicadas se han descartado.'}catch(e){actionStatus.textContent='No se pudo rechazar el lote: '+e.message;button.disabled=false}});
 detail.querySelector('#apply-approved')?.addEventListener('click',async()=>{const ids=[...detail.querySelectorAll('.approve-check:checked')].map(x=>Number(x.value)),selected=ids.length>0;if(!selected&&!approved.length)return;const prompt=selected?`¿Aprobar y aplicar los ${ids.length} campos seleccionados a Shopify?`:`¿Aplicar ${approved.length} campo(s) aprobado(s) a Shopify?`;if(!confirm(prompt+' Esta acción escribe en la tienda.'))return;const button=detail.querySelector('#apply-approved');button.disabled=true;actionStatus.textContent=selected?'Aprobando y aplicando solo los campos seleccionados…':'Aplicando los campos aprobados en Shopify…';try{if(selected)await request(`/api/translation-batches/${b.id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids})});await request(`/api/translation-batches/${b.id}/apply`,selected?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({item_ids:ids})}:{method:'POST'});await loadDetail(b.id);await loadBatches();detail.querySelector('#batch-action-status').textContent=selected?`${ids.length} campo(s) aprobado(s) y aplicado(s).`:'Aplicación finalizada. Los campos pendientes siguen disponibles para otra selección.'}catch(e){actionStatus.textContent='No se pudieron aplicar los campos: '+e.message;button.disabled=false}})}
 async function loadDetail(id){detail.innerHTML='<section class="card" role="status">Cargando lote…</section>';try{renderBatch(await request('/api/translation-batches/'+id));detail.querySelector('#batch-detail-title')?.focus({preventScroll:true})}catch(e){detail.innerHTML=`<section class="card"><p class="status" role="alert">${esc(e.message)}</p></section>`}}
-document.querySelector('#refresh-batches').addEventListener('click',loadBatches);loadBatches();{const m=location.hash.match(/^#([0-9]+)$/);if(m)loadDetail(Number(m[1]))}
+const STATE_ES={PENDING_REVIEW:'pendientes',APPROVED:'aprobados',SAVED:'subidos',REJECTED:'rechazados',ERROR:'con error',APPLY_ERROR:'error al aplicar'};
+async function searchSku(ev){ev.preventDefault();const sku=document.querySelector('#batch-search-sku').value.trim(),st=document.querySelector('#batch-search-status'),out=document.querySelector('#batch-search-results');if(!sku)return;st.textContent='Buscando…';out.innerHTML='';try{const d=await request('/api/translation-batches/search?sku='+encodeURIComponent(sku));st.textContent=d.batches.length?`${d.batches.length} lote(s) para «${sku}»${d.product_gid?' (incluye otros SKU del mismo producto)':''}, del más reciente al más antiguo.`:`No hay lotes para «${sku}». Las traducciones hechas fuera del hub (p. ej. en el admin de Shopify) no aparecen aquí.`;out.innerHTML=d.batches.map(b=>`<article class="card"><h3>Lote #${b.id} · ${esc(b.sku)} <span class="badge">${esc(b.state)}</span></h3><p>${esc(b.source_title||'')} · Creado ${esc(date(b.created_at))} · Actualizado ${esc(date(b.updated_at))}${b.match==='producto'?' · <em>mismo producto, otro SKU</em>':''}</p>${b.error?`<p class="batch-error">${esc(b.error)}</p>`:''}<ul>${b.targets.map(t=>`<li><strong>${esc(t.store)} · ${esc(t.locale)}</strong>: ${Object.entries(t.states).map(([s,n])=>n+' '+(STATE_ES[s]||s)).join(', ')}</li>`).join('')||'<li class="muted">Sin campos.</li>'}</ul><button class="secondary open-found" type="button" data-id="${b.id}">Abrir revisión</button></article>`).join('');out.querySelectorAll('.open-found').forEach(x=>x.addEventListener('click',()=>{loadDetail(Number(x.dataset.id));detail.scrollIntoView({behavior:'smooth'})}))}catch(e){st.textContent=e.message}}
+document.querySelector('#batch-search').addEventListener('submit',searchSku);
+document.querySelector('#refresh-batches').addEventListener('click',loadBatches);document.querySelector('#recent-batches').addEventListener('toggle',e=>{if(e.target.open&&!list.innerHTML)loadBatches()});{const m=location.hash.match(/^#([0-9]+)$/);if(m)loadDetail(Number(m[1]))}
 </script>'''
     return shell('Revisión de lotes',body,'review')
 
@@ -1254,6 +1257,34 @@ def list_translation_batches(user=Depends(operator)):
     with pool.connection() as c:
         rows=c.execute('SELECT id,source_sku,source_title,state,error,created_at,updated_at FROM translation_batches ORDER BY updated_at DESC,id DESC LIMIT 200').fetchall()
     return [dict(zip(('id','sku','source_title','state','error','created_at','updated_at'),row)) for row in rows]
+
+@app.get('/api/translation-batches/search')
+def search_translation_batches(sku:str,user=Depends(operator)):
+    sku=sku.strip()
+    if not sku or len(sku)>120: raise HTTPException(422,'Indica un SKU de hasta 120 caracteres')
+    like='%'+sku.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+    # Un lote se registra con el SKU con el que se lanzó; si el SKU existe en ES,
+    # también se buscan los lotes del mismo producto (otras variantes).
+    gid=None
+    try:
+        source_store=next((s for s in shopify_stores() if s['code']=='ES' and s['token']),None)
+        if source_store: gid=resolve_es_product_by_sku(source_store,sku)['id']
+    except HTTPException: gid=None
+    with pool.connection() as c:
+        rows=c.execute("""SELECT b.id,b.source_sku,b.source_title,b.source_product_gid,b.state,b.error,b.created_at,b.updated_at,
+            (b.source_sku ILIKE %s ESCAPE '\\') AS sku_match
+            FROM translation_batches b WHERE b.source_sku ILIKE %s ESCAPE '\\' OR (%s::text IS NOT NULL AND b.source_product_gid=%s)
+            ORDER BY b.created_at DESC,b.id DESC LIMIT 100""",(like,like,gid,gid)).fetchall()
+        ids=[r[0] for r in rows]
+        items=c.execute("""SELECT batch_id,store_code,locale,state,count(*),max(updated_at) FROM translation_batch_items
+            WHERE batch_id=ANY(%s) GROUP BY batch_id,store_code,locale,state ORDER BY store_code,locale""",(ids,)).fetchall() if ids else []
+    by_batch={}
+    for batch_id,store,locale,state,n,last in items:
+        entry=by_batch.setdefault(batch_id,{}).setdefault((store,locale),{'store':store,'locale':locale,'states':{},'updated_at':last})
+        entry['states'][state]=n
+        if last>entry['updated_at']: entry['updated_at']=last
+    return {'sku':sku,'product_gid':gid,'batches':[{'id':r[0],'sku':r[1],'source_title':r[2],'state':r[4],'error':r[5],'created_at':r[6],'updated_at':r[7],
+        'match':'sku' if r[8] else 'producto','targets':list(by_batch.get(r[0],{}).values())} for r in rows]}
 
 @app.post('/api/translation-batches')
 def create_translation_batch(x:TranslationBatchRequest,user=Depends(operator)):
