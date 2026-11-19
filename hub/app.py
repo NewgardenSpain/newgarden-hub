@@ -2767,6 +2767,7 @@ class AdminGlobalChange(BaseModel):
     key:str|None=Field(None,pattern=r'^[A-Za-z0-9_-]{1,64}$')
     type:str|None=Field(None,max_length=80)
     value:Any=None
+    clear:bool=False
 
 class AdminGlobalRequest(BaseModel):
     scope:str
@@ -2777,6 +2778,7 @@ class AdminGlobalRequest(BaseModel):
 def admin_global_change(scope,c):
     if c.kind=='metafield':
         if not (c.namespace and c.key and c.type): raise HTTPException(400,'Metacampo incompleto: faltan namespace, clave o tipo')
+        if c.clear: return {'kind':'metafield','label':f'{c.namespace}.{c.key}','namespace':c.namespace,'key':c.key,'type':c.type,'value':'','clear':True}
         if not isinstance(c.value,str): raise HTTPException(400,f'Valor no válido para {c.namespace}.{c.key}')
         return {'kind':'metafield','label':f'{c.namespace}.{c.key}','namespace':c.namespace,'key':c.key,'type':c.type,'value':admin_metafield_value(c.type,c.value)}
     if c.kind!='field' or c.field not in GLOBAL_FIELDS[scope]: raise HTTPException(400,f'Campo no editable en modo global: {c.field}')
@@ -2864,7 +2866,7 @@ def admin_global_plan_store(st,scope,skus,changes):
             d=defs.get((owner,c['namespace'],c['key']))
             if not d: block('METAFIELD_DEFINITION_MISSING',f'El metacampo {c["label"]} no existe en {st["code"]}',owner=owner,namespace=c['namespace'],key=c['key'],type=c['type']); continue
             if d['type']!=c['type']: block('METAFIELD_TYPE_MISMATCH',f'{c["label"]} es de tipo {d["type"]} en {st["code"]} (se esperaba {c["type"]})'); continue
-            if d.get('choices'):
+            if d.get('choices') and not c.get('clear'):
                 try: values=json.loads(c['value']) if c['type'].startswith('list.') else [c['value']]
                 except ValueError: values=[None]
                 bad=[v for v in values if v not in d['choices']]
@@ -2923,7 +2925,8 @@ def admin_global_apply_store(st,scope,plan,changes):
             results.append({**item,'status':'SKIPPED'}); continue
         try:
             fields={changes[d['i']]['field']:changes[d['i']]['value'] for d in item['changes'] if changes[d['i']]['kind']=='field'}
-            entries=[{'ownerId':item['id'],'namespace':changes[d['i']]['namespace'],'key':changes[d['i']]['key'],'type':changes[d['i']]['type'],'value':changes[d['i']]['value']} for d in item['changes'] if changes[d['i']]['kind']=='metafield']
+            entries=[{'ownerId':item['id'],'namespace':changes[d['i']]['namespace'],'key':changes[d['i']]['key'],'type':changes[d['i']]['type'],'value':changes[d['i']]['value']} for d in item['changes'] if changes[d['i']]['kind']=='metafield' and not changes[d['i']].get('clear')]
+            clears=[{'ownerId':item['id'],'namespace':changes[d['i']]['namespace'],'key':changes[d['i']]['key']} for d in item['changes'] if changes[d['i']]['kind']=='metafield' and changes[d['i']].get('clear')]
             if fields and scope=='product':
                 admin_exec(st,'mutation($product:ProductUpdateInput!){productUpdate(product:$product){product{id} userErrors{field message}}}',{'product':{'id':item['id'],**fields}},'productUpdate')
             elif fields:
@@ -2931,6 +2934,8 @@ def admin_global_apply_store(st,scope,plan,changes):
                 admin_exec(st,'mutation($productId:ID!,$variants:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$productId,variants:$variants){productVariants{id} userErrors{field message}}}',{'productId':item['product_id'],'variants':[variant]},'productVariantsBulkUpdate')
             if entries:
                 admin_exec(st,'mutation($metafields:[MetafieldsSetInput!]!){metafieldsSet(metafields:$metafields){metafields{id} userErrors{field message}}}',{'metafields':entries},'metafieldsSet')
+            if clears:
+                admin_exec(st,'mutation($metafields:[MetafieldIdentifierInput!]!){metafieldsDelete(metafields:$metafields){deletedMetafields{key} userErrors{field message}}}',{'metafields':clears},'metafieldsDelete')
             results.append({**item,'status':'OK'})
         except HTTPException as exc:
             results.append({**item,'status':'FAILED','error':str(exc.detail)[:400]})

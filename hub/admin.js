@@ -607,7 +607,16 @@ function addChange(pre) {
   const row = document.createElement('div'); row.className = 'change';
   row.innerHTML = `<div class="field combo"><input role="combobox" aria-label="Campo a cambiar" aria-expanded="false" aria-autocomplete="list" autocomplete="off" placeholder="Buscar campo o metacampo…"><ul role="listbox" hidden></ul></div><div class="ctl-slot"><p class="muted">Elige primero el campo.</p></div><button type="button" class="button secondary remove" aria-label="Quitar este cambio">✕</button>`;
   $('.remove', row).onclick = () => { row.remove(); if (!OPEN_ROWS().length) addChange(); };
-  const choose = o => { row._ctl = valueControl(o); const slot = $('.ctl-slot', row); slot.innerHTML = ''; slot.appendChild(row._ctl.el); const f = $('input,select,textarea', slot); if (f) f.focus(); };
+  const choose = o => { row._ctl = valueControl(o); const slot = $('.ctl-slot', row); slot.innerHTML = ''; slot.appendChild(row._ctl.el); const f = $('input,select,textarea', slot); if (f) f.focus();
+    row._clear = false;
+    if (o.kind === 'metafield') {
+      const lab = document.createElement('label'); lab.className = 'muted';
+      lab.innerHTML = '<input type="checkbox" style="width:auto"> Vaciar (eliminar el valor del metacampo)';
+      const cb = $('input', lab);
+      cb.onchange = () => { row._clear = cb.checked; $$('input,select,textarea,button', row._ctl.el).forEach(e => { e.disabled = cb.checked; }); };
+      slot.appendChild(lab);
+    }
+  };
   makeCombo(row, choose); $('#g-changes').appendChild(row);
   if (pre) { const o = scopeOptions().find(x => x.id === pre); if (o) { row._sel = o; $('input', row).value = o.label + (o.sub ? '  ·  ' + o.sub : ''); choose(o); } }
   return row;
@@ -705,6 +714,7 @@ function collectBody() {
   const changes = OPEN_ROWS().map((row, n) => {
     const o = row._sel; if (!o || !row._ctl) throw new Error(`Paso 3: elige el campo del cambio ${n + 1}.`);
     const v = row._ctl.get();
+    if (o.kind === 'metafield' && row._clear) return { kind: 'metafield', namespace: o.namespace, key: o.key, type: o.type, value: '', clear: true };
     if (o.kind === 'metafield') { if (v === '' || v === '[]') throw new Error(`Paso 3: indica el valor de ${o.label}.`); return { kind: 'metafield', namespace: o.namespace, key: o.key, type: o.type, value: String(v) }; }
     if (o.key === 'weight' && v === '') throw new Error('Paso 3: indica el peso.');
     return { kind: 'field', field: o.key, value: v };
