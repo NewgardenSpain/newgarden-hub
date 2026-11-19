@@ -2731,6 +2731,22 @@ def admin_metafield_set(x:AdminMetafieldSet):
     admin_mutate(st,'metafield.set',x.owner_id,'mutation($metafields:[MetafieldsSetInput!]!){metafieldsSet(metafields:$metafields){metafields{id} userErrors{field message}}}',{'metafields':[entry]},'metafieldsSet',{f'{x.namespace}.{x.key}':current.get('value')},{f'{x.namespace}.{x.key}':x.value})
     return {'store':st['code'],'saved':True}
 
+class AdminMetafieldDelete(BaseModel):
+    store:str
+    owner_id:str
+    namespace:str=Field(pattern=r'^[A-Za-z0-9_-]{2,255}$')
+    key:str=Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
+
+@app.post('/api/admin/metafield/delete')
+def admin_metafield_delete(x:AdminMetafieldDelete):
+    """Vacía un metacampo (lo elimina del producto, variante o colección). El valor anterior queda en la auditoría."""
+    st=admin_store(x.store)
+    if not x.owner_id.startswith(('gid://shopify/Product/','gid://shopify/ProductVariant/','gid://shopify/Collection/')): raise HTTPException(400,'Propietario de metacampo no admitido')
+    current=((admin_gql(st,ADMIN_MF_READ,{'id':x.owner_id,'ns':x.namespace,'key':x.key}).get('node') or {}).get('metafield')) or {}
+    if not current: return {'store':st['code'],'saved':False}
+    admin_mutate(st,'metafield.delete',x.owner_id,'mutation($metafields:[MetafieldIdentifierInput!]!){metafieldsDelete(metafields:$metafields){deletedMetafields{key} userErrors{field message}}}',{'metafields':[{'ownerId':x.owner_id,'namespace':x.namespace,'key':x.key}]},'metafieldsDelete',{f'{x.namespace}.{x.key}':current.get('value')},{f'{x.namespace}.{x.key}':None})
+    return {'store':st['code'],'saved':True}
+
 @app.get('/api/admin/operations')
 def admin_operations(limit:int=50):
     with pool.connection() as c:

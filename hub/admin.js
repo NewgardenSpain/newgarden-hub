@@ -192,7 +192,7 @@ function mfBlock(nodes, ownerId) {
   if (!nodes.length) { box.innerHTML = '<p class="muted">Sin metacampos con valor.</p>'; return box; }
   nodes.forEach(m => {
     const row = document.createElement('div'); row.className = 'mf';
-    row.innerHTML = `<div><div class="k">${esc(m.namespace + '.' + m.key)}</div>${tag(m.type)}</div><div class="slot"></div><div><button type="button" class="button secondary" disabled>Guardar</button> <span class="st muted" role="status"></span></div>`;
+    row.innerHTML = `<div><div class="k">${esc(m.namespace + '.' + m.key)}</div>${tag(m.type)}</div><div class="slot"></div><div><button type="button" class="button secondary" disabled>Guardar</button> <button type="button" class="button secondary" data-clear>Vaciar</button> <span class="st muted" role="status"></span></div>`;
     const ctl = makeControl(m.type, { value: m.value }); $('.slot', row).appendChild(ctl.el);
     let initial = ctl.get(), digest = m.compareDigest; const btn = $('button', row), st = $('.st', row);
     const refresh = () => { btn.disabled = ctl.get() === initial; };
@@ -203,6 +203,14 @@ function mfBlock(nodes, ownerId) {
         const d = await post('/api/admin/metafield/set', { store: state.store, owner_id: ownerId, namespace: m.namespace, key: m.key, type: m.type, value: ctl.get(), compare_digest: digest || null });
         initial = ctl.get(); digest = null; st.textContent = d.saved ? 'Guardado' : 'Sin cambios';
       } catch (err) { st.textContent = err.message; refresh(); }
+    };
+    const clr = $('[data-clear]', row);
+    clr.onclick = async () => {
+      clr.disabled = true; btn.disabled = true; st.textContent = 'Vaciando…';
+      try {
+        await post('/api/admin/metafield/delete', { store: state.store, owner_id: ownerId, namespace: m.namespace, key: m.key });
+        row.innerHTML = `<div><div class="k">${esc(m.namespace + '.' + m.key)}</div></div><div class="muted">Vaciado (metacampo eliminado)</div>`;
+      } catch (err) { st.textContent = err.message; clr.disabled = false; refresh(); }
     };
     box.appendChild(row);
   });
