@@ -5,6 +5,7 @@
 <div class="adm-tabs" role="tablist" aria-label="Secciones">
   <button type="button" role="tab" id="tab-tienda" data-tab="tienda" aria-controls="panel-tienda">Una tienda</button>
   <button type="button" role="tab" id="tab-varias" data-tab="varias" aria-controls="panel-varias">Varias tiendas</button>
+  <button type="button" role="tab" id="tab-duplicados" data-tab="duplicados" aria-controls="panel-duplicados">Duplicados</button>
   <button type="button" role="tab" id="tab-valores" data-tab="valores" aria-controls="panel-valores">Valores</button>
   <button type="button" role="tab" id="tab-metacampos" data-tab="metacampos" aria-controls="panel-metacampos">Metacampos</button>
   <button type="button" role="tab" id="tab-historial" data-tab="historial" aria-controls="panel-historial">Historial</button>
@@ -77,6 +78,33 @@
   </div>
 
   <div id="g-result" aria-live="polite"></div>
+</section>
+
+<!-- DUPLICADOS -->
+<section id="panel-duplicados" role="tabpanel" aria-labelledby="tab-duplicados" hidden>
+  <p class="adm-intro">Pon un SKU o una lista y verás <strong>todas sus instancias en cada tienda</strong> (SKU exacto) con su SKU, el título de la variante y el producto al que pertenece (solo informativo). Edita el SKU y el título de la variante directamente, o aplica un prefijo/sufijo a las filas marcadas (por ejemplo para una campaña). «Guardar» escribe directamente en Shopify y solo envía las filas modificadas.</p>
+  <div class="step">
+    <div class="field"><label for="d-skus">SKU <span class="muted">(uno por línea o separados por comas)</span></label><textarea id="d-skus" rows="4" spellcheck="false"></textarea><p class="muted" id="d-sku-count">0 SKU</p></div>
+    <div class="chips" id="d-stores" role="group" aria-label="Tiendas"></div>
+    <div class="actions"><button type="button" class="button secondary" id="d-all">Todas</button><button type="button" class="button secondary" id="d-none">Ninguna</button><button type="button" class="button primary" id="d-search">Buscar instancias</button></div>
+    <p id="d-status" class="muted" role="status" aria-live="polite"></p>
+  </div>
+  <div id="d-work" hidden>
+    <div class="adm-bar">
+      <div class="field"><label for="d-sku-pre">Prefijo SKU</label><input id="d-sku-pre" autocomplete="off"></div>
+      <div class="field"><label for="d-sku-suf">Sufijo SKU</label><input id="d-sku-suf" autocomplete="off" placeholder="-XMAS"></div>
+      <div class="field"><label for="d-title-pre">Prefijo título variante</label><input id="d-title-pre" autocomplete="off"></div>
+      <div class="field"><label for="d-title-suf">Sufijo título variante</label><input id="d-title-suf" autocomplete="off"></div>
+      <button type="button" class="button secondary" id="d-fill">Aplicar a las filas marcadas</button>
+      <button type="button" class="button secondary" id="d-reset">Deshacer cambios</button>
+    </div>
+    <div id="d-table"></div>
+  </div>
+  <div class="actionbar" id="d-bar" hidden>
+    <button type="button" class="button primary" id="d-save" disabled>Guardar en Shopify</button>
+    <span id="d-save-status" class="muted" role="status" aria-live="polite"></span>
+  </div>
+  <div id="d-result" aria-live="polite"></div>
 </section>
 
 <!-- VALORES DE UN METACAMPO -->

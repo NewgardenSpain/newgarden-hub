@@ -3079,6 +3079,94 @@ def admin_definition_read(st,owner,namespace,key):
     nodes=(admin_gql(st,ADMIN_DEFINITION_READ,{'owner':owner,'ns':namespace,'key':key}).get('metafieldDefinitions') or {}).get('nodes') or []
     return nodes[0] if nodes else None
 
+# --- Duplicados: instancias de un SKU en todas las tiendas, con edición de SKU y título ---
+DUP_MAX_CHANGES=500
+ADMIN_DUP_QUERY='query($q:String!,$after:String){productVariants(first:100,query:$q,after:$after){nodes{id sku title selectedOptions{name value} product{id title status handle}} pageInfo{hasNextPage endCursor}}}'
+
+def admin_dup_instances(st,skus):
+    """Todas las variantes de la tienda cuyo SKU coincide exactamente (sin distinguir mayúsculas) con alguno de `skus`."""
+    wanted={s.lower() for s in skus}; out=[]
+    for i in range(0,len(skus),10):
+        q=' OR '.join('sku:"%s"'%s.replace('\\','\\\\').replace('"','\\"') for s in skus[i:i+10]); after=None
+        while True:
+            data=admin_gql(st,ADMIN_DUP_QUERY,{'q':q,'after':after}).get('productVariants') or {}
+            for n in data.get('nodes',[]):
+                sku=(n.get('sku') or '').strip()
+                if sku.lower() in wanted:
+                    p=n.get('product') or {}
+                    out.append({'variant_id':n['id'],'product_id':p.get('id'),'sku':sku,'variant_title':n.get('title') or '','options':[{'name':o['name'],'value':o['value']} for o in n.get('selectedOptions') or []],'product_title':p.get('title') or '','status':p.get('status') or '','handle':p.get('handle') or ''})
+            info=data.get('pageInfo') or {}
+            if not info.get('hasNextPage') or not info.get('endCursor'): break
+            after=info['endCursor']
+    return out
+
+@app.post('/api/admin/duplicates/search')
+def admin_duplicates_search(x:AdminSkuCheck):
+    skus=list(dict.fromkeys(s.strip() for s in x.skus if s.strip()))
+    if not skus: raise HTTPException(400,'Indica al menos un SKU')
+    if len(skus)>GLOBAL_MAX_SKUS: raise HTTPException(400,f'Máximo {GLOBAL_MAX_SKUS} SKU por búsqueda')
+    stores=admin_stores_from(x.stores)
+    results=run_per_store(stores,lambda st:admin_dup_instances(st,skus))
+    return {'skus':skus,'stores':[{'store':r['store'],'items':r['data']} if r['ok'] else {'store':r['store'],'items':[],'error':r['error']} for r in results]}
+
+class AdminDupChange(BaseModel):
+    store:str
+    variant_id:str
+    sku:str|None=None
+    variant_title:str|None=None
+
+class AdminDupApply(BaseModel):
+    changes:list[AdminDupChange]
+
+ADMIN_VARIANT_TITLE_READ='query($id:ID!){productVariant(id:$id){title product{id} selectedOptions{name value}}}'
+
+def admin_variant_title_update(st,vid,new_title):
+    """Cambia el título de una variante. En Shopify el título es la unión de los valores de sus opciones con ' / ',
+    así que se reparte el texto entre las opciones (debe haber tantos tramos como opciones)."""
+    node=admin_gql(st,ADMIN_VARIANT_TITLE_READ,{'id':vid}).get('productVariant')
+    if not node: raise HTTPException(404,'Variante no encontrada en la tienda')
+    opts=node.get('selectedOptions') or []
+    parts=[p.strip() for p in new_title.split(' / ')] if len(opts)>1 else [new_title.strip()]
+    if len(parts)!=len(opts) or not all(parts): raise HTTPException(400,f'El título debe tener {len(opts)} valores separados por " / " ({" / ".join(o["name"] for o in opts)})')
+    changed={o['name']:p for o,p in zip(opts,parts) if p!=o['value']}
+    if not changed: return []
+    values=[{'optionName':o['name'],'name':p} for o,p in zip(opts,parts) if o['name'] in changed]
+    admin_mutate(st,'variant.title',vid,'mutation($productId:ID!,$variants:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$productId,variants:$variants){productVariants{id} userErrors{field message}}}',{'productId':node['product']['id'],'variants':[{'id':vid,'optionValues':values}]},'productVariantsBulkUpdate',{o['name']:o['value'] for o in opts if o['name'] in changed},changed)
+    return ['variant_title']
+
+def admin_dup_apply_store(st,rows):
+    """Aplica en una tienda los cambios de SKU y título de variante. Un fallo no detiene el resto."""
+    out=[]
+    for r in rows:
+        try:
+            changed=[]
+            if r.sku is not None:
+                changed+=admin_variant_update(AdminVariantUpdate(store=st['code'],id=r.variant_id,fields={'sku':r.sku}))['changed']
+            if r.variant_title is not None:
+                changed+=admin_variant_title_update(st,r.variant_id,r.variant_title)
+            out.append({'store':st['code'],'variant_id':r.variant_id,'status':'OK' if changed else 'UNCHANGED','changed':changed})
+        except HTTPException as exc:
+            out.append({'store':st['code'],'variant_id':r.variant_id,'status':'FAILED','error':str(exc.detail)[:300]})
+    return out
+
+@app.post('/api/admin/duplicates/apply')
+def admin_duplicates_apply(x:AdminDupApply):
+    if not x.changes: raise HTTPException(400,'No hay cambios que guardar')
+    if len(x.changes)>DUP_MAX_CHANGES: raise HTTPException(400,f'Máximo {DUP_MAX_CHANGES} cambios por operación')
+    for r in x.changes:
+        if r.sku is None and r.variant_title is None: raise HTTPException(400,'Cambio vacío')
+        if not r.variant_id.startswith('gid://shopify/ProductVariant/'): raise HTTPException(400,'Identificador no válido')
+    by_store={}
+    for r in x.changes: by_store.setdefault(r.store.strip().upper(),[]).append(r)
+    stores=admin_stores_from(list(by_store))
+    missing=[c for c in by_store if c not in {s['code'] for s in stores}]
+    if missing: raise HTTPException(400,'Tienda inactiva o sin credenciales: '+', '.join(missing))
+    results=[]
+    for r in run_per_store(stores,lambda st:admin_dup_apply_store(st,by_store[st['code']])):
+        if r['ok']: results+=r['data']
+        else: results+=[{'store':r['store'],'variant_id':c.variant_id,'status':'FAILED','error':r['error']} for c in by_store[r['store']]]
+    return {'results':results,'ok':sum(1 for r in results if r['status']=='OK'),'failed':sum(1 for r in results if r['status']=='FAILED')}
+
 @app.post('/api/admin/definitions/create')
 def admin_definitions_create(x:AdminDefinitionCreate):
     """Copia la definición de un metacampo desde una tienda que la tiene a las tiendas indicadas que no la tienen."""
