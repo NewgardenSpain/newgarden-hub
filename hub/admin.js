@@ -820,11 +820,10 @@ function dupRender() {
   dupCount();
 }
 function dupFill() {
-  const sp = $('#d-sku-pre').value, ss = $('#d-sku-suf').value, tp = $('#d-title-pre').value, ts = $('#d-title-suf').value;
-  if (!(sp || ss || tp || ts)) { $('#d-save-status').textContent = 'Escribe un prefijo o un sufijo.'; return; }
+  const sp = $('#d-sku-pre').value, ss = $('#d-sku-suf').value;
+  if (!(sp || ss)) { $('#d-save-status').textContent = 'Escribe un prefijo o un sufijo.'; return; }
   D.rows.filter(r => r.pick).forEach(r => {  // siempre sobre el valor original: pulsar dos veces no lo duplica
-    if (sp || ss) r.sku = sp + r.sku0 + ss;
-    if (tp || ts) r.vt = tp + r.vt0 + ts;
+    r.sku = sp + r.sku0 + ss;
   });
   dupRender();
 }

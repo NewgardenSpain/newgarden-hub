@@ -82,7 +82,7 @@
 
 <!-- DUPLICADOS -->
 <section id="panel-duplicados" role="tabpanel" aria-labelledby="tab-duplicados" hidden>
-  <p class="adm-intro">Pon un SKU o una lista y verás <strong>todas sus instancias en cada tienda</strong> (SKU exacto) con su SKU, el título de la variante y el producto al que pertenece (solo informativo). Edita el SKU y el título de la variante directamente, o aplica un prefijo/sufijo a las filas marcadas (por ejemplo para una campaña). «Guardar» escribe directamente en Shopify y solo envía las filas modificadas.</p>
+  <p class="adm-intro">Pon un SKU o una lista y verás <strong>todas sus instancias en cada tienda</strong> (SKU exacto) con su SKU, el título de la variante y el producto al que pertenece (solo informativo). Edita el SKU y el título de la variante directamente, o aplica un prefijo/sufijo de SKU a las filas marcadas (por ejemplo para una campaña). «Guardar» escribe directamente en Shopify y solo envía las filas modificadas.</p>
   <div class="step">
     <div class="field"><label for="d-skus">SKU <span class="muted">(uno por línea o separados por comas)</span></label><textarea id="d-skus" rows="4" spellcheck="false"></textarea><p class="muted" id="d-sku-count">0 SKU</p></div>
     <div class="chips" id="d-stores" role="group" aria-label="Tiendas"></div>
@@ -93,8 +93,6 @@
     <div class="adm-bar">
       <div class="field"><label for="d-sku-pre">Prefijo SKU</label><input id="d-sku-pre" autocomplete="off"></div>
       <div class="field"><label for="d-sku-suf">Sufijo SKU</label><input id="d-sku-suf" autocomplete="off" placeholder="-XMAS"></div>
-      <div class="field"><label for="d-title-pre">Prefijo título variante</label><input id="d-title-pre" autocomplete="off"></div>
-      <div class="field"><label for="d-title-suf">Sufijo título variante</label><input id="d-title-suf" autocomplete="off"></div>
       <button type="button" class="button secondary" id="d-fill">Aplicar a las filas marcadas</button>
       <button type="button" class="button secondary" id="d-reset">Deshacer cambios</button>
     </div>
