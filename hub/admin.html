@@ -6,6 +6,7 @@
   <button type="button" role="tab" id="tab-tienda" data-tab="tienda" aria-controls="panel-tienda">Una tienda</button>
   <button type="button" role="tab" id="tab-varias" data-tab="varias" aria-controls="panel-varias">Varias tiendas</button>
   <button type="button" role="tab" id="tab-duplicados" data-tab="duplicados" aria-controls="panel-duplicados">Duplicados</button>
+  <button type="button" role="tab" id="tab-categorias" data-tab="categorias" aria-controls="panel-categorias">Categorías</button>
   <button type="button" role="tab" id="tab-valores" data-tab="valores" aria-controls="panel-valores">Valores</button>
   <button type="button" role="tab" id="tab-metacampos" data-tab="metacampos" aria-controls="panel-metacampos">Metacampos</button>
   <button type="button" role="tab" id="tab-historial" data-tab="historial" aria-controls="panel-historial">Historial</button>
@@ -103,6 +104,27 @@
     <span id="d-save-status" class="muted" role="status" aria-live="polite"></span>
   </div>
   <div id="d-result" aria-live="polite"></div>
+</section>
+
+<!-- CATEGORÍAS -->
+<section id="panel-categorias" role="tabpanel" aria-labelledby="tab-categorias" hidden>
+  <p class="adm-intro">Vincula cada categoría de <strong>España (maestra)</strong> con su colección homóloga en cada tienda y compara los <strong>productos activos</strong> con España. Vincular <strong>no cambia nada en Shopify</strong>: solo guarda la equivalencia para reutilizarla. Portugal y Países Bajos son idiomas de la tienda ES y heredan la colección de España.</p>
+  <div id="c-list-view">
+    <div class="adm-bar">
+      <div class="adm-search"><input id="c-q" type="search" placeholder="Buscar categoría de España" aria-label="Buscar categoría de España"><label class="adm-check"><input type="checkbox" id="c-pending"> Solo con vínculos pendientes</label></div>
+    </div>
+    <p id="c-status" class="muted" role="status" aria-live="polite"></p>
+    <div id="c-list"></div>
+    <div class="actions"><button type="button" class="button secondary" id="c-more" hidden>Cargar más</button></div>
+  </div>
+  <div id="c-detail-view" hidden>
+    <div class="adm-bar"><button type="button" class="button secondary" id="c-back">← Categorías</button><h2 id="c-title" tabindex="-1"></h2></div>
+    <p id="c-dstatus" class="muted" role="status" aria-live="polite"></p>
+    <div id="c-detail"></div>
+    <div id="c-picker" class="step" hidden></div>
+    <div id="c-skus" hidden></div>
+    <div id="c-edit" class="step" hidden></div>
+  </div>
 </section>
 
 <!-- VALORES DE UN METACAMPO -->

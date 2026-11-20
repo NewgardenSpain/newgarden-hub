@@ -25,7 +25,7 @@ const OWNER_ES = { PRODUCT: 'Producto', PRODUCTVARIANT: 'Variante' };
 const state = { stores: [], store: null, kind: 'products', cursor: null, rows: [], seq: 0, defs: null, defsPromise: null, editing: null };
 
 /* ---------- pestañas principales ---------- */
-const TABS = ['tienda', 'varias', 'duplicados', 'valores', 'metacampos', 'historial'];
+const TABS = ['tienda', 'varias', 'duplicados', 'categorias', 'valores', 'metacampos', 'historial'];
 const shown = {};
 function showTab(name, push = true) {
   if (!TABS.includes(name)) name = 'tienda';
@@ -34,7 +34,7 @@ function showTab(name, push = true) {
     b.setAttribute('aria-selected', on); b.tabIndex = on ? 0 : -1; $('#panel-' + t).hidden = !on;
   });
   if (push) history.replaceState(null, '', '#' + name);
-  if (!shown[name]) { shown[name] = true; ({ tienda: loadList, varias: initMulti, duplicados: initDup, valores: initValues, metacampos: renderMatrix, historial: loadHistory })[name](true); }
+  if (!shown[name]) { shown[name] = true; ({ tienda: loadList, varias: initMulti, duplicados: initDup, categorias: initCat, valores: initValues, metacampos: renderMatrix, historial: loadHistory })[name](true); }
 }
 $$('.adm-tabs [role=tab]').forEach(b => {
   b.onclick = () => showTab(b.dataset.tab);
@@ -768,6 +768,170 @@ function renderResults(d, applied, box) {
 const D = { rows: [], inited: false };
 const dSkus = () => [...new Set($('#d-skus').value.split(/[\n,;]+/).map(x => x.trim()).filter(Boolean))];
 const dDirty = r => r.sku !== r.sku0 || r.vt !== r.vt0 || r.pt !== r.pt0;
+
+/* ---------- categorías: vínculos entre colecciones homólogas y control de activos ---------- */
+const C = { cursor: null, rows: [], master: null, seq: 0 };
+const CAT_STATE = { MASTER: ['Referencia', ''], LINKED: ['Vinculada', 'ok'], PENDING: ['Pendiente', 'warn'], NONE: ['Sin homóloga', 'muted'], BROKEN: ['Vínculo roto', 'err'], ERROR: ['Error', 'err'] };
+function initCat() {
+  let t; $('#c-q').addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => catLoad(false), 300); });
+  $('#c-pending').onchange = catRender;
+  $('#c-more').onclick = () => catLoad(true);
+  $('#c-back').onclick = () => { $('#c-detail-view').hidden = true; $('#c-list-view').hidden = false; catLoad(false); };
+  $('#c-list').addEventListener('click', e => { const b = e.target.closest('[data-cmaster]'); if (b) catOpen(b.dataset.cmaster); });
+  $('#c-detail').addEventListener('click', catAction);
+  catLoad(false);
+}
+async function catLoad(more) {
+  const st = $('#c-status'), n = ++C.seq; st.textContent = 'Cargando…';
+  try {
+    const d = await api(`/api/admin/categories/masters?q=${enc($('#c-q').value)}${more && C.cursor ? '&after=' + enc(C.cursor) : ''}`);
+    if (n !== C.seq) return;
+    C.rows = more ? C.rows.concat(d.collections) : d.collections; C.cursor = d.has_next ? d.cursor : null;
+    $('#c-more').hidden = !C.cursor; catRender();
+  } catch (e) { st.textContent = e.message; }
+}
+function catRender() {
+  const only = $('#c-pending').checked, rows = C.rows.filter(r => !only || r.pending > 0);
+  $('#c-status').textContent = `${rows.length} ${rows.length === 1 ? 'categoría' : 'categorías'} de España${C.cursor ? ' (hay más por cargar)' : ''}.`;
+  $('#c-list').innerHTML = rows.length ? table(['Categoría (ES)', 'Vinculadas', 'Sin homóloga', 'Pendientes', ''], rows.map(r =>
+    `<tr><td>${esc(r.title)}<div class="muted">${esc(r.handle)}</div></td><td>${r.confirmed}/${r.stores}</td><td>${r.none}</td><td>${r.pending ? tag(r.pending, 'warn') : tag('0', 'ok')}</td><td><button type="button" class="button secondary" data-cmaster="${esc(r.id)}">Abrir</button></td></tr>`).join('')) : '<p class="muted">Sin resultados.</p>';
+}
+async function catOpen(gid) {
+  C.master = gid; $('#c-list-view').hidden = true; $('#c-detail-view').hidden = false; $('#c-picker').hidden = true;
+  $('#c-title').textContent = 'Cargando…'; $('#c-detail').innerHTML = '';
+  await catReload(); $('#c-title').focus();
+}
+async function catReload() {
+  const st = $('#c-dstatus'); st.textContent = 'Consultando las tiendas…';
+  try {
+    const d = await api('/api/admin/categories/group?master=' + enc(C.master));
+    C.group = d; $('#c-title').textContent = d.master.title; st.textContent = 'Los recuentos son productos activos (no borradores ni archivados).'; catDetail();
+  } catch (e) { st.textContent = e.message; }
+}
+function catDetail() {
+  const g = C.group, linked = g.stores.some(s => s.status === 'LINKED');
+  $('#c-skus').hidden = true; catEditRender();
+  $('#c-detail').innerHTML = (linked ? `<p><a class="button secondary" href="/api/admin/categories/skus.csv?master=${enc(C.master)}">Exportar incidencias de SKU de todas las tiendas (CSV)</a></p>` : '') + table(['Mercado', 'Colección homóloga', 'Estado', 'Activos', 'Dif. vs ES', ''], g.stores.map(s => {
+    const [label, cls] = CAT_STATE[s.status] || [s.status, ''], col = s.collection;
+    const diff = s.diff == null ? '—' : s.diff === 0 ? '0' : (s.diff > 0 ? '+' : '−') + Math.abs(s.diff);
+    const name = col ? `${esc(col.title || '(no encontrada)')}<div class="muted">${esc(col.handle || '')}</div>` : (s.error ? `<span class="muted">${esc(s.error)}</span>` : '<span class="muted">—</span>');
+    const acts = s.status === 'MASTER' ? '' : (s.status === 'LINKED' ? `<button type="button" class="button primary" data-cact="skus" data-store="${esc(s.store)}">Comparar SKU</button> ` : '') + `<button type="button" class="button secondary" data-cact="pick" data-store="${esc(s.store)}">${s.status === 'LINKED' || s.status === 'BROKEN' ? 'Cambiar' : 'Vincular'}</button>`
+      + (s.status === 'LINKED' || s.status === 'BROKEN' || s.status === 'NONE' ? ` <button type="button" class="button secondary" data-cact="unlink" data-store="${esc(s.store)}">Desvincular</button>` : '')
+      + (s.status === 'PENDING' ? ` <button type="button" class="button secondary" data-cact="none" data-store="${esc(s.store)}">Sin homóloga</button>` : '');
+    const tot = s.total != null && s.total !== s.active ? ` <span class="muted" title="Total en la colección, incluidos borradores y archivados">/ ${s.total}</span>` : '';
+    return `<tr><td>${esc(s.store)}</td><td>${name}</td><td>${tag(label, cls === 'bad' ? 'err' : cls)}</td><td>${s.active ?? '—'}${tot}</td><td>${diff}</td><td>${acts}</td></tr>`;
+  }).join(''));
+}
+
+const CAT_FIELDS = [['image', 'Imagen de portada'], ['icon', 'Icono de categoría'], ['parent', 'Miga de pan / colección padre'], ['related', 'Categorías relacionadas'], ['inspiration', '«Necesitas más inspiración»'], ['rules', 'Condiciones (se añaden reglas de etiqueta y tipo)']];
+const EDIT_STATE = { CHANGE: ['Se cambiará', 'warn'], SAME: ['Ya está igual', 'ok'], BLOCKED: ['Bloqueado', 'err'] };
+const RES_STATE = { OK: ['Actualizado', 'ok'], FAILED: ['Con incidencia', 'err'], SKIPPED: ['No actualizado', 'muted'] };
+const showVal = v => v == null ? '<span class="muted">—</span>' : Array.isArray(v) ? (v.length ? '<ul class="plain">' + v.map(x => `<li>${esc(x)}</li>`).join('') + '</ul>' : '<span class="muted">(vacío)</span>') : esc(v);
+function catEditRender() {
+  const box = $('#c-edit'), linked = C.group.stores.filter(s => s.status === 'LINKED');
+  box.hidden = !linked.length; if (!linked.length) { C.editKey = null; return; }
+  const key = C.master + '|' + linked.map(s => s.store).join(','); if (C.editKey === key) return;  // no borrar la vista previa ni el resultado al refrescar recuentos
+  C.editKey = key;
+  box.innerHTML = `<h3>Editar campos en las homólogas</h3><p class="muted">Se copia el valor de la categoría de España a las tiendas elegidas. No se tocan títulos, URL, textos ni SEO. Primero verás una vista previa y después tendrás que confirmar.</p>`
+    + `<fieldset class="field"><legend>Campos a modificar</legend><div class="chips" id="ce-fields">${CAT_FIELDS.map(([k, l]) => `<label class="chip"><input type="checkbox" value="${k}"><span>${esc(l)}</span></label>`).join('')}</div></fieldset>`
+    + `<fieldset class="field"><legend>Países</legend><div class="chips" id="ce-stores">${linked.map(s => `<label class="chip"><input type="checkbox" value="${esc(s.store)}" checked><span>${esc(s.store)}</span></label>`).join('')}</div><p class="muted">Solo aparecen los países con homóloga vinculada.</p></fieldset>`
+    + `<label class="adm-check"><input type="checkbox" id="ce-partial"> En listas, aplicar solo las colecciones que tengan homóloga vinculada</label>`
+    + `<div class="actions"><button type="button" class="button primary" id="ce-preview">Vista previa</button></div><p id="ce-status" class="muted" role="status" aria-live="polite"></p><div id="ce-plan"></div><div id="ce-result" aria-live="polite"></div>`;
+  C.plan = null;
+  box.onchange = () => { C.plan = null; $('#ce-plan').innerHTML = ''; $('#ce-result').innerHTML = ''; $('#ce-status').textContent = ''; };
+  $('#ce-preview').onclick = catEditPreview;
+}
+const catEditBody = () => ({ master: C.master, stores: $$('#ce-stores input:checked').map(i => i.value), fields: $$('#ce-fields input:checked').map(i => i.value), partial_lists: $('#ce-partial').checked });
+async function catEditPreview() {
+  const body = catEditBody(), st = $('#ce-status'), b = $('#ce-preview');
+  if (!body.fields.length) { st.textContent = 'Marca al menos un campo.'; return; }
+  if (!body.stores.length) { st.textContent = 'Elige al menos un país.'; return; }
+  b.disabled = true; st.textContent = 'Preparando la vista previa (no se escribe nada)…'; $('#ce-result').innerHTML = '';
+  try {
+    const d = await post('/api/admin/categories/edit/preview', body); C.plan = { body, hash: d.plan_hash, stores: d.stores };
+    const changes = d.stores.reduce((n, s) => n + s.fields.filter(f => f.state === 'CHANGE').length, 0);
+    $('#ce-plan').innerHTML = d.stores.map(s => `<div class="card"><h4>${esc(s.store)}${s.collection ? ' · ' + esc(s.collection.title) : ''}</h4>`
+      + (s.status !== 'READY' ? `<p class="muted">${tag('No aplicable', 'err')} ${esc(s.reason || s.status)}</p>` : table(['Campo', 'Estado', 'Antes', 'Después'], s.fields.map(f => {
+        const [label, cls] = EDIT_STATE[f.state];
+        return `<tr><td>${esc(f.label)}</td><td>${tag(label, cls)}${f.reason ? `<div class="muted">${esc(f.reason)}</div>` : ''}${f.warnings.map(w => `<div class="muted">⚠ ${esc(w)}</div>`).join('')}</td><td>${showVal(f.before)}</td><td>${f.state === 'SAME' ? '<span class="muted">sin cambios</span>' : showVal(f.after)}</td></tr>`;
+      }).join(''))) + '</div>').join('')
+      + (changes ? `<div class="actionbar"><button type="button" class="button primary" id="ce-apply">Confirmar y aplicar ${changes} ${changes === 1 ? 'cambio' : 'cambios'} en Shopify</button><span class="muted">Escribe directamente en las tiendas.</span></div>` : '');
+    st.textContent = changes ? 'Revisa los cambios. Nada se ha escrito todavía.' : 'No hay nada que aplicar.';
+    const a = $('#ce-apply'); if (a) a.onclick = catEditApply;
+  } catch (e) { st.textContent = e.message; } finally { b.disabled = false; }
+}
+async function catEditApply() {
+  const a = $('#ce-apply'), st = $('#ce-status'); if (!C.plan) return;
+  a.disabled = true; st.textContent = 'Aplicando…';
+  try {
+    const d = await post('/api/admin/categories/edit/apply', { ...C.plan.body, confirm: true, plan_hash: C.plan.hash });
+    $('#ce-plan').innerHTML = ''; C.plan = null; st.textContent = `Operación n.º ${d.operation_id ?? '—'} registrada en el Historial.`;
+    $('#ce-result').innerHTML = d.stores.map(s => `<div class="card"><h4>${esc(s.store)}</h4>` + (s.results.length ? table(['Campo', 'Resultado', 'Detalle'], s.results.map(r => {
+      const [label, cls] = RES_STATE[r.status]; return `<tr><td>${esc(r.label)}</td><td>${tag(label, cls)}</td><td>${esc(r.error || r.reason || '')}</td></tr>`;
+    }).join('')) : `<p class="muted">${tag(s.skipped ? 'No actualizado' : 'Con incidencia', s.skipped ? 'muted' : 'err')} ${esc(s.skipped || s.error || '')}</p>`) + '</div>').join('');
+    catReload();
+  } catch (e) { st.textContent = e.message; a.disabled = false; }
+}
+async function catSave(store, body, okMsg) {
+  const st = $('#c-dstatus');
+  try { await post('/api/admin/categories/link', { master: C.master, store, ...body }); $('#c-picker').hidden = true; await catReload(); $('#c-dstatus').textContent = okMsg; }
+  catch (e) { st.textContent = e.message; }
+}
+function catAction(e) {
+  const b = e.target.closest('[data-cact]'); if (!b) return;
+  const store = b.dataset.store;
+  if (b.dataset.cact === 'unlink') catSave(store, {}, `Vínculo de ${store} eliminado.`);
+  else if (b.dataset.cact === 'skus') catSkus(store);
+  else if (b.dataset.cact === 'none') catSave(store, { none: true }, `${store} marcada sin homóloga.`);
+  else catPick(store);
+}
+
+const SKU_RES = { MATCH: ['Coincide', 'ok'], MISSING: ['Falta en destino', 'warn'], EXTRA: ['Solo en destino', 'warn'] };
+async function catSkus(store) {
+  const box = $('#c-skus'); box.hidden = false; $('#c-picker').hidden = true;
+  box.innerHTML = `<p class="muted" role="status">Comparando SKU de ${esc(store)} con ES…</p>`;
+  try {
+    const d = await api(`/api/admin/categories/skus?master=${enc(C.master)}&store=${enc(store)}`), m = d.summary;
+    const real = d.rows.filter(r => r.result !== 'MATCH' && r.code !== 'NOT_IN_STORE').length;
+    box.innerHTML = `<h3>SKU de productos activos: ES frente a ${esc(store)}</h3>`
+      + `<p>${tag('ES ' + m.master)} ${tag(store + ' ' + m.target)} ${tag(m.match + ' coinciden', 'ok')} ${tag(m.missing + ' faltan en ' + store, m.missing ? 'warn' : 'ok')} ${tag(m.extra + ' solo en ' + store, m.extra ? 'warn' : 'ok')}</p>`
+      + (d.truncated ? '<div class="callout">La colección es muy grande: se compararon solo los primeros SKU.</div>' : '')
+      + (d.unchecked ? `<div class="callout">${d.unchecked} SKU no se pudieron clasificar (límite de comprobación).</div>` : '')
+      + (m.missing || m.extra ? `<p class="muted">${real} diferencias probablemente reales; el resto son SKU que ni existen en la tienda, que pueden ser una ausencia comercial intencionada.</p>` : '')
+      + `<div class="adm-bar"><div class="field"><label for="c-sf">Mostrar</label><select id="c-sf"><option value="issues">Solo incidencias</option><option value="">Todos</option><option value="MISSING">Faltan en destino</option><option value="EXTRA">Solo en destino</option><option value="MATCH">Coinciden</option></select></div>`
+      + `<a class="button secondary" href="/api/admin/categories/skus.csv?master=${enc(C.master)}&store=${enc(store)}">Exportar incidencias (CSV)</a></div><div id="c-sku-table"></div>`;
+    const draw = () => {
+      const f = $('#c-sf').value, rows = d.rows.filter(r => f === 'issues' ? r.result !== 'MATCH' : !f || r.result === f);
+      $('#c-sku-table').innerHTML = rows.length ? table(['SKU', 'ES', esc(store), 'Resultado', 'Detalle'], rows.map(r => {
+        const [label, cls] = SKU_RES[r.result];
+        return `<tr><td>${esc(r.sku)}</td><td>${r.result === 'EXTRA' ? 'No' : 'Sí'}</td><td>${r.result === 'MISSING' ? 'No' : 'Sí'}</td><td>${tag(label, cls)}</td><td>${esc(r.detail)}</td></tr>`;
+      }).join('')) : '<p class="muted">Sin filas para este filtro.</p>';
+    };
+    $('#c-sf').onchange = draw; draw();
+  } catch (e) { box.innerHTML = `<p class="muted" role="alert">${esc(e.message)}</p>`; }
+}
+async function catPick(store) {
+  const box = $('#c-picker'); box.hidden = false;
+  box.innerHTML = `<h3>Homóloga en ${esc(store)}</h3><div class="field"><label for="c-pq">Buscar colección de ${esc(store)}</label><input id="c-pq" type="search" autocomplete="off"></div><p class="muted" id="c-pst" role="status" aria-live="polite"></p><div id="c-pres"></div>`;
+  const pres = $('#c-pres'), pst = $('#c-pst'); let seq = 0;
+  const show = (items, note) => { pres.innerHTML = items.length ? table(['Colección', note, ''], items.map(i => `<tr><td>${esc(i.title)}<div class="muted">${esc(i.handle)}</div></td><td>${esc(i.note || '')}</td><td>${i.taken ? tag('Ya vinculada a otra', 'warn') : `<button type="button" class="button primary" data-cset="${esc(i.id)}">Vincular</button>`}</td></tr>`).join('')) : '<p class="muted">Sin resultados.</p>'; };
+  pres.onclick = ev => { const x = ev.target.closest('[data-cset]'); if (x) catSave(store, { collection: x.dataset.cset }, `Vinculada en ${store}.`); };
+  try {
+    pst.textContent = 'Buscando sugerencias por SKU…';
+    const d = await api(`/api/admin/categories/suggest?master=${enc(C.master)}&store=${enc(store)}`);
+    pst.textContent = d.sampled ? `Sugerencias según ${d.sampled} SKU de la categoría de España (${d.matched} encontrados en ${store}). Solo orientan: confirma tú la equivalencia.` : 'La categoría de España no tiene SKU para sugerir.';
+    show(d.candidates.map(c => ({ ...c, note: `${c.hits} coincidencias · ${c.total ?? '?'} productos` })), 'Coincidencia');
+  } catch (err) { pst.textContent = 'No se pudieron calcular sugerencias: ' + err.message; }
+  let t; $('#c-pq').addEventListener('input', () => {
+    clearTimeout(t); t = setTimeout(async () => {
+      const n = ++seq, q = $('#c-pq').value.trim(); if (!q) return;
+      try { const d = await api(`/api/admin/collections?store=${enc(store)}&q=${enc(q)}`); if (n === seq) { pst.textContent = ''; show(d.collections.map(c => ({ ...c, note: `${c.products ?? '?'} productos` })), 'Productos'); } }
+      catch (err) { pst.textContent = err.message; }
+    }, 300);
+  });
+  $('#c-pq').focus();
+}
+
 function initDup() {
   if (D.inited) return; D.inited = true;
   $('#d-stores').innerHTML = state.stores.map(s => `<label class="chip"><input type="checkbox" value="${esc(s.code)}" checked><span>${esc(s.code)}</span></label>`).join('');

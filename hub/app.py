@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field, field_validator
+import psycopg.errors
 from psycopg.types.json import Jsonb
 from .db import pool, initialize
 from .skufile import extract_skus
@@ -3438,6 +3439,469 @@ def admin_values_apply(x:AdminValuesApply):
             for res in ex.map(apply_batch,batches):
                 for vid,status,error in res: results.append((vid,status,error,current.get(vid)))
     return _values_finish(st,x,label,value,results)
+
+# --- Categorías: vínculo permanente entre colecciones homólogas y control de catálogo (fase 1, solo lectura en Shopify) ---
+CATEGORY_MASTER='ES'
+CATEGORY_GID_RE=re.compile(r'^gid://shopify/Collection/(\d{1,20})$')
+CATEGORY_SUGGEST_SKUS=25
+
+def category_gid(value,label='colección'):
+    m=CATEGORY_GID_RE.match((value or '').strip())
+    if not m: raise HTTPException(400,f'Identificador de {label} no válido')
+    return m.group(0),m.group(1)
+
+# Tiendas que de momento no entran en la gestión de categorías (no figuran en el briefing).
+CATEGORY_EXCLUDED_STORES={'B2B','EU','WEB'}
+
+def category_other_stores():
+    return [s for s in shopify_stores() if s['domain'] and s['token'] and s['code']!=CATEGORY_MASTER and s['code'] not in CATEGORY_EXCLUDED_STORES]
+
+def category_target_store(code):
+    code=(code or '').strip().upper()
+    if code==CATEGORY_MASTER: raise HTTPException(400,'La tienda maestra no tiene homóloga')
+    if code in CATEGORY_EXCLUDED_STORES: raise HTTPException(400,f'La tienda {code} no está incluida en la gestión de categorías')
+    return admin_store(code)
+
+def category_counts_query(numeric_ids):
+    """Un solo viaje por tienda: total y activos de varias colecciones (productos activos, no borradores ni archivados)."""
+    parts=[]
+    for n in numeric_ids:
+        parts.append(f'a{n}:productsCount(query:"collection_id:{n} AND status:active",limit:10000){{count precision}} t{n}:productsCount(query:"collection_id:{n}",limit:10000){{count}}')
+    return 'query{'+' '.join(parts)+'}'
+
+def category_counts(st,numeric_ids):
+    if not numeric_ids: return {}
+    data=admin_gql(st,category_counts_query(numeric_ids))
+    return {n:{'active':(data.get(f'a{n}') or {}).get('count'),'total':(data.get(f't{n}') or {}).get('count')} for n in numeric_ids}
+
+@app.get('/api/admin/categories/masters')
+def category_masters(q:str='',after:str|None=None):
+    """Colecciones de la tienda maestra con el estado de sus vínculos (confirmados / sin homóloga / pendientes)."""
+    base=admin_collections(CATEGORY_MASTER,q,after)
+    total=len(category_other_stores())
+    gids=[c['id'] for c in base['collections']]
+    stats={}
+    if gids:
+        with pool.connection() as c:
+            for gid,confirmed,none in c.execute("SELECT master_gid,count(*) FILTER (WHERE status='CONFIRMED'),count(*) FILTER (WHERE status='NONE') FROM category_links WHERE master_gid=ANY(%s) GROUP BY master_gid",(gids,)).fetchall():
+                stats[gid]=(confirmed,none)
+    for col in base['collections']:
+        confirmed,none=stats.get(col['id'],(0,0))
+        col.update({'confirmed':confirmed,'none':none,'pending':max(0,total-confirmed-none),'stores':total})
+    return base
+
+@app.get('/api/admin/categories/group')
+def category_group(master:str):
+    """Una categoría maestra con su homóloga por tienda, estado del vínculo y productos activos frente a la maestra."""
+    master_gid,master_id=category_gid(master,'colección maestra')
+    ms=admin_store(CATEGORY_MASTER)
+    node=admin_gql(ms,'query($id:ID!){collection(id:$id){id title handle}}',{'id':master_gid}).get('collection')
+    if not node: raise HTTPException(404,'La colección maestra no existe en '+CATEGORY_MASTER)
+    with pool.connection() as c:
+        links={r[0]:{'collection':r[1],'status':r[2],'by':r[3],'at':r[4].isoformat()} for r in c.execute("SELECT store_code,collection_gid,status,linked_by,linked_at FROM category_links WHERE master_gid=%s",(master_gid,)).fetchall()}
+    def row(st):
+        if st['code']==CATEGORY_MASTER:
+            counts=category_counts(st,[master_id])[master_id]
+            return {'status':'MASTER','collection':node,**counts}
+        link=links.get(st['code'])
+        if not link: return {'status':'PENDING'}
+        if link['status']=='NONE': return {'status':'NONE','by':link['by'],'at':link['at']}
+        gid,numeric=category_gid(link['collection'])
+        found=admin_gql(st,'query($id:ID!){collection(id:$id){id title handle}}',{'id':gid}).get('collection')
+        if not found: return {'status':'BROKEN','collection':{'id':gid,'title':'','handle':''},'by':link['by'],'at':link['at']}
+        return {'status':'LINKED','collection':found,**category_counts(st,[numeric])[numeric],'by':link['by'],'at':link['at']}
+    stores=[ms]+category_other_stores()
+    results=run_per_store(stores,row)
+    rows=[]; base=None
+    for r in results:
+        item={'store':r['store'],**(r['data'] if r['ok'] else {'status':'ERROR','error':r['error']})}
+        if item['store']==CATEGORY_MASTER: base=item.get('active')
+        rows.append(item)
+    for item in rows:
+        if item.get('active') is not None and base is not None and item['status']!='MASTER': item['diff']=item['active']-base
+    return {'master':node,'stores':rows}
+
+@app.get('/api/admin/categories/suggest')
+def category_suggest(master:str,store:str):
+    """Candidatas a homóloga: colecciones de la tienda destino que contienen los mismos SKU que la maestra. Solo orienta; nunca vincula."""
+    master_gid,_=category_gid(master,'colección maestra')
+    ms=admin_store(CATEGORY_MASTER); st=category_target_store(store); store=st['code']
+    data=admin_gql(ms,'query($id:ID!){collection(id:$id){products(first:%d){nodes{variants(first:1){nodes{sku}}}}}}'%CATEGORY_SUGGEST_SKUS,{'id':master_gid}).get('collection')
+    if data is None: raise HTTPException(404,'La colección maestra no existe en '+CATEGORY_MASTER)
+    skus=[v['sku'] for p in data['products']['nodes'] for v in p['variants']['nodes'] if (v.get('sku') or '').strip()]
+    if not skus: return {'sampled':0,'matched':0,'candidates':[]}
+    term=' OR '.join('sku:"%s"'%s.replace('\\','\\\\').replace('"','\\"') for s in skus)
+    nodes=(admin_gql(st,'query($q:String){products(first:50,query:$q){nodes{collections(first:30){nodes{id title handle productsCount{count}}}}}}',{'q':term}).get('products') or {}).get('nodes',[])
+    tally={}
+    for p in nodes:
+        for col in p['collections']['nodes']:
+            t=tally.setdefault(col['id'],{'id':col['id'],'title':col['title'],'handle':col['handle'],'total':(col.get('productsCount') or {}).get('count'),'hits':0}); t['hits']+=1
+    with pool.connection() as c:
+        taken={r[0]:r[1] for r in c.execute("SELECT collection_gid,master_gid FROM category_links WHERE store_code=%s AND collection_gid IS NOT NULL",(store,)).fetchall()}
+    matched=len(nodes)
+    # Cobertura x precisión: una colección comodín ("Todos", "Bestseller") cubre todo pero tiene demasiados productos, y sale peor.
+    for t in tally.values(): t['score']=round((t['hits']/matched)*(t['hits']/t['total']),3) if matched and t['total'] else 0
+    cands=sorted(tally.values(),key=lambda t:(-t['score'],-t['hits']))[:6]
+    for t in cands: t['taken']=taken.get(t['id'])!=None and taken.get(t['id'])!=master_gid
+    return {'sampled':len(skus),'matched':matched,'candidates':cands}
+
+# --- Categorías, fase 2: comparador de SKU frente a la maestra (solo lectura) ---
+CATEGORY_SKU_PRODUCTS='query($q:String!,$after:String){products(first:50,query:$q,after:$after){nodes{id variants(first:100){nodes{sku} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}'
+CATEGORY_SKU_MAX_PAGES=40
+CATEGORY_SKU_RESOLVE_MAX=200
+CATEGORY_DETAIL={'NOT_IN_STORE':'No existe en la tienda (posible ausencia comercial)','OUTSIDE_COLLECTION':'Existe y está activo, pero fuera de la colección','NOT_ACTIVE':'Existe en la tienda, pero no está activo','ELSEWHERE_IN_ES':'Existe en ES, pero fuera de esta categoría','NOT_IN_ES':'No existe en ES','UNCHECKED':'Sin comprobar (demasiados SKU)'}
+
+def category_active_skus(st,numeric_id):
+    """({sku_en_minúsculas: sku}, truncado) de todas las variantes de los productos ACTIVOS de una colección."""
+    out={}; after=None; truncated=False
+    for page_no in range(CATEGORY_SKU_MAX_PAGES):
+        data=admin_gql(st,CATEGORY_SKU_PRODUCTS,{'q':f'collection_id:{numeric_id} AND status:active','after':after}).get('products') or {}
+        for p in data.get('nodes',[]):
+            variants=p.get('variants') or {}
+            for v in variants.get('nodes',[]):
+                if (v.get('sku') or '').strip(): out.setdefault(v['sku'].strip().lower(),v['sku'].strip())
+            info=variants.get('pageInfo') or {}
+            while info.get('hasNextPage') and info.get('endCursor'):  # producto con más de 100 variantes
+                more=((admin_gql(st,'query($id:ID!,$after:String){product(id:$id){variants(first:100,after:$after){nodes{sku} pageInfo{hasNextPage endCursor}}}}',{'id':p['id'],'after':info['endCursor']}).get('product') or {}).get('variants')) or {}
+                for v in more.get('nodes',[]):
+                    if (v.get('sku') or '').strip(): out.setdefault(v['sku'].strip().lower(),v['sku'].strip())
+                info=more.get('pageInfo') or {}
+        page=data.get('pageInfo') or {}
+        if not page.get('hasNextPage') or not page.get('endCursor'): break
+        after=page['endCursor']
+        if page_no==CATEGORY_SKU_MAX_PAGES-1: truncated=True
+    return out,truncated
+
+def category_sku_status(st,skus):
+    """{sku_en_minúsculas: estado del producto} para los SKU que existen en la tienda (el mejor estado si se repite)."""
+    rank={'ACTIVE':0,'DRAFT':1,'ARCHIVED':2}; found={}
+    query='query($q:String!,$after:String){productVariants(first:100,query:$q,after:$after){nodes{sku product{status}} pageInfo{hasNextPage endCursor}}}'
+    for i in range(0,len(skus),10):
+        q=' OR '.join('sku:"%s"'%x.replace('\\','\\\\').replace('"','\\"') for x in skus[i:i+10]); after=None
+        while True:
+            data=admin_gql(st,query,{'q':q,'after':after}).get('productVariants') or {}
+            for n in data.get('nodes',[]):
+                key=(n.get('sku') or '').strip().lower(); status=(n.get('product') or {}).get('status') or 'DRAFT'
+                if key and (key not in found or rank.get(status,9)<rank.get(found[key],9)): found[key]=status
+            info=data.get('pageInfo') or {}
+            if not info.get('hasNextPage') or not info.get('endCursor'): break
+            after=info['endCursor']
+    return found
+
+def category_sku_diff(master_gid,store_code):
+    """Compara los SKU de los productos activos de la categoría maestra con los de su homóloga vinculada."""
+    master_gid,master_id=category_gid(master_gid,'colección maestra')
+    st=category_target_store(store_code)
+    with pool.connection() as c:
+        link=c.execute("SELECT collection_gid,status FROM category_links WHERE master_gid=%s AND store_code=%s",(master_gid,st['code'])).fetchone()
+    if not link: raise HTTPException(400,f'La categoría no está vinculada en {st["code"]}')
+    if link[1]=='NONE': raise HTTPException(400,f'{st["code"]} está marcada sin homóloga')
+    _,target_id=category_gid(link[0])
+    ms=admin_store(CATEGORY_MASTER)
+    (m,m_trunc),(t,t_trunc)=category_active_skus(ms,master_id),category_active_skus(st,target_id)
+    missing=sorted(set(m)-set(t)); extra=sorted(set(t)-set(m)); match=sorted(set(m)&set(t))
+    rows=[]; unchecked=0
+    in_store=category_sku_status(st,[m[k] for k in missing[:CATEGORY_SKU_RESOLVE_MAX]])
+    for i,k in enumerate(missing):
+        if i>=CATEGORY_SKU_RESOLVE_MAX: code='UNCHECKED'; unchecked+=1
+        elif k not in in_store: code='NOT_IN_STORE'
+        else: code='OUTSIDE_COLLECTION' if in_store[k]=='ACTIVE' else 'NOT_ACTIVE'
+        rows.append({'sku':m[k],'result':'MISSING','code':code,'detail':CATEGORY_DETAIL[code]})
+    in_es=category_sku_status(ms,[t[k] for k in extra[:CATEGORY_SKU_RESOLVE_MAX]])
+    for i,k in enumerate(extra):
+        if i>=CATEGORY_SKU_RESOLVE_MAX: code='UNCHECKED'; unchecked+=1
+        else: code='ELSEWHERE_IN_ES' if k in in_es else 'NOT_IN_ES'
+        rows.append({'sku':t[k],'result':'EXTRA','code':code,'detail':CATEGORY_DETAIL[code]})
+    rows+=[{'sku':m[k],'result':'MATCH','code':'','detail':''} for k in match]
+    return {'store':st['code'],'summary':{'master':len(m),'target':len(t),'match':len(match),'missing':len(missing),'extra':len(extra)},'rows':rows,'truncated':m_trunc or t_trunc,'unchecked':unchecked}
+
+@app.get('/api/admin/categories/skus')
+def category_skus(master:str,store:str):
+    return category_sku_diff(master,store)
+
+CATEGORY_CSV_RESULT={'MISSING':'Falta en destino','EXTRA':'Solo en destino'}
+
+def category_csv_cell(value):
+    value=str(value or '')
+    return "'"+value if value[:1] in ('=','+','-','@','\t','\r') else value  # evita que Excel interprete un SKU como fórmula
+
+@app.get('/api/admin/categories/skus.csv')
+def category_skus_csv(master:str,store:str=''):
+    """Incidencias (faltan y sobran) de una tienda o de todas las vinculadas, en CSV para Excel (UTF-8 con BOM, separador ;)."""
+    import csv, io
+    master_gid,_=category_gid(master,'colección maestra')
+    title=(admin_gql(admin_store(CATEGORY_MASTER),'query($id:ID!){collection(id:$id){title}}',{'id':master_gid}).get('collection') or {}).get('title','')
+    if store.strip(): codes=[store]
+    else:
+        with pool.connection() as c:
+            codes=[r[0] for r in c.execute("SELECT store_code FROM category_links WHERE master_gid=%s AND status='CONFIRMED' ORDER BY store_code",(master_gid,)).fetchall() if r[0] not in CATEGORY_EXCLUDED_STORES]
+        if not codes: raise HTTPException(400,'La categoría no tiene ninguna homóloga vinculada')
+    results=run_per_store([{'code':code.strip().upper()} for code in codes],lambda s:category_sku_diff(master_gid,s['code']))
+    if store.strip() and not results[0]['ok']: raise HTTPException(400,results[0]['error'])
+    out=io.StringIO(); w=csv.writer(out,delimiter=';',lineterminator='\r\n'); w.writerow(['Categoría ES','Tienda','SKU','Resultado','Detalle'])
+    for r in results:
+        if not r['ok']: w.writerow([category_csv_cell(title),r['store'],'','Error',category_csv_cell(r['error'])]); continue
+        for row in r['data']['rows']:
+            if row['result']!='MATCH': w.writerow([category_csv_cell(title),r['store'],category_csv_cell(row['sku']),CATEGORY_CSV_RESULT[row['result']],row['detail']])
+    import unicodedata
+    name=re.sub(r'[^A-Za-z0-9_-]+','_',unicodedata.normalize('NFKD',title).encode('ascii','ignore').decode()).strip('_') or 'categoria'
+    return Response('\ufeff'+out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="incidencias_sku_{name}.csv"'})
+
+# --- Categorías, fase 3: edición de campos en las homólogas (vista previa, confirmación y auditoría) ---
+CATEGORY_EDIT_FIELDS={
+    'image':{'label':'Imagen de portada'},
+    'icon':{'label':'Icono de categoría','key':'icono_navegacion','type':'file_reference'},
+    'parent':{'label':'Miga de pan / colección padre','key':'miga_de_pan_colecci_n_padre','type':'collection_reference'},
+    'related':{'label':'Categorías relacionadas','key':'colecciones_relacionadas','type':'list.collection_reference'},
+    'inspiration':{'label':'«Necesitas más inspiración»','key':'necesitas_m_s_inspiraci_n','type':'list.collection_reference'},
+    'rules':{'label':'Condiciones (se añaden reglas de etiqueta y tipo)'},
+}
+CATEGORY_REF_FIELDS=('parent','related','inspiration')
+CATEGORY_RULE_COLUMNS={'TAG','TYPE'}  # las reglas por título dependen del idioma y no se copian
+CATEGORY_NS='custom'
+CATEGORY_EDIT_READ='''query($id:ID!){collection(id:$id){id title handle image{url altText}
+ ruleSet{appliedDisjunctively rules{column relation condition conditionObject{__typename ... on CollectionRuleMetafieldCondition{metafieldDefinition{id}}}}}
+ icon:metafield(namespace:"custom",key:"icono_navegacion"){value reference{... on MediaImage{id image{url}}}}
+ parent:metafield(namespace:"custom",key:"miga_de_pan_colecci_n_padre"){value}
+ related:metafield(namespace:"custom",key:"colecciones_relacionadas"){value}
+ inspiration:metafield(namespace:"custom",key:"necesitas_m_s_inspiraci_n"){value}}
+ metafieldDefinitions(ownerType:COLLECTION,first:100){nodes{namespace key type{name}}}}'''
+
+class CategoryEdit(BaseModel):
+    master:str
+    stores:list[str]
+    fields:list[str]
+    partial_lists:bool=False   # en listas, aplicar solo las colecciones con homóloga (el resto se omite con aviso)
+    confirm:bool=False
+    plan_hash:str|None=None
+
+def _basename(url):
+    # Shopify añade «_<uuid>» al nombre cuando el archivo ya existía: se ignora para que reaplicar no cuente como cambio.
+    name=(url or '').split('?')[0].rsplit('/',1)[-1].lower()
+    return re.sub(r'_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=\.[a-z0-9]+$)','',name)
+
+def _gid_list(value):
+    try: data=json.loads(value) if value else []
+    except ValueError: return []
+    return [str(x) for x in data] if isinstance(data,list) else []
+
+def category_titles(st,gids):
+    out={}; gids=list(dict.fromkeys(g for g in gids if g))
+    for i in range(0,len(gids),50):
+        for n in admin_gql(st,'query($ids:[ID!]!){nodes(ids:$ids){... on Collection{id title}}}',{'ids':gids[i:i+50]}).get('nodes') or []:
+            if n: out[n['id']]=n['title']
+    return out
+
+def category_rule_key(r):
+    return (r['column'],r['relation'],(r.get('condition') or '').strip().lower())
+
+def category_rule_text(r):
+    return f"{r['column']} {r['relation']} «{r.get('condition') or ''}»"
+
+def category_match_count(st,rules):
+    """Productos que cumplen A LA VEZ todas las reglas positivas (etiqueta o tipo igual a...). Cota superior de lo que quedaría en la colección."""
+    parts=[]
+    for r in rules:
+        if r['relation']!='EQUALS' or r['column'] not in ('TAG','TYPE'): continue
+        safe=(r.get('condition') or '').replace('\\','\\\\').replace('"','\\"')
+        parts.append(('tag' if r['column']=='TAG' else 'product_type')+f':"{safe}"')
+    if not parts: return None
+    return (admin_gql(st,'query($q:String){productsCount(query:$q,limit:10000){count}}',{'q':' AND '.join(parts)}).get('productsCount') or {}).get('count') or 0
+
+def category_edit_plan_store(st,master_gid,src,src_titles,fields,partial):
+    """Qué cambiaría en una tienda (solo lectura). Cada campo queda CHANGE (se aplicará), SAME (ya igual) o BLOCKED (con el motivo)."""
+    with pool.connection() as c:
+        link=c.execute("SELECT collection_gid,status FROM category_links WHERE master_gid=%s AND store_code=%s",(master_gid,st['code'])).fetchone()
+        links={r[0]:(r[1],r[2]) for r in c.execute("SELECT master_gid,collection_gid,status FROM category_links WHERE store_code=%s",(st['code'],)).fetchall()}
+    if not link or link[1]!='CONFIRMED':
+        return {'store':st['code'],'status':'NO_LINK','reason':'Sin homóloga vinculada' if not link else 'Marcada sin homóloga','fields':[]}
+    gid,_=category_gid(link[0])
+    data=admin_gql(st,CATEGORY_EDIT_READ,{'id':gid}); tgt=data.get('collection')
+    if not tgt: return {'store':st['code'],'status':'BROKEN','reason':'La colección vinculada ya no existe en la tienda','fields':[]}
+    defs={(d['namespace'],d['key']):(d.get('type') or {}).get('name') for d in (data.get('metafieldDefinitions') or {}).get('nodes',[])}
+    out=[]
+    def add(field,state,before=None,after=None,warnings=None,reason=None,apply=None):
+        out.append({'field':field,'label':CATEGORY_EDIT_FIELDS[field]['label'],'state':state,'before':before,'after':after,'warnings':warnings or [],'reason':reason,'apply':apply})
+    for field in fields:
+        spec=CATEGORY_EDIT_FIELDS[field]
+        if field=='image':
+            url=(src.get('image') or {}).get('url'); cur=(tgt.get('image') or {}).get('url')
+            if not url: add(field,'BLOCKED',reason='La categoría de España no tiene imagen'); continue
+            if _basename(url)==_basename(cur): add(field,'SAME',_basename(cur),_basename(url)); continue
+            add(field,'CHANGE',_basename(cur) or '(sin imagen)',_basename(url),apply={'src':url,'alt':(tgt.get('image') or {}).get('altText')})
+        elif field=='icon':
+            ref=(src.get('icon') or {}).get('reference') or {}; url=(ref.get('image') or {}).get('url')
+            if not url: add(field,'BLOCKED',reason='La categoría de España no tiene icono (imagen)'); continue
+            if defs.get((CATEGORY_NS,spec['key']))!=spec['type']: add(field,'BLOCKED',reason=f'La tienda no tiene el metacampo {CATEGORY_NS}.{spec["key"]} ({spec["type"]})'); continue
+            cur=((((tgt.get('icon') or {}).get('reference') or {}).get('image')) or {}).get('url')
+            if _basename(url)==_basename(cur): add(field,'SAME',_basename(cur),_basename(url)); continue
+            add(field,'CHANGE',_basename(cur) or '(sin icono)',_basename(url),apply={'src':url})
+        elif field in CATEGORY_REF_FIELDS:
+            raw=(src.get(field) or {}).get('value')
+            is_list=spec['type'].startswith('list.'); wanted=_gid_list(raw) if is_list else ([raw] if raw else [])
+            if not wanted: add(field,'BLOCKED',reason='La categoría de España no tiene valor (no se vacía el destino)'); continue
+            if defs.get((CATEGORY_NS,spec['key']))!=spec['type']: add(field,'BLOCKED',reason=f'La tienda no tiene el metacampo {CATEGORY_NS}.{spec["key"]} ({spec["type"]})'); continue
+            mapped=[]; missing=[]
+            for m in wanted:
+                l=links.get(m)
+                if l and l[1]=='CONFIRMED' and l[0]: mapped.append(l[0])
+                else: missing.append(f"{src_titles.get(m,m)} ({'marcada sin homóloga' if l else 'sin vincular'})")
+            cur_raw=(tgt.get(field) or {}).get('value'); cur=_gid_list(cur_raw) if is_list else ([cur_raw] if cur_raw else [])
+            titles=category_titles(st,mapped+cur)
+            show=lambda ids:[titles.get(g,g) for g in ids]
+            warn=[f'Sin homóloga en {st["code"]}: '+m for m in missing]
+            if missing and not (partial and is_list and mapped):
+                add(field,'BLOCKED',show(cur),show(mapped),warn,'Faltan homólogas vinculadas; vincúlalas o usa «aplicar solo las vinculadas» en listas'); continue
+            if mapped==cur: add(field,'SAME',show(cur),show(mapped),warn); continue
+            add(field,'CHANGE',show(cur),show(mapped),warn,apply={'value':json.dumps(mapped) if is_list else mapped[0],'type':spec['type'],'key':spec['key']})
+        elif field=='rules':
+            if not src.get('ruleSet'): add(field,'BLOCKED',reason='La categoría de España es manual (no tiene condiciones)'); continue
+            if not tgt.get('ruleSet'): add(field,'BLOCKED',reason='La homóloga es una colección manual (no admite condiciones)'); continue
+            trules=tgt['ruleSet']['rules']; have={category_rule_key(r) for r in trules}
+            copyable=[r for r in src['ruleSet']['rules'] if r['column'] in CATEGORY_RULE_COLUMNS and (r.get('conditionObject') or {}).get('__typename')=='CollectionRuleTextCondition']
+            skipped=[category_rule_text(r) for r in src['ruleSet']['rules'] if r not in copyable]
+            warn=['No se copia (depende del idioma): '+t for t in skipped]
+            if src['ruleSet']['appliedDisjunctively']!=tgt['ruleSet']['appliedDisjunctively']: warn.append('ES y la homóloga combinan las reglas de forma distinta (todas / cualquiera); no se cambia')
+            new=[r for r in copyable if category_rule_key(r) not in have]
+            if not new: add(field,'SAME',[category_rule_text(r) for r in trules],[],warn); continue
+            before_txt=[category_rule_text(r) for r in trules]
+            disj=tgt['ruleSet']['appliedDisjunctively']
+            positives=[r for r in new if r['relation']=='EQUALS' and r['column'] in ('TAG','TYPE')]
+            if positives and disj:
+                n=category_match_count(st,positives)
+                if n==0: add(field,'BLOCKED',before_txt,[category_rule_text(r) for r in new],warn,'Ningún producto de la tienda cumple la regla nueva: '+', '.join(category_rule_text(r) for r in positives)); continue
+                warn.append(f'Las reglas se combinan con «cualquiera»: la nueva añadiría hasta {n} productos a la colección')
+            elif positives:  # «todas»: cada regla positiva nueva restringe la colección
+                after_rules=[r for r in trules]+positives
+                n0=category_match_count(st,trules); n1=category_match_count(st,after_rules)
+                if n1==0: add(field,'BLOCKED',before_txt,[category_rule_text(r) for r in new],warn,f'La colección quedaría vacía: ningún producto cumple a la vez todas las etiquetas/tipos requeridos (con las reglas nuevas: {", ".join(category_rule_text(r) for r in positives)}). Probablemente las etiquetas aún no están unificadas en esta tienda'); continue
+                if n0 is not None and n1<n0: warn.append(f'Las reglas se combinan con «todas»: la colección se reduciría de {n0} a {n1} productos (sin contar las exclusiones)')
+            keep=[]; unsupported=False
+            for r in trules:
+                item={'column':r['column'],'relation':r['relation'],'condition':r.get('condition') or ''}
+                kind=(r.get('conditionObject') or {}).get('__typename')
+                if kind=='CollectionRuleMetafieldCondition': item['conditionObjectId']=((r['conditionObject'].get('metafieldDefinition')) or {}).get('id')
+                elif kind!='CollectionRuleTextCondition': unsupported=True
+                keep.append(item)
+            if unsupported: add(field,'BLOCKED',reason='La homóloga tiene condiciones de un tipo que esta herramienta no puede conservar'); continue
+            merged=keep+[{'column':r['column'],'relation':r['relation'],'condition':r['condition']} for r in new]
+            add(field,'CHANGE',[category_rule_text(r) for r in trules],[category_rule_text(r) for r in trules]+['+ '+category_rule_text(r) for r in new],warn,apply={'rules':merged,'disjunctive':tgt['ruleSet']['appliedDisjunctively']})
+    return {'store':st['code'],'status':'READY','collection':{'id':tgt['id'],'title':tgt['title'],'handle':tgt['handle']},'fields':out}
+
+def category_edit_plan(x):
+    master_gid,_=category_gid(x.master,'colección maestra')
+    fields=list(dict.fromkeys(x.fields)); unknown=[f for f in fields if f not in CATEGORY_EDIT_FIELDS]
+    if unknown or not fields: raise HTTPException(400,'Elige al menos un campo válido'+(': '+', '.join(unknown) if unknown else ''))
+    codes=list(dict.fromkeys(c.strip().upper() for c in x.stores if c.strip()))
+    if not codes: raise HTTPException(400,'Elige al menos un país')
+    stores=[category_target_store(c) for c in codes]
+    ms=admin_store(CATEGORY_MASTER)
+    src=admin_gql(ms,CATEGORY_EDIT_READ,{'id':master_gid}).get('collection')
+    if not src: raise HTTPException(404,'La colección maestra no existe en '+CATEGORY_MASTER)
+    refs=[g for f in CATEGORY_REF_FIELDS if f in fields for g in (_gid_list((src.get(f) or {}).get('value')) if CATEGORY_EDIT_FIELDS[f]['type'].startswith('list.') else [(src.get(f) or {}).get('value')])]
+    titles=category_titles(ms,refs)
+    results=run_per_store(stores,lambda st:category_edit_plan_store(st,master_gid,src,titles,fields,x.partial_lists))
+    plan=[r['data'] if r['ok'] else {'store':r['store'],'status':'ERROR','reason':r['error'],'fields':[]} for r in results]
+    digest=hashlib.sha256(json.dumps([(p['store'],p['status'],[(f['field'],f['state'],f['after']) for f in p['fields']]) for p in plan],sort_keys=True,ensure_ascii=False).encode()).hexdigest()[:16]
+    return master_gid,src,plan,digest
+
+@app.post('/api/admin/categories/edit/preview')
+def category_edit_preview(x:CategoryEdit):
+    """Vista previa: valores anteriores y nuevos por país y campo, y avisos. No escribe nada."""
+    _,src,plan,digest=category_edit_plan(x)
+    for p in plan:
+        for f in p['fields']: f.pop('apply',None)
+    return {'master':{'id':src['id'],'title':src['title']},'plan_hash':digest,'stores':plan}
+
+def category_apply_field(st,gid,f):
+    a=f['apply']; field=f['field']
+    if field=='image':
+        image={'src':a['src']}
+        if a.get('alt'): image['altText']=a['alt']
+        admin_exec(st,'mutation($input:CollectionInput!){collectionUpdate(input:$input){collection{id} userErrors{field message}}}',{'input':{'id':gid,'image':image}},'collectionUpdate')
+    elif field=='icon':
+        created=admin_exec(st,'mutation($files:[FileCreateInput!]!){fileCreate(files:$files){files{id} userErrors{field message}}}',{'files':[{'originalSource':a['src'],'contentType':'IMAGE'}]},'fileCreate')
+        file_id=((created.get('files') or [{}])[0]).get('id')
+        if not file_id: raise HTTPException(502,'Shopify no devolvió el archivo creado')
+        for _ in range(30):  # el archivo se procesa de forma asíncrona
+            status=((admin_gql(st,'query($id:ID!){node(id:$id){... on MediaImage{fileStatus}}}',{'id':file_id}).get('node')) or {}).get('fileStatus')
+            if status=='READY': break
+            if status=='FAILED': raise HTTPException(502,'Shopify no pudo procesar la imagen del icono')
+            time.sleep(1)
+        else: raise HTTPException(502,'La imagen del icono sigue procesándose; reintenta en un momento')
+        admin_exec(st,'mutation($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){metafields{id} userErrors{field message}}}',{'m':[{'ownerId':gid,'namespace':CATEGORY_NS,'key':CATEGORY_EDIT_FIELDS['icon']['key'],'type':'file_reference','value':file_id}]},'metafieldsSet')
+    elif field in CATEGORY_REF_FIELDS:
+        admin_exec(st,'mutation($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){metafields{id} userErrors{field message}}}',{'m':[{'ownerId':gid,'namespace':CATEGORY_NS,'key':a['key'],'type':a['type'],'value':a['value']}]},'metafieldsSet')
+    elif field=='rules':
+        admin_exec(st,'mutation($input:CollectionInput!){collectionUpdate(input:$input){collection{id} userErrors{field message}}}',{'input':{'id':gid,'ruleSet':{'appliedDisjunctively':a['disjunctive'],'rules':a['rules']}}},'collectionUpdate')
+
+@app.post('/api/admin/categories/edit/apply')
+def category_edit_apply(x:CategoryEdit):
+    """Aplica lo previsualizado. Exige confirmación expresa y que nada haya cambiado desde la vista previa."""
+    if not x.confirm: raise HTTPException(400,'Falta la confirmación expresa')
+    master_gid,src,plan,digest=category_edit_plan(x)
+    if not x.plan_hash or x.plan_hash!=digest: raise HTTPException(409,'Los datos han cambiado desde la vista previa. Vuelve a previsualizar y confirma de nuevo.')
+    def run(p):
+        st=admin_store(p['store']); out=[]
+        for f in p['fields']:
+            if f['state']!='CHANGE': out.append({'field':f['field'],'label':f['label'],'status':'SKIPPED','reason':f.get('reason') or ('Ya estaba igual' if f['state']=='SAME' else '')}); continue
+            try: category_apply_field(st,p['collection']['id'],f); out.append({'field':f['field'],'label':f['label'],'status':'OK','before':f['before'],'after':f['after']})
+            except HTTPException as exc: out.append({'field':f['field'],'label':f['label'],'status':'FAILED','error':str(exc.detail)[:500],'before':f['before'],'after':f['after']})
+            except Exception as exc: out.append({'field':f['field'],'label':f['label'],'status':'FAILED','error':f'{type(exc).__name__}: {exc}'[:500],'before':f['before'],'after':f['after']})
+        return {'store':p['store'],'collection':p['collection'],'results':out}
+    ready={p['store']:p for p in plan if p['status']=='READY'}
+    done={r['store']:(r['data'] if r['ok'] else {'store':r['store'],'results':[],'error':r['error']}) for r in run_per_store([{'code':c} for c in ready],lambda s:run(ready[s['code']]))}
+    stores_out=[done.get(p['store'],{'store':p['store'],'results':[],'skipped':p.get('reason') or p['status']}) for p in plan]
+    op=None
+    try:
+        with pool.connection() as c:
+            op=c.execute("INSERT INTO admin_operations(operator,kind,mode,payload) VALUES(%s,'category.edit','global',%s) RETURNING id",(operator(),Jsonb({'master':master_gid,'fields':x.fields,'stores':[p['store'] for p in plan],'partial_lists':x.partial_lists}))).fetchone()[0]
+            for s in stores_out:
+                if not s['results']: c.execute("INSERT INTO admin_operation_items(op_id,store_code,entity_gid,status,error) VALUES(%s,%s,NULL,%s,%s)",(op,s['store'],'SKIPPED' if s.get('skipped') else 'FAILED',(s.get('skipped') or s.get('error') or '')[:500]))
+                for r in s['results']:
+                    c.execute("INSERT INTO admin_operation_items(op_id,store_code,entity_gid,status,error,before,after) VALUES(%s,%s,%s,%s,%s,%s,%s)",(op,s['store'],s['collection']['id'],r['status'],r.get('error') or r.get('reason'),Jsonb({r['label']:r.get('before')}),Jsonb({r['label']:r.get('after')})))
+    except Exception:
+        logging.getLogger('hub.admin').exception('No se pudo registrar la auditoría de categorías')
+    logging.getLogger('hub.admin').info('category.edit %s tiendas=%s campos=%s',master_gid,[p['store'] for p in plan],x.fields)
+    return {'operation_id':op,'stores':stores_out}
+
+class CategoryLink(BaseModel):
+    master:str
+    store:str
+    collection:str|None=None   # gid de la homóloga; vacío = desvincular
+    none:bool=False            # confirma que ese mercado no tiene colección equivalente
+
+@app.post('/api/admin/categories/link')
+def category_link(x:CategoryLink):
+    """Guarda, cambia o elimina el vínculo de una categoría en una tienda. Solo escribe en la base de datos del hub, no en Shopify."""
+    master_gid,_=category_gid(x.master,'colección maestra')
+    st=category_target_store(x.store); store=st['code']
+    if x.none and x.collection: raise HTTPException(400,'Elige una colección o "sin homóloga", no ambas')
+    with pool.connection() as c:
+        prev=c.execute("SELECT collection_gid,status FROM category_links WHERE master_gid=%s AND store_code=%s",(master_gid,store)).fetchone()
+    before={'collection':prev[0],'status':prev[1]} if prev else None
+    title=None
+    if x.collection:
+        gid,_=category_gid(x.collection)
+        node=admin_gql(st,'query($id:ID!){collection(id:$id){id title}}',{'id':gid}).get('collection')
+        if not node: raise HTTPException(404,f'La colección no existe en {store}')
+        title=node['title']
+        after={'collection':gid,'status':'CONFIRMED'}
+        try:
+            with pool.connection() as c:
+                c.execute("INSERT INTO category_links(master_gid,store_code,collection_gid,status,linked_by) VALUES(%s,%s,%s,'CONFIRMED',%s) ON CONFLICT(master_gid,store_code) DO UPDATE SET collection_gid=EXCLUDED.collection_gid,status='CONFIRMED',linked_by=EXCLUDED.linked_by,linked_at=now()",(master_gid,store,gid,operator()))
+        except psycopg.errors.UniqueViolation:
+            raise HTTPException(409,f'Esa colección de {store} ya es la homóloga de otra categoría maestra')
+    elif x.none:
+        after={'collection':None,'status':'NONE'}
+        with pool.connection() as c:
+            c.execute("INSERT INTO category_links(master_gid,store_code,collection_gid,status,linked_by) VALUES(%s,%s,NULL,'NONE',%s) ON CONFLICT(master_gid,store_code) DO UPDATE SET collection_gid=NULL,status='NONE',linked_by=EXCLUDED.linked_by,linked_at=now()",(master_gid,store,operator()))
+    else:
+        after=None
+        with pool.connection() as c:
+            c.execute("DELETE FROM category_links WHERE master_gid=%s AND store_code=%s",(master_gid,store))
+    admin_audit('category.link',store,master_gid,'OK',None,before,after,{'master':master_gid,'store':store,'title':title})
+    return {'store':store,'link':after,'title':title}
 
 ADMIN_ASSETS=Path(__file__).parent
 ADMIN_BODY='<style>'+(ADMIN_ASSETS/'admin.css').read_text(encoding='utf-8')+'</style>'+(ADMIN_ASSETS/'admin.html').read_text(encoding='utf-8')+'<script>'+(ADMIN_ASSETS/'admin.js').read_text(encoding='utf-8')+'</script>'

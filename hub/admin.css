@@ -148,3 +148,6 @@
 .finder .actions { display: flex; align-items: center; gap: 14px; margin: 12px 0; }
 .finder .actions label { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-weight: 400; }
 .callout.ok { border-left-color: #2f6b3a; background: #eef6ef; color: #1f4d2a; }
+
+/* Categorías */
+ul.plain { margin: 0; padding-left: 1.1em; }
