@@ -767,7 +767,7 @@ function renderResults(d, applied, box) {
 /* ---------- DUPLICADOS ---------- */
 const D = { rows: [], inited: false };
 const dSkus = () => [...new Set($('#d-skus').value.split(/[\n,;]+/).map(x => x.trim()).filter(Boolean))];
-const dDirty = r => r.sku !== r.sku0 || r.vt !== r.vt0;
+const dDirty = r => r.sku !== r.sku0 || r.vt !== r.vt0 || r.pt !== r.pt0;
 function initDup() {
   if (D.inited) return; D.inited = true;
   $('#d-stores').innerHTML = state.stores.map(s => `<label class="chip"><input type="checkbox" value="${esc(s.code)}" checked><span>${esc(s.code)}</span></label>`).join('');
@@ -776,12 +776,15 @@ function initDup() {
   $('#d-skus').addEventListener('input', () => { $('#d-sku-count').textContent = `${dSkus().length} SKU`; });
   $('#d-search').onclick = dupSearch;
   $('#d-fill').onclick = dupFill;
-  $('#d-reset').onclick = () => { D.rows.forEach(r => { r.sku = r.sku0; r.vt = r.vt0; }); dupRender(); };
+  $('#d-reset').onclick = () => { D.rows.forEach(r => { r.sku = r.sku0; r.vt = r.vt0; r.pt = r.pt0; }); dupRender(); };
   $('#d-save').onclick = dupSave;
   const t = $('#d-table');
   t.addEventListener('input', e => {
-    const k = e.target.dataset.dsku !== undefined ? 'sku' : e.target.dataset.dtitle !== undefined ? 'vt' : null; if (!k) return;
-    const r = D.rows[+(e.target.dataset.dsku ?? e.target.dataset.dtitle)]; r[k] = e.target.value;
+    const k = e.target.dataset.dsku !== undefined ? 'sku' : e.target.dataset.dtitle !== undefined ? 'vt' : e.target.dataset.dprod !== undefined ? 'pt' : null; if (!k) return;
+    const r = D.rows[+(e.target.dataset.dsku ?? e.target.dataset.dtitle ?? e.target.dataset.dprod)]; r[k] = e.target.value;
+    if (k === 'pt') {  // el título es del producto: todas las filas del mismo producto en la tienda lo comparten
+      D.rows.forEach((o, j) => { if (o !== r && o.store === r.store && o.product_id === r.product_id) { o.pt = r.pt; const inp = $(`#d-table input[data-dprod="${j}"]`); if (inp) inp.value = r.pt; inp?.closest('tr').classList.toggle('vrow-sel', dDirty(o)); } });
+    }
     e.target.closest('tr').classList.toggle('vrow-sel', dDirty(r)); dupCount();
   });
   t.addEventListener('change', e => {
@@ -800,7 +803,7 @@ async function dupSearch() {
   b.disabled = true; st.textContent = 'Buscando en las tiendas…'; $('#d-result').innerHTML = '';
   try {
     const d = await post('/api/admin/duplicates/search', { skus, stores });
-    D.rows = []; d.stores.forEach(s => s.items.forEach(it => D.rows.push({ ...it, store: s.store, sku0: it.sku, vt: it.variant_title, vt0: it.variant_title, pick: true })));
+    D.rows = []; d.stores.forEach(s => s.items.forEach(it => D.rows.push({ ...it, store: s.store, sku0: it.sku, vt: it.variant_title, vt0: it.variant_title, pt: it.product_title, pt0: it.product_title, pick: true })));
     const order = new Map(skus.map((s, i) => [s.toLowerCase(), i]));
     D.rows.sort((a, c) => (order.get(a.sku.toLowerCase()) - order.get(c.sku.toLowerCase())) || a.store.localeCompare(c.store));
     const errs = d.stores.filter(s => s.error).map(s => `<div class="callout err"><strong>${esc(s.store)}</strong>: ${esc(s.error)}</div>`).join('');
@@ -812,11 +815,11 @@ async function dupSearch() {
 }
 function dupRender() {
   const counts = {}; D.rows.forEach(r => { const k = r.sku0.toLowerCase() + '|' + r.store; counts[k] = (counts[k] || 0) + 1; });
-  $('#d-table').innerHTML = table(['<input type="checkbox" id="d-pick-all" checked aria-label="Marcar todas las filas">', 'Tienda', 'SKU', 'Título de la variante', 'Producto (informativo)'], D.rows.map((r, i) =>
+  $('#d-table').innerHTML = table(['<input type="checkbox" id="d-pick-all" checked aria-label="Marcar todas las filas">', 'Tienda', 'SKU', 'Título de la variante', 'Título del producto'], D.rows.map((r, i) =>
     `<tr${dDirty(r) ? ' class="vrow-sel"' : ''}><td class="chk"><input type="checkbox" data-dpick="${i}"${r.pick ? ' checked' : ''} aria-label="Marcar fila ${i + 1}"></td><td class="nw">${esc(r.store)}${counts[r.sku0.toLowerCase() + '|' + r.store] > 1 ? '<br>' + tag('repetido en la tienda', 'warn') : ''}</td>`
     + `<td><input data-dsku="${i}" value="${esc(r.sku)}" autocomplete="off" spellcheck="false" aria-label="SKU de la fila ${i + 1}"></td>`
     + `<td><input data-dtitle="${i}" value="${esc(r.vt)}" autocomplete="off" aria-label="Título de variante de la fila ${i + 1}"></td>`
-    + `<td class="wrap-cell">${esc(r.product_title)} ${statusTag(r.status)}</td></tr>`).join(''));
+    + `<td class="wrap-cell"><input data-dprod="${i}" value="${esc(r.pt)}" autocomplete="off" aria-label="Título del producto de la fila ${i + 1}"> ${statusTag(r.status)}</td></tr>`).join(''));
   dupCount();
 }
 function dupFill() {
@@ -830,12 +833,12 @@ function dupFill() {
 async function dupSave() {
   const dirty = D.rows.filter(dDirty), b = $('#d-save'), st = $('#d-save-status');
   if (!dirty.length) return;
-  if (dirty.some(r => !r.sku.trim() || !r.vt.trim())) { st.textContent = 'SKU y título de variante no pueden quedar vacíos.'; return; }
-  const changes = dirty.map(r => ({ store: r.store, variant_id: r.variant_id, ...(r.sku !== r.sku0 ? { sku: r.sku } : {}), ...(r.vt !== r.vt0 ? { variant_title: r.vt } : {}) }));
+  if (dirty.some(r => !r.sku.trim() || !r.vt.trim() || !r.pt.trim())) { st.textContent = 'SKU, título de variante y título de producto no pueden quedar vacíos.'; return; }
+  const changes = dirty.map(r => ({ store: r.store, variant_id: r.variant_id, ...(r.sku !== r.sku0 ? { sku: r.sku } : {}), ...(r.vt !== r.vt0 ? { variant_title: r.vt } : {}), ...(r.pt !== r.pt0 ? { product_id: r.product_id, product_title: r.pt } : {}) }));
   b.disabled = true; st.textContent = `Guardando ${dupPlural(changes.length, 'fila', 'filas')} en Shopify…`;
   try {
     const d = await post('/api/admin/duplicates/apply', { changes }), byV = new Map(d.results.map(r => [r.store + r.variant_id, r]));
-    dirty.forEach(r => { const x = byV.get(r.store + r.variant_id); if (x && x.status !== 'FAILED') { r.sku0 = r.sku; r.vt0 = r.vt; r.err = null; } else r.err = (x && x.error) || 'Sin respuesta'; });
+    dirty.forEach(r => { const x = byV.get(r.store + r.variant_id); if (x && x.status !== 'FAILED') { r.sku0 = r.sku; r.vt0 = r.vt; r.pt0 = r.pt; r.err = null; } else r.err = (x && x.error) || 'Sin respuesta'; });
     const fails = dirty.filter(r => r.err);
     $('#d-result').innerHTML = `<div class="callout ${d.failed ? 'err' : 'ok'}"><strong>${dupPlural(d.ok, 'fila guardada', 'filas guardadas')}${d.failed ? `, ${dupPlural(d.failed, 'fallida', 'fallidas')}` : ''}.</strong></div>`
       + (fails.length ? table(['Tienda', 'SKU', 'Error'], fails.map(r => `<tr><td class="nw">${esc(r.store)}</td><td class="nw">${esc(r.sku0)}</td><td>${esc(r.err)}</td></tr>`).join('')) : '');

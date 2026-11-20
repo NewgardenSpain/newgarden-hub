@@ -3114,6 +3114,8 @@ class AdminDupChange(BaseModel):
     variant_id:str
     sku:str|None=None
     variant_title:str|None=None
+    product_id:str|None=None
+    product_title:str|None=None
 
 class AdminDupApply(BaseModel):
     changes:list[AdminDupChange]
@@ -3136,10 +3138,13 @@ def admin_variant_title_update(st,vid,new_title):
 
 def admin_dup_apply_store(st,rows):
     """Aplica en una tienda los cambios de SKU y título de variante. Un fallo no detiene el resto."""
-    out=[]
+    out=[]; products_done={}
     for r in rows:
         try:
             changed=[]
+            if r.product_title is not None:
+                if r.product_id not in products_done: products_done[r.product_id]=admin_product_update(AdminEntityUpdate(store=st['code'],id=r.product_id,fields={'title':r.product_title}))['changed']
+                if products_done[r.product_id]: changed.append('product_title')
             if r.sku is not None:
                 changed+=admin_variant_update(AdminVariantUpdate(store=st['code'],id=r.variant_id,fields={'sku':r.sku}))['changed']
             if r.variant_title is not None:
@@ -3154,7 +3159,9 @@ def admin_duplicates_apply(x:AdminDupApply):
     if not x.changes: raise HTTPException(400,'No hay cambios que guardar')
     if len(x.changes)>DUP_MAX_CHANGES: raise HTTPException(400,f'Máximo {DUP_MAX_CHANGES} cambios por operación')
     for r in x.changes:
-        if r.sku is None and r.variant_title is None: raise HTTPException(400,'Cambio vacío')
+        if r.sku is None and r.variant_title is None and r.product_title is None: raise HTTPException(400,'Cambio vacío')
+        if r.product_title is not None and not (r.product_id or '').startswith('gid://shopify/Product/'): raise HTTPException(400,'Identificador de producto no válido')
+        if r.product_title is not None and not r.product_title.strip(): raise HTTPException(400,'El título del producto no puede estar vacío')
         if not r.variant_id.startswith('gid://shopify/ProductVariant/'): raise HTTPException(400,'Identificador no válido')
     by_store={}
     for r in x.changes: by_store.setdefault(r.store.strip().upper(),[]).append(r)
