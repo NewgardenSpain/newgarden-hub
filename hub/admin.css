@@ -151,3 +151,30 @@
 
 /* Categorías */
 ul.plain { margin: 0; padding-left: 1.1em; }
+
+/* Precios: rejilla tipo Excel */
+.pg-wrap { position: relative; max-height: 72vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+.pg { border-collapse: separate; border-spacing: 0; width: max-content; min-width: 100%; font-size: 14px; user-select: none; -webkit-user-select: none; outline: none; }
+.pg th, .pg td { padding: 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #fff; white-space: nowrap; }
+.pg thead th { position: sticky; z-index: 3; background: #f1f3f1; font-weight: 600; padding: 6px 10px; text-align: center; cursor: pointer; }
+.pg thead tr:nth-child(1) th { top: 0; }
+.pg thead tr:nth-child(2) th { top: 33px; font-weight: 500; font-size: 12px; color: var(--muted); }
+.pg .pg-key { position: sticky; z-index: 4; text-align: left; cursor: default; background: #f1f3f1; }
+.pg tbody .pg-key { z-index: 2; padding: 6px 10px; font-weight: 600; cursor: pointer; background: #f7f8f7; }
+.pg .pg-k1 { left: 0; min-width: 130px; }
+.pg tbody .pg-k2 { font-weight: 400; }
+.pg .pg-k2 { left: 130px; min-width: 150px; max-width: 240px; overflow: hidden; text-overflow: ellipsis; box-shadow: 2px 0 0 var(--line); }
+.pg td.c { min-width: 92px; padding: 6px 10px; text-align: right; font-variant-numeric: tabular-nums; cursor: cell; }
+.pg td.c.ph { color: #9aa39c; }
+.pg td.c.na { background: #e9ebe9; cursor: not-allowed; }
+.pg td.c.dirty { background: #fff3d6; font-weight: 600; }
+.pg td.c.err { background: #fbe3e1; }
+.pg td.c.sel { background: #dbe9ff; }
+.pg td.c.sel.dirty { background: #cfe0f7; }
+.pg td.c.cur { outline: 2px solid #1f5fbf; outline-offset: -2px; }
+.pg .pg-sep { border-left: 2px solid #7d877f; }
+.pg-edit { position: absolute; z-index: 6; margin: 0; padding: 4px 8px; border: 2px solid #1f5fbf; border-radius: 0; background: #fff; font: inherit; text-align: right; box-sizing: border-box; min-height: 0; }
+.pg thead tr:nth-child(1) th.pg-sep { text-align: left; padding-left: 0; }
+.pg thead tr:nth-child(1) th.pg-sep > span { position: sticky; left: 400px; display: inline-block; padding: 0 10px; }
+.pg thead th small { font: 400 10px var(--mono); color: var(--muted); }
+.pg thead tr:nth-child(2) th { top: 33px; }

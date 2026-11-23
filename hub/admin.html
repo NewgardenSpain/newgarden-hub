@@ -6,6 +6,7 @@
   <button type="button" role="tab" id="tab-tienda" data-tab="tienda" aria-controls="panel-tienda">Una tienda</button>
   <button type="button" role="tab" id="tab-varias" data-tab="varias" aria-controls="panel-varias">Varias tiendas</button>
   <button type="button" role="tab" id="tab-duplicados" data-tab="duplicados" aria-controls="panel-duplicados">Duplicados</button>
+  <button type="button" role="tab" id="tab-precios" data-tab="precios" aria-controls="panel-precios">Precios</button>
   <button type="button" role="tab" id="tab-categorias" data-tab="categorias" aria-controls="panel-categorias">Categorías</button>
   <button type="button" role="tab" id="tab-valores" data-tab="valores" aria-controls="panel-valores">Valores</button>
   <button type="button" role="tab" id="tab-metacampos" data-tab="metacampos" aria-controls="panel-metacampos">Metacampos</button>
@@ -104,6 +105,33 @@
     <span id="d-save-status" class="muted" role="status" aria-live="polite"></span>
   </div>
   <div id="d-result" aria-live="polite"></div>
+</section>
+
+<!-- PRECIOS -->
+<section id="panel-precios" role="tabpanel" aria-labelledby="tab-precios" hidden>
+  <p class="adm-intro">Escribe el <strong>nombre del producto</strong> (o el SKU de cualquiera de sus variantes) y verás <strong>todas sus variantes</strong> en filas y, en columnas, el <strong>precio base de cada tienda</strong> y el <strong>precio de cada mercado</strong> (por ejemplo, en la tienda ES: España, Portugal y EXPORT 1, que incluye NL). Selecciona celdas arrastrando con el ratón (o con Mayús + flechas), <strong>escribe el valor</strong> y pulsa Intro: se aplica a todas las celdas seleccionadas. Opcional: <code>+10%</code> o <code>-5%</code> suben o bajan sobre el valor actual. Supr vacía las celdas y copiar/pegar desde Excel. Un mercado sin precio propio <strong>hereda el precio base</strong>. «Guardar» escribe directamente en Shopify y solo envía las celdas modificadas.</p>
+  <div class="step">
+    <div class="adm-bar"><div class="field"><label for="p-sku">Producto: nombre o SKU de cualquiera de sus variantes</label><input id="p-sku" autocomplete="off" spellcheck="false" placeholder="Bola iluminada Buly  ·  LUMBL030OFNW" style="min-width:min(420px,100%)"></div></div>
+    <div class="chips" id="p-stores" role="group" aria-label="Tiendas"></div>
+    <div class="actions"><button type="button" class="button secondary" id="p-all">Todas</button><button type="button" class="button secondary" id="p-none">Ninguna</button><button type="button" class="button primary" id="p-search">Cargar precios</button></div>
+    <p id="p-status" class="muted" role="status" aria-live="polite"></p>
+    <div id="p-pick"></div>
+  </div>
+  <div id="p-work" hidden>
+    <div class="adm-bar">
+      <div class="seg" role="group" aria-label="Campo a editar"><button type="button" data-pf="p" aria-pressed="true">Precio</button><button type="button" data-pf="c" aria-pressed="false">Precio de comparación</button></div>
+      <button type="button" class="button secondary" id="p-selall" title="Ctrl + A">Seleccionar todo</button>
+      <button type="button" class="button secondary" id="p-reset">Deshacer cambios</button>
+      <span id="p-sel" class="muted" role="status" aria-live="polite"></span>
+    </div>
+    <div id="p-warn"></div>
+    <div id="p-grid" class="pg-wrap"></div>
+  </div>
+  <div class="actionbar" id="p-bar" hidden>
+    <button type="button" class="button primary" id="p-save" disabled>Guardar en Shopify</button>
+    <span id="p-save-status" class="muted" role="status" aria-live="polite"></span>
+  </div>
+  <div id="p-result" aria-live="polite"></div>
 </section>
 
 <!-- CATEGORÍAS -->

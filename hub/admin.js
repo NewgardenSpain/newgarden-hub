@@ -25,7 +25,7 @@ const OWNER_ES = { PRODUCT: 'Producto', PRODUCTVARIANT: 'Variante' };
 const state = { stores: [], store: null, kind: 'products', cursor: null, rows: [], seq: 0, defs: null, defsPromise: null, editing: null };
 
 /* ---------- pestañas principales ---------- */
-const TABS = ['tienda', 'varias', 'duplicados', 'categorias', 'valores', 'metacampos', 'historial'];
+const TABS = ['tienda', 'varias', 'duplicados', 'precios', 'categorias', 'valores', 'metacampos', 'historial'];
 const shown = {};
 function showTab(name, push = true) {
   if (!TABS.includes(name)) name = 'tienda';
@@ -34,7 +34,7 @@ function showTab(name, push = true) {
     b.setAttribute('aria-selected', on); b.tabIndex = on ? 0 : -1; $('#panel-' + t).hidden = !on;
   });
   if (push) history.replaceState(null, '', '#' + name);
-  if (!shown[name]) { shown[name] = true; ({ tienda: loadList, varias: initMulti, duplicados: initDup, categorias: initCat, valores: initValues, metacampos: renderMatrix, historial: loadHistory })[name](true); }
+  if (!shown[name]) { shown[name] = true; ({ tienda: loadList, varias: initMulti, duplicados: initDup, precios: initPrices, categorias: initCat, valores: initValues, metacampos: renderMatrix, historial: loadHistory })[name](true); }
 }
 $$('.adm-tabs [role=tab]').forEach(b => {
   b.onclick = () => showTab(b.dataset.tab);
@@ -1010,8 +1010,207 @@ async function dupSave() {
   } catch (err) { st.textContent = err.message; b.disabled = false; }
 }
 
+/* ---------- PRECIOS (rejilla tipo Excel) ---------- */
+const P = { inited: false, stores: [], rows: [], cols: [], cells: new Map(), field: 'p', anchor: null, focus: null, drag: false, vis: [], edit: null };
+const pNum = v => { const t = String(v ?? '').trim().replace(',', '.'); if (t === '') return ''; if (!/^\d+(\.\d+)?$/.test(t)) return null; return String(+t); };
+const pKey = (r, c) => r + '|' + c;
+const pCell = (r, c) => P.cells.get(pKey(r, P.vis[c].i));
+const pVal = (cell, f = P.field) => f === 'p' ? cell.p : cell.c;
+const pDirtyCell = x => x.p !== x.p0 || x.c !== x.c0;
+const pDirtyCount = () => { let n = 0; P.cells.forEach(x => { if (pDirtyCell(x)) n++; }); return n; };
+function initPrices() {
+  if (P.inited) return; P.inited = true;
+  $('#p-stores').innerHTML = state.stores.map(s => `<label class="chip"><input type="checkbox" value="${esc(s.code)}" checked><span>${esc(s.code)}</span></label>`).join('');
+  $('#p-all').onclick = () => $$('#p-stores input').forEach(i => i.checked = true);
+  $('#p-none').onclick = () => $$('#p-stores input').forEach(i => i.checked = false);
+  $('#p-search').onclick = priceFind;
+  $('#p-sku').addEventListener('keydown', e => { if (e.key === 'Enter') priceFind(); });
+  $('#p-save').onclick = priceSave;
+  $('#p-selall').onclick = priceSelectAll;
+  $('#p-reset').onclick = () => { P.cells.forEach(x => { x.p = x.p0; x.c = x.c0; x.err = null; }); priceRender(); };
+  $$('#panel-precios [data-pf]').forEach(b => b.onclick = () => { P.field = b.dataset.pf; $$('#panel-precios [data-pf]').forEach(x => x.setAttribute('aria-pressed', String(x === b))); priceRender(); });
+  const g = $('#p-grid');
+  g.addEventListener('mousedown', e => {
+    const td = e.target.closest('td.c, th[data-pc], td[data-pr]'); if (!td || e.target.closest('.pg-edit')) return;
+    priceCommitEdit(); g.querySelector('table')?.focus({ preventScroll: true });
+    if (td.matches('th[data-pc]')) { const c = +td.dataset.pc; P.anchor = { r: 0, c }; P.focus = { r: P.rows.length - 1, c }; }
+    else if (td.matches('td[data-pr]')) { const r = +td.dataset.pr; P.anchor = { r, c: 0 }; P.focus = { r, c: P.vis.length - 1 }; }
+    else { const pos = { r: +td.dataset.r, c: +td.dataset.c }; if (e.shiftKey && P.anchor) P.focus = pos; else { P.anchor = pos; P.focus = pos; } P.drag = true; }
+    e.preventDefault(); priceSelPaint();
+  });
+  g.addEventListener('mouseover', e => { if (!P.drag) return; const td = e.target.closest('td.c'); if (td) { P.focus = { r: +td.dataset.r, c: +td.dataset.c }; priceSelPaint(); } });
+  document.addEventListener('mouseup', () => { P.drag = false; });
+  g.addEventListener('dblclick', e => { if (e.target.closest('td.c')) priceOpenEdit(null); });
+  g.addEventListener('keydown', priceKey);
+  g.addEventListener('copy', e => { const rect = priceRect(); if (!rect) return; e.preventDefault(); const lines = []; for (let r = rect.r0; r <= rect.r1; r++) { const row = []; for (let c = rect.c0; c <= rect.c1; c++) { const x = pCell(r, c); row.push(x ? pVal(x) : ''); } lines.push(row.join('\t')); } e.clipboardData.setData('text/plain', lines.join('\n')); });
+  g.addEventListener('paste', e => {
+    const rect = priceRect(); if (!rect) return; e.preventDefault();
+    const rows = (e.clipboardData.getData('text/plain') || '').replace(/\r/g, '').replace(/\n$/, '').split('\n').map(l => l.split('\t'));
+    if (rows.length === 1 && rows[0].length === 1) { priceApply(rows[0][0]); return; }
+    let bad = 0; rows.forEach((cols, i) => cols.forEach((v, j) => { const r = rect.r0 + i, c = rect.c0 + j; if (r >= P.rows.length || c >= P.vis.length) return; if (!priceSet(r, c, v)) bad++; }));
+    priceRender(); $('#p-save-status').textContent = bad ? `${bad} celdas no se pegaron (valor no válido o celda inexistente).` : '';
+  });
+  window.addEventListener('beforeunload', e => { if (pDirtyCount()) { e.preventDefault(); e.returnValue = ''; } });
+}
+async function priceFind() {
+  const q = $('#p-sku').value.trim(), stores = $$('#p-stores input:checked').map(i => i.value), st = $('#p-status'), pick = $('#p-pick');
+  pick.innerHTML = '';
+  if (!q) { st.textContent = 'Escribe el nombre o un SKU.'; return; }
+  if (!stores.length) { st.textContent = 'Elige al menos una tienda.'; return; }
+  if (pDirtyCount() && !confirm('Hay cambios sin guardar. ¿Descartarlos y cargar de nuevo?')) return;
+  $('#p-search').disabled = true; st.textContent = 'Buscando el producto…';
+  try {
+    const d = await post('/api/admin/prices/find', { q, stores });
+    if (!d.products.length) { st.textContent = 'No se encontró ningún producto con ese nombre o SKU.'; return; }
+    if (d.exact || d.products.length === 1) { await priceSearch(d.exact ? q : d.products[0].sku, true); return; }
+    st.textContent = `${d.products.length}${d.has_next ? '+' : ''} productos coinciden (búsqueda en ${d.store}). Elige uno:`;
+    pick.innerHTML = '<div class="chips" style="margin-top:10px">' + d.products.map((p, i) => `<button type="button" class="button secondary" data-psku="${esc(p.sku)}" title="${esc(p.sku)}">${esc(p.title)} <small>· ${p.variants} var.${p.status !== 'ACTIVE' ? ' · ' + esc(STATUS_ES[p.status] || p.status) : ''}</small></button>`).join('') + '</div>';
+    $$('#p-pick [data-psku]').forEach(b => b.onclick = () => { pick.innerHTML = ''; priceSearch(b.dataset.psku, true); });
+  } catch (err) { st.textContent = err.message; } finally { $('#p-search').disabled = false; }
+}
+async function priceSearch(skuArg, skipConfirm) {
+  const sku = (skuArg || '').trim(), stores = $$('#p-stores input:checked').map(i => i.value), st = $('#p-status'), b = $('#p-search');
+  if (!sku) { st.textContent = 'Indica un SKU.'; return; }
+  if (!stores.length) { st.textContent = 'Elige al menos una tienda.'; return; }
+  b.disabled = true; st.textContent = 'Cargando precios de las tiendas…'; $('#p-result').innerHTML = '';
+  try {
+    const d = await post('/api/admin/prices/search', { sku, stores });
+    P.stores = d.stores; P.cells = new Map(); P.cols = []; const rowMap = new Map(); P.rows = [];
+    const warns = [];
+    d.stores.forEach(s => {
+      if (s.error) { warns.push(`<div class="callout err"><strong>${esc(s.store)}</strong>: ${esc(s.error)}</div>`); return; }
+      if (!s.products.length) { warns.push(`<div class="callout"><strong>${esc(s.store)}</strong>: no hay ningún producto con ese SKU.</div>`); return; }
+      if (s.products.length > 1) warns.push(`<div class="callout"><strong>${esc(s.store)}</strong>: el SKU está en ${s.products.length} productos (${esc(s.products.map(p => p.title).join(' | '))}). Se agrupan por SKU y se usa la primera variante de cada SKU.</div>`);
+      const variants = new Map(); s.products.forEach(p => p.variants.forEach(v => { if (v.sku && !variants.has(v.sku.toLowerCase())) variants.set(v.sku.toLowerCase(), { ...v, pid: p.id }); }));
+      const base = { i: P.cols.length, store: s.store, listId: null, label: 'Precio base', cur: '', first: true, title: s.products.map(p => p.title).join(' | ') };
+      P.cols.push(base);
+      const listCols = s.lists.map(l => ({ i: P.cols.length + 0, store: s.store, listId: l.id, label: l.name, cur: l.currency, fixed: l.fixed, countries: l.countries || [], draft: l.status === 'DRAFT' }));
+      listCols.forEach((c, k) => { c.i = P.cols.length; P.cols.push(c); });
+      variants.forEach((v, k) => {
+        if (!rowMap.has(k)) { rowMap.set(k, P.rows.length); P.rows.push({ sku: v.sku, title: v.title }); }
+        const r = rowMap.get(k);
+        P.cells.set(pKey(r, base.i), { vid: v.id, pid: v.pid, p: v.price, p0: v.price, c: v.compareAtPrice, c0: v.compareAtPrice, base: true });
+        s.lists.forEach((l, li) => { const f = l.prices[v.id]; const col = listCols[li]; P.cells.set(pKey(r, col.i), { vid: v.id, pid: v.pid, listId: l.id, p: f ? f.price : '', p0: f ? f.price : '', c: f ? f.compareAtPrice : '', c0: f ? f.compareAtPrice : '', cur: l.currency, baseKey: pKey(r, base.i) }); });
+      });
+    });
+    P.anchor = P.focus = null;
+    st.textContent = P.rows.length ? `${P.rows.length} variantes · ${new Set(P.cols.map(c => c.store)).size} tiendas.` : 'No se encontró ninguna variante con ese SKU.';
+    $('#p-warn').innerHTML = warns.join(''); $('#p-work').hidden = !P.rows.length; $('#p-bar').hidden = !P.rows.length;
+    priceRender();
+  } catch (err) { st.textContent = err.message; } finally { b.disabled = false; }
+}
+function priceVisible() { return P.cols.map(c => ({ ...c })); }
+function priceRender() {
+  P.vis = priceVisible(); const f = P.field, groups = [];
+  P.vis.forEach(c => { const g = groups[groups.length - 1]; if (g && g.store === c.store) g.n++; else groups.push({ store: c.store, n: 1, title: c.title }); });
+  const sepAt = new Set(); let acc = 0; groups.forEach(g => { sepAt.add(acc); acc += g.n; });
+  let h = `<table class="pg" tabindex="0" aria-label="Rejilla de precios: usa las flechas y escribe para editar"><thead><tr><th class="pg-key pg-k1" rowspan="2">SKU</th><th class="pg-key pg-k2" rowspan="2">Variante</th>`
+    + groups.map(g => `<th colspan="${g.n}" class="pg-sep" title="${esc(g.title || '')}"><span>${esc(g.store)}</span></th>`).join('') + '</tr><tr>'
+    + P.vis.map((c, i) => `<th data-pc="${i}" class="${sepAt.has(i) ? 'pg-sep' : ''}" title="${esc(c.listId ? 'Mercado ' + c.label + (c.countries.length ? ' (' + c.countries.join(', ') + ')' : '') + (c.draft ? ' · en borrador' : '') + ' — clic para seleccionar la columna' : 'Precio base de la tienda — clic para seleccionar la columna')}">${esc(c.label)}${c.cur ? ' · ' + esc(c.cur) : ''}${c.draft ? ' (borrador)' : ''}${c.countries && c.countries.length ? '<br><small>' + esc(c.countries.slice(0, 5).join(' ') + (c.countries.length > 5 ? ' …' : '')) + '</small>' : ''}</th>`).join('') + '</tr></thead><tbody>';
+  P.rows.forEach((row, r) => {
+    h += `<tr><td class="pg-key pg-k1" data-pr="${r}" title="Seleccionar toda la fila">${esc(row.sku)}</td><td class="pg-key pg-k2" data-pr="${r}" title="${esc(row.title)}">${esc(row.title === 'Default Title' ? '—' : row.title)}</td>`;
+    P.vis.forEach((c, ci) => {
+      const x = P.cells.get(pKey(r, c.i)), sep = sepAt.has(ci) ? ' pg-sep' : '';
+      if (!x) { h += `<td class="c na${sep}" data-r="${r}" data-c="${ci}" title="La variante no existe en esta tienda"></td>`; return; }
+      const v = pVal(x, f); let cls = 'c' + sep, txt = v, tip = x.err || '';
+      if (!x.base && v === '' && f === 'p') { const b = P.cells.get(x.baseKey); txt = b ? b.p : ''; cls += ' ph'; tip = tip || 'Sin precio propio: hereda el precio base'; }
+      if (x.err) cls += ' err'; else if (x.p !== x.p0 || x.c !== x.c0) cls += ' dirty';
+      h += `<td class="${cls}" data-r="${r}" data-c="${ci}"${tip ? ` title="${esc(tip)}"` : ''}>${esc(txt)}</td>`;
+    });
+    h += '</tr>';
+  });
+  $('#p-grid').innerHTML = h + '</tbody></table>'; priceSelPaint(); priceCount();
+}
+function priceRect() {
+  if (!P.anchor || !P.focus) return null;
+  return { r0: Math.min(P.anchor.r, P.focus.r), r1: Math.max(P.anchor.r, P.focus.r), c0: Math.min(P.anchor.c, P.focus.c), c1: Math.max(P.anchor.c, P.focus.c) };
+}
+function priceSelPaint() {
+  const rect = priceRect(), g = $('#p-grid'); let n = 0;
+  $$('td.c', g).forEach(td => { const r = +td.dataset.r, c = +td.dataset.c, on = rect && r >= rect.r0 && r <= rect.r1 && c >= rect.c0 && c <= rect.c1 && !td.classList.contains('na'); td.classList.toggle('sel', !!on); td.classList.toggle('cur', !!(P.focus && P.focus.r === r && P.focus.c === c)); if (on) n++; });
+  $('#p-sel').textContent = n ? `${n} ${n === 1 ? 'celda seleccionada' : 'celdas seleccionadas'}` : '';
+}
+function priceCount() { const n = pDirtyCount(); $('#p-save').disabled = !n; $('#p-save-status').textContent = n ? `${n} ${n === 1 ? 'celda modificada' : 'celdas modificadas'}.` : 'Sin cambios.'; }
+/* Calcula el nuevo valor de una celda a partir del texto escrito (admite +10%, -5%, +2, -2). Devuelve null si no es válido. */
+function priceCompute(text, cur) {
+  const t = String(text).trim().replace(',', '.');
+  if (t === '') return '';
+  let m = t.match(/^([+-])(\d+(?:\.\d+)?)%$/);
+  if (m) { if (cur === '') return null; const v = +cur * (1 + (m[1] === '-' ? -1 : 1) * +m[2] / 100); return v < 0 ? null : String(Math.round(v * 100) / 100); }
+  m = t.match(/^([+-])(\d+(?:\.\d+)?)$/);
+  if (m) { if (cur === '') return null; const v = +cur + (m[1] === '-' ? -1 : 1) * +m[2]; return v < 0 ? null : String(Math.round(v * 100) / 100); }
+  return pNum(t);
+}
+function priceSet(r, c, text) {
+  const x = pCell(r, c); if (!x) return false;
+  const v = priceCompute(text, pVal(x)); if (v === null) return false;
+  if (v === '' && x.base && P.field === 'p') return false;      // el precio base no puede quedar vacío
+  if (P.field === 'p') x.p = v; else x.c = v;
+  x.err = null; return true;
+}
+function priceApply(text) {
+  const rect = priceRect(); if (!rect) return; let bad = 0, done = 0;
+  for (let r = rect.r0; r <= rect.r1; r++) for (let c = rect.c0; c <= rect.c1; c++) { if (!pCell(r, c)) continue; if (priceSet(r, c, text)) done++; else bad++; }
+  priceRender();
+  $('#p-save-status').textContent = bad ? `${bad} celdas no se modificaron (valor no válido, precio base vacío o celda inexistente).` : '';
+  return done;
+}
+function priceOpenEdit(first) {
+  const rect = priceRect(); if (!rect || !P.focus) return;
+  const td = $(`#p-grid td.c[data-r="${P.focus.r}"][data-c="${P.focus.c}"]`); if (!td) return;
+  const wrap = $('#p-grid'), tb = td.getBoundingClientRect(), wb = wrap.getBoundingClientRect();
+  const inp = document.createElement('input'); inp.className = 'pg-edit'; inp.autocomplete = 'off'; inp.spellcheck = false; inp.setAttribute('aria-label', 'Nuevo valor para las celdas seleccionadas');
+  inp.style.left = (tb.left - wb.left + wrap.scrollLeft) + 'px'; inp.style.top = (tb.top - wb.top + wrap.scrollTop) + 'px'; inp.style.width = Math.max(tb.width, 110) + 'px'; inp.style.height = tb.height + 'px';
+  const cur = pCell(P.focus.r, P.focus.c); inp.value = first !== null ? first : (cur ? pVal(cur) : '');
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); priceCommitEdit(true, e.key === 'Enter' ? 'down' : 'right'); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); priceCommitEdit(false); }
+  });
+  inp.addEventListener('blur', () => { if (P.edit === inp) priceCommitEdit(true); });
+  wrap.appendChild(inp); P.edit = inp; inp.focus(); if (first === null) inp.select(); else inp.setSelectionRange(inp.value.length, inp.value.length);
+}
+function priceCommitEdit(apply = true, move) {
+  const inp = P.edit; if (!inp) return; P.edit = null; const text = inp.value; inp.remove();
+  if (apply) priceApply(text);
+  if (move && P.focus) { const r = Math.min(P.rows.length - 1, P.focus.r + (move === 'down' ? 1 : 0)), c = Math.min(P.vis.length - 1, P.focus.c + (move === 'right' ? 1 : 0)); P.anchor = P.focus = { r, c }; priceSelPaint(); }
+  $('#p-grid table')?.focus({ preventScroll: true });
+}
+function priceSelectAll() { if (!P.rows.length || !P.vis.length) return; priceCommitEdit(false); P.anchor = { r: 0, c: 0 }; P.focus = { r: P.rows.length - 1, c: P.vis.length - 1 }; priceSelPaint(); $('#p-grid table')?.focus({ preventScroll: true }); }
+function priceKey(e) {
+  if (e.target.classList.contains('pg-edit')) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); priceSelectAll(); return; }
+  const f = P.focus; if (!f) return;
+  const arrows = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
+  if (arrows[e.key]) {
+    e.preventDefault(); const [dr, dc] = arrows[e.key], n = { r: Math.max(0, Math.min(P.rows.length - 1, f.r + dr)), c: Math.max(0, Math.min(P.vis.length - 1, f.c + dc)) };
+    P.focus = n; if (!e.shiftKey) P.anchor = n; priceSelPaint(); $(`#p-grid td.c[data-r="${n.r}"][data-c="${n.c}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); priceSelectAll(); return; }
+  if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); priceApply(''); return; }
+  if (e.key === 'Enter' || e.key === 'F2') { e.preventDefault(); priceOpenEdit(null); return; }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key.length === 1) { e.preventDefault(); priceOpenEdit(e.key); }
+}
+async function priceSave() {
+  priceCommitEdit(); const b = $('#p-save'), st = $('#p-save-status'), dirty = [];
+  P.cells.forEach((x, k) => { if (pDirtyCell(x)) { const [r, c] = k.split('|').map(Number); dirty.push({ x, r, c }); } });
+  if (!dirty.length) return;
+  const changes = dirty.map(({ x, c }) => ({ store: P.cols[c].store, product_id: x.pid, variant_id: x.vid, list_id: x.listId || null, price: x.p, compareAtPrice: x.c }));
+  if (changes.some((ch, i) => !ch.list_id && ch.price === '')) { st.textContent = 'El precio base no puede quedar vacío.'; return; }
+  const nBase = changes.filter(c => !c.list_id).length, nList = changes.length - nBase;
+  if (!confirm(`Se van a escribir directamente en Shopify ${nBase} precios base y ${nList} precios de mercado. ¿Continuar?`)) return;
+  b.disabled = true; st.textContent = `Guardando ${changes.length} celdas en Shopify…`;
+  try {
+    const d = await post('/api/admin/prices/apply', { changes }), res = new Map(d.results.map(r => [r.store + '|' + r.variant_id + '|' + (r.list_id || ''), r])), fails = [];
+    dirty.forEach(({ x, c }) => { const r = res.get(P.cols[c].store + '|' + x.vid + '|' + (x.listId || '')); if (r && r.status === 'OK') { x.p0 = x.p; x.c0 = x.c; x.err = null; } else { x.err = (r && r.error) || 'Sin respuesta'; fails.push({ store: P.cols[c].store, col: P.cols[c].label, sku: P.rows[+(dirty.find(z => z.x === x).r)].sku, err: x.err }); } });
+    $('#p-result').innerHTML = `<div class="callout ${d.failed ? 'err' : 'ok'}"><strong>${d.ok} ${d.ok === 1 ? 'celda guardada' : 'celdas guardadas'}${d.failed ? `, ${d.failed} fallidas` : ''}.</strong></div>`
+      + (fails.length ? table(['Tienda', 'Columna', 'SKU', 'Error'], fails.map(f => `<tr><td class="nw">${esc(f.store)}</td><td class="nw">${esc(f.col)}</td><td class="nw">${esc(f.sku)}</td><td>${esc(f.err)}</td></tr>`).join('')) : '');
+    st.textContent = ''; priceRender();
+  } catch (err) { st.textContent = err.message; b.disabled = false; }
+}
+
 /* ---------- HISTORIAL ---------- */
-const KIND_ES = { 'global.apply': 'Edición multitienda', 'global.retry': 'Reintento', 'definition.create': 'Crear definición', 'product.update': 'Producto', 'variant.update': 'Variante', 'collection.update': 'Colección', 'metafield.set': 'Metacampo', 'values.apply': 'Cambio de valores' };
+const KIND_ES = { 'global.apply': 'Edición multitienda', 'global.retry': 'Reintento', 'definition.create': 'Crear definición', 'product.update': 'Producto', 'variant.update': 'Variante', 'price.update': 'Precios', 'collection.update': 'Colección', 'metafield.set': 'Metacampo', 'values.apply': 'Cambio de valores' };
 $('#hist-reload').onclick = () => loadHistory();
 async function loadHistory() {
   const box = $('#hist'), st = $('#hist-status'); st.textContent = 'Cargando…';

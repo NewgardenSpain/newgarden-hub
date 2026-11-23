@@ -3188,6 +3188,146 @@ def admin_duplicates_apply(x:AdminDupApply):
         else: results+=[{'store':r['store'],'variant_id':c.variant_id,'status':'FAILED','error':r['error']} for c in by_store[r['store']]]
     return {'results':results,'ok':sum(1 for r in results if r['status']=='OK'),'failed':sum(1 for r in results if r['status']=='FAILED')}
 
+# --- Precios: variantes de un producto en todas las tiendas, precio base y tarifas (listas de precios por mercado/catálogo) ---
+PRICE_MAX_CHANGES=2000
+PRICE_CHUNK=100
+ADMIN_PRICE_FIND='query($q:String!){productVariants(first:20,query:$q){nodes{sku product{id}}}}'
+ADMIN_PRICE_PRODUCT='query($id:ID!){product(id:$id){id title status handle variants(first:250){nodes{id sku title price compareAtPrice}}}}'
+ADMIN_PRICE_LISTS='query($after:String){catalogs(first:100,after:$after){nodes{__typename title status ... on MarketCatalog{markets(first:5){nodes{name type conditions{regionsCondition{regions(first:15){nodes{... on MarketRegionCountry{code}}}}}}}} priceList{id name currency fixedPricesCount}} pageInfo{hasNextPage endCursor}}}'
+ADMIN_PRICE_FIXED='query($id:ID!,$q:String,$after:String){priceList(id:$id){prices(first:250,originType:FIXED,query:$q,after:$after){edges{node{variant{id} price{amount} compareAtPrice{amount}}} pageInfo{hasNextPage endCursor}}}}'
+
+def admin_price_lists(st):
+    """Listas de precios de los mercados de la tienda (catálogos de mercado de tipo región). Se ignoran las tarifas B2B por empresa."""
+    out={}; after=None
+    while True:
+        data=admin_gql(st,ADMIN_PRICE_LISTS,{'after':after}).get('catalogs') or {}
+        for n in data.get('nodes',[]):
+            pl=n.get('priceList'); markets=((n.get('markets') or {}).get('nodes')) or []
+            if n.get('__typename')!='MarketCatalog' or not pl or not pl.get('currency') or pl['id'] in out: continue
+            if not markets or any(m.get('type')=='COMPANY_LOCATION' for m in markets): continue
+            countries=[r['code'] for m in markets for r in ((((m.get('conditions') or {}).get('regionsCondition') or {}).get('regions') or {}).get('nodes') or []) if r.get('code')]
+            out[pl['id']]={'id':pl['id'],'name':' + '.join(m['name'] for m in markets),'currency':pl['currency'],'fixed':pl.get('fixedPricesCount') or 0,'countries':countries,'status':n.get('status') or ''}
+        info=data.get('pageInfo') or {}
+        if not info.get('hasNextPage'): break
+        after=info.get('endCursor')
+    lists=list(out.values()); names=[l['name'] for l in lists]
+    for l in lists:
+        if names.count(l['name'])>1: l['name']+=' #'+l['id'].rsplit('/',1)[-1][-4:]   # mercados con el mismo nombre: se distinguen por la lista
+    return lists
+
+def admin_price_store(st,sku):
+    esc_sku=sku.replace('\\','\\\\').replace('"','\\"')
+    nodes=(admin_gql(st,ADMIN_PRICE_FIND,{'q':'sku:"%s"'%esc_sku}).get('productVariants') or {}).get('nodes',[])
+    pids=list(dict.fromkeys(n['product']['id'] for n in nodes if (n.get('sku') or '').strip().lower()==sku.lower() and n.get('product')))
+    if not pids: return {'products':[],'lists':[]}
+    products=[]
+    for pid in pids:
+        p=admin_gql(st,ADMIN_PRICE_PRODUCT,{'id':pid}).get('product')
+        if p: products.append({'id':p['id'],'title':p['title'],'status':p['status'],'variants':[{'id':v['id'],'sku':(v.get('sku') or '').strip(),'title':v.get('title') or '','price':_dec(v.get('price')),'compareAtPrice':_dec(v.get('compareAtPrice'))} for v in p['variants']['nodes']]})
+    lists=admin_price_lists(st)
+    for pl in lists:
+        pl['prices']={}
+        if not pl['fixed']: continue
+        for p in products:
+            pnum=p['id'].rsplit('/',1)[-1]; after=None
+            while True:
+                data=((admin_gql(st,ADMIN_PRICE_FIXED,{'id':pl['id'],'q':'product_id:'+pnum,'after':after}).get('priceList') or {}).get('prices')) or {}
+                for e in data.get('edges',[]):
+                    n=e['node']; pl['prices'][n['variant']['id']]={'price':_dec(n['price']['amount']),'compareAtPrice':_dec((n.get('compareAtPrice') or {}).get('amount'))}
+                info=data.get('pageInfo') or {}
+                if not info.get('hasNextPage'): break
+                after=info.get('endCursor')
+    return {'products':products,'lists':lists}
+
+class AdminPriceFind(BaseModel):
+    q:str
+    stores:list[str]=[]
+
+@app.post('/api/admin/prices/find')
+def admin_prices_find(x:AdminPriceFind):
+    """Busca productos por nombre o SKU (en la primera tienda elegida, prefiriendo ES) y devuelve un SKU de variante por producto para cargar sus precios."""
+    q=x.q.strip()
+    if not q: raise HTTPException(400,'Escribe un SKU o parte del nombre del producto')
+    stores=admin_stores_from(x.stores); st=next((s for s in stores if s['code']=='ES'),stores[0])
+    data=admin_gql(st,ADMIN_PRODUCTS_QUERY,{'query':admin_search_term(q),'after':None})
+    nodes=(data.get('products') or {}).get('nodes',[])
+    exact=any((v.get('sku') or '').strip().lower()==q.lower() for n in nodes for v in n['variants']['nodes'])
+    return {'store':st['code'],'exact':exact,'has_next':bool(((data.get('products') or {}).get('pageInfo') or {}).get('hasNextPage')),
+            'products':[{'title':n['title'],'status':n['status'],'sku':next((v['sku'] for v in n['variants']['nodes'] if v.get('sku')),None),'variants':len(n['variants']['nodes'])} for n in nodes if any(v.get('sku') for v in n['variants']['nodes'])]}
+
+class AdminPriceSearch(BaseModel):
+    sku:str
+    stores:list[str]=[]
+
+@app.post('/api/admin/prices/search')
+def admin_prices_search(x:AdminPriceSearch):
+    sku=x.sku.strip()
+    if not sku: raise HTTPException(400,'Indica el SKU de una variante del producto')
+    stores=admin_stores_from(x.stores)
+    results=run_per_store(stores,lambda st:admin_price_store(st,sku))
+    return {'sku':sku,'stores':[{'store':r['store'],**r['data']} if r['ok'] else {'store':r['store'],'products':[],'lists':[],'error':r['error']} for r in results]}
+
+class AdminPriceChange(BaseModel):
+    store:str
+    product_id:str
+    variant_id:str
+    list_id:str|None=None   # None = precio base de la tienda
+    price:str
+    compareAtPrice:str=''
+
+class AdminPriceApply(BaseModel):
+    changes:list[AdminPriceChange]
+
+def _price_chunks(items,n=PRICE_CHUNK):
+    for i in range(0,len(items),n): yield items[i:i+n]
+
+def admin_price_apply_store(st,rows):
+    """Aplica los cambios de precio de una tienda por grupos (producto o lista de precios). Un grupo fallido no detiene el resto."""
+    out=[]
+    groups={}
+    for r in rows: groups.setdefault((r.list_id,r.product_id if not r.list_id else None),[]).append(r)
+    for (list_id,product_id),items in groups.items():
+        def done(status,error=None):
+            out.extend({'store':st['code'],'variant_id':r.variant_id,'list_id':list_id,'status':status,**({'error':error} if error else {})} for r in items)
+        try:
+            if not list_id:
+                for chunk in _price_chunks(items):
+                    variants=[{'id':r.variant_id,'price':_dec(r.price),'compareAtPrice':_dec(r.compareAtPrice) or None} for r in chunk]
+                    admin_mutate(st,'price.update',product_id,'mutation($productId:ID!,$variants:[ProductVariantsBulkInput!]!){productVariantsBulkUpdate(productId:$productId,variants:$variants){productVariants{id} userErrors{field message}}}',{'productId':product_id,'variants':variants},'productVariantsBulkUpdate',None,{'base':{r.variant_id:{'price':_dec(r.price),'compareAtPrice':_dec(r.compareAtPrice)} for r in chunk}})
+            else:
+                currency=(admin_gql(st,'query($id:ID!){priceList(id:$id){currency}}',{'id':list_id}).get('priceList') or {}).get('currency')
+                if not currency: raise HTTPException(404,'Lista de precios no encontrada en la tienda')
+                adds=[r for r in items if _dec(r.price)!='']; dels=[r for r in items if _dec(r.price)=='']
+                if any(_dec(r.compareAtPrice)!='' for r in dels): raise HTTPException(400,'No se puede dejar precio de comparación sin precio: vacía también el de comparación')
+                for chunk in _price_chunks(adds):
+                    prices=[{'variantId':r.variant_id,'price':{'amount':_dec(r.price),'currencyCode':currency},'compareAtPrice':({'amount':_dec(r.compareAtPrice),'currencyCode':currency} if _dec(r.compareAtPrice)!='' else None)} for r in chunk]
+                    admin_mutate(st,'price.update',list_id,'mutation($id:ID!,$prices:[PriceListPriceInput!]!){priceListFixedPricesAdd(priceListId:$id,prices:$prices){prices{variant{id}} userErrors{field message}}}',{'id':list_id,'prices':prices},'priceListFixedPricesAdd',None,{'list':{r.variant_id:{'price':_dec(r.price),'compareAtPrice':_dec(r.compareAtPrice)} for r in chunk}})
+                for chunk in _price_chunks(dels):
+                    admin_mutate(st,'price.update',list_id,'mutation($id:ID!,$v:[ID!]!){priceListFixedPricesDelete(priceListId:$id,variantIds:$v){deletedFixedPriceVariantIds userErrors{field message}}}',{'id':list_id,'v':[r.variant_id for r in chunk]},'priceListFixedPricesDelete',None,{'list':{r.variant_id:'sin precio fijo (hereda el base)' for r in chunk}})
+            done('OK')
+        except HTTPException as exc: done('FAILED',str(exc.detail)[:300])
+    return out
+
+@app.post('/api/admin/prices/apply')
+def admin_prices_apply(x:AdminPriceApply):
+    if not x.changes: raise HTTPException(400,'No hay cambios que guardar')
+    if len(x.changes)>PRICE_MAX_CHANGES: raise HTTPException(400,f'Máximo {PRICE_MAX_CHANGES} cambios por operación')
+    for r in x.changes:
+        if not r.variant_id.startswith('gid://shopify/ProductVariant/') or not r.product_id.startswith('gid://shopify/Product/'): raise HTTPException(400,'Identificador no válido')
+        if r.list_id is not None and not r.list_id.startswith('gid://shopify/PriceList/'): raise HTTPException(400,'Lista de precios no válida')
+        if r.list_id is None and _dec(r.price)=='': raise HTTPException(400,'El precio base no puede quedar vacío')
+        _dec(r.compareAtPrice)
+    by_store={}
+    for r in x.changes: by_store.setdefault(r.store.strip().upper(),[]).append(r)
+    stores=admin_stores_from(list(by_store))
+    missing=[c for c in by_store if c not in {s['code'] for s in stores}]
+    if missing: raise HTTPException(400,'Tienda inactiva o sin credenciales: '+', '.join(missing))
+    results=[]
+    for r in run_per_store(stores,lambda st:admin_price_apply_store(st,by_store[st['code']])):
+        if r['ok']: results+=r['data']
+        else: results+=[{'store':r['store'],'variant_id':c.variant_id,'list_id':c.list_id,'status':'FAILED','error':r['error']} for c in by_store[r['store']]]
+    return {'results':results,'ok':sum(1 for r in results if r['status']=='OK'),'failed':sum(1 for r in results if r['status']=='FAILED')}
+
 @app.post('/api/admin/definitions/create')
 def admin_definitions_create(x:AdminDefinitionCreate):
     """Copia la definición de un metacampo desde una tienda que la tiene a las tiendas indicadas que no la tienen."""
