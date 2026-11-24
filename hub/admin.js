@@ -887,6 +887,17 @@ function catAction(e) {
 }
 
 const SKU_RES = { MATCH: ['Coincide', 'ok'], MISSING: ['Falta en destino', 'warn'], EXTRA: ['Solo en destino', 'warn'] };
+function catRulesSyncNote(rs, store) {
+  if (!rs) return '';
+  const msg = {
+    NO_RULES: 'La categoría de ES es manual: no hay condiciones que sincronizar.',
+    MANUAL_TARGET: `La homóloga de ${store} es manual: la sincronización de condiciones no se puede aplicar.`,
+    NOTHING_NEW: 'Las condiciones de etiqueta y tipo ya coinciden con las de ES: sincronizar no cambiaría nada.',
+    ALL: `Sincronizar condiciones añadiría ${rs.new.length} regla(s) (${rs.new.join('; ')}), pero la homóloga combina las reglas con «todas»: solo restringiría la colección, no añadiría productos.`,
+    ANY: rs.fixes ? `Sincronizar condiciones (${rs.new.join('; ')}) haría entrar ${rs.fixes} de los SKU que faltan (marcados abajo). Revisa la vista previa de «Condiciones» antes de aplicar.` : `Sincronizar condiciones añadiría ${rs.new.length} regla(s) (${rs.new.join('; ')}), pero ninguno de los SKU que faltan las cumple.`,
+  }[rs.state];
+  return msg ? `<div class="callout">${esc(msg)}</div>` : '';
+}
 async function catSkus(store) {
   const box = $('#c-skus'); box.hidden = false; $('#c-picker').hidden = true;
   box.innerHTML = `<p class="muted" role="status">Comparando SKU de ${esc(store)} con ES…</p>`;
@@ -897,6 +908,7 @@ async function catSkus(store) {
       + `<p>${tag('ES ' + m.master)} ${tag(store + ' ' + m.target)} ${tag(m.match + ' coinciden', 'ok')} ${tag(m.missing + ' faltan en ' + store, m.missing ? 'warn' : 'ok')} ${tag(m.extra + ' solo en ' + store, m.extra ? 'warn' : 'ok')}</p>`
       + (d.truncated ? '<div class="callout">La colección es muy grande: se compararon solo los primeros SKU.</div>' : '')
       + (d.unchecked ? `<div class="callout">${d.unchecked} SKU no se pudieron clasificar (límite de comprobación).</div>` : '')
+      + catRulesSyncNote(d.rules_sync, store)
       + (m.missing || m.extra ? `<p class="muted">${real} diferencias probablemente reales; el resto son SKU que ni existen en la tienda, que pueden ser una ausencia comercial intencionada.</p>` : '')
       + `<div class="adm-bar"><div class="field"><label for="c-sf">Mostrar</label><select id="c-sf"><option value="issues">Solo incidencias</option><option value="">Todos</option><option value="MISSING">Faltan en destino</option><option value="EXTRA">Solo en destino</option><option value="MATCH">Coinciden</option></select></div>`
       + `<a class="button secondary" href="/api/admin/categories/skus.csv?master=${enc(C.master)}&store=${enc(store)}">Exportar incidencias (CSV)</a></div><div id="c-sku-table"></div>`;
@@ -904,7 +916,7 @@ async function catSkus(store) {
       const f = $('#c-sf').value, rows = d.rows.filter(r => f === 'issues' ? r.result !== 'MATCH' : !f || r.result === f);
       $('#c-sku-table').innerHTML = rows.length ? table(['SKU', 'ES', esc(store), 'Resultado', 'Detalle'], rows.map(r => {
         const [label, cls] = SKU_RES[r.result];
-        return `<tr><td>${esc(r.sku)}</td><td>${r.result === 'EXTRA' ? 'No' : 'Sí'}</td><td>${r.result === 'MISSING' ? 'No' : 'Sí'}</td><td>${tag(label, cls)}</td><td>${esc(r.detail)}</td></tr>`;
+        return `<tr><td>${esc(r.sku)}</td><td>${r.result === 'EXTRA' ? 'No' : 'Sí'}</td><td>${r.result === 'MISSING' ? 'No' : 'Sí'}</td><td>${tag(label, cls)}</td><td>${esc(r.detail)}${r.rules_fix ? ' ' + tag('Lo resolvería sincronizar condiciones', 'ok') : ''}</td></tr>`;
       }).join('')) : '<p class="muted">Sin filas para este filtro.</p>';
     };
     $('#c-sf').onchange = draw; draw();

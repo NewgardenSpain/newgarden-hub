@@ -3712,21 +3712,42 @@ def category_active_skus(st,numeric_id):
         if page_no==CATEGORY_SKU_MAX_PAGES-1: truncated=True
     return out,truncated
 
-def category_sku_status(st,skus):
-    """{sku_en_minúsculas: estado del producto} para los SKU que existen en la tienda (el mejor estado si se repite)."""
+def category_sku_status(st,skus,details=None):
+    """{sku_en_minúsculas: estado del producto} para los SKU que existen en la tienda (el mejor estado si se repite).
+    Si se pasa `details`, se rellena con {sku: {'tags':[...],'type':...}} del producto elegido."""
     rank={'ACTIVE':0,'DRAFT':1,'ARCHIVED':2}; found={}
-    query='query($q:String!,$after:String){productVariants(first:100,query:$q,after:$after){nodes{sku product{status}} pageInfo{hasNextPage endCursor}}}'
+    query='query($q:String!,$after:String){productVariants(first:100,query:$q,after:$after){nodes{sku product{status tags productType}} pageInfo{hasNextPage endCursor}}}'
     for i in range(0,len(skus),10):
         q=' OR '.join('sku:"%s"'%x.replace('\\','\\\\').replace('"','\\"') for x in skus[i:i+10]); after=None
         while True:
             data=admin_gql(st,query,{'q':q,'after':after}).get('productVariants') or {}
             for n in data.get('nodes',[]):
                 key=(n.get('sku') or '').strip().lower(); status=(n.get('product') or {}).get('status') or 'DRAFT'
-                if key and (key not in found or rank.get(status,9)<rank.get(found[key],9)): found[key]=status
+                if key and (key not in found or rank.get(status,9)<rank.get(found[key],9)):
+                    found[key]=status
+                    if details is not None: details[key]={'tags':[t.lower() for t in (n['product'].get('tags') or [])],'type':(n['product'].get('productType') or '').strip().lower()}
             info=data.get('pageInfo') or {}
             if not info.get('hasNextPage') or not info.get('endCursor'): break
             after=info['endCursor']
     return found
+
+def category_rules_sync_prediction(ms,master_gid,st,target_gid):
+    """Qué haría la sincronización de «Condiciones» (fase 3) en la homóloga, sin escribir: {state, new, disjunctive, positives}.
+    state: NO_RULES (ES manual) | MANUAL_TARGET (homóloga manual) | NOTHING_NEW | ALL (reglas «todas»: solo restringen) | ANY (reglas «cualquiera»: pueden añadir productos)."""
+    src=admin_gql(ms,CATEGORY_EDIT_READ,{'id':master_gid}).get('collection') or {}
+    tgt=admin_gql(st,CATEGORY_EDIT_READ,{'id':target_gid}).get('collection') or {}
+    if not src.get('ruleSet'): return {'state':'NO_RULES','new':[],'positives':[]}
+    if not tgt.get('ruleSet'): return {'state':'MANUAL_TARGET','new':[],'positives':[]}
+    have={category_rule_key(r) for r in tgt['ruleSet']['rules']}
+    new=[r for r in src['ruleSet']['rules'] if r['column'] in CATEGORY_RULE_COLUMNS and (r.get('conditionObject') or {}).get('__typename')=='CollectionRuleTextCondition' and category_rule_key(r) not in have]
+    if not new: return {'state':'NOTHING_NEW','new':[],'positives':[]}
+    disj=bool(tgt['ruleSet']['appliedDisjunctively'])
+    positives=[r for r in new if r['relation']=='EQUALS' and r['column'] in ('TAG','TYPE')]
+    return {'state':'ANY' if disj else 'ALL','new':[category_rule_text(r) for r in new],'positives':positives}
+
+def category_rule_covers(rule,detail):
+    cond=(rule.get('condition') or '').strip().lower()
+    return cond in detail['tags'] if rule['column']=='TAG' else detail['type']==cond
 
 def category_sku_diff(master_gid,store_code):
     """Compara los SKU de los productos activos de la categoría maestra con los de su homóloga vinculada."""
@@ -3741,19 +3762,26 @@ def category_sku_diff(master_gid,store_code):
     (m,m_trunc),(t,t_trunc)=category_active_skus(ms,master_id),category_active_skus(st,target_id)
     missing=sorted(set(m)-set(t)); extra=sorted(set(t)-set(m)); match=sorted(set(m)&set(t))
     rows=[]; unchecked=0
-    in_store=category_sku_status(st,[m[k] for k in missing[:CATEGORY_SKU_RESOLVE_MAX]])
+    details={}
+    in_store=category_sku_status(st,[m[k] for k in missing[:CATEGORY_SKU_RESOLVE_MAX]],details)
+    try: sync=category_rules_sync_prediction(ms,master_gid,st,link[0])
+    except Exception: logging.getLogger('hub.admin').exception('No se pudo predecir la sincronización de reglas'); sync=None
+    fixes=0
     for i,k in enumerate(missing):
         if i>=CATEGORY_SKU_RESOLVE_MAX: code='UNCHECKED'; unchecked+=1
         elif k not in in_store: code='NOT_IN_STORE'
         else: code='OUTSIDE_COLLECTION' if in_store[k]=='ACTIVE' else 'NOT_ACTIVE'
-        rows.append({'sku':m[k],'result':'MISSING','code':code,'detail':CATEGORY_DETAIL[code]})
+        row={'sku':m[k],'result':'MISSING','code':code,'detail':CATEGORY_DETAIL[code]}
+        if code=='OUTSIDE_COLLECTION' and sync and sync['state']=='ANY' and any(category_rule_covers(r,details[k]) for r in sync['positives']):
+            row['rules_fix']=True; fixes+=1
+        rows.append(row)
     in_es=category_sku_status(ms,[t[k] for k in extra[:CATEGORY_SKU_RESOLVE_MAX]])
     for i,k in enumerate(extra):
         if i>=CATEGORY_SKU_RESOLVE_MAX: code='UNCHECKED'; unchecked+=1
         else: code='ELSEWHERE_IN_ES' if k in in_es else 'NOT_IN_ES'
         rows.append({'sku':t[k],'result':'EXTRA','code':code,'detail':CATEGORY_DETAIL[code]})
     rows+=[{'sku':m[k],'result':'MATCH','code':'','detail':''} for k in match]
-    return {'store':st['code'],'summary':{'master':len(m),'target':len(t),'match':len(match),'missing':len(missing),'extra':len(extra)},'rows':rows,'truncated':m_trunc or t_trunc,'unchecked':unchecked}
+    return {'store':st['code'],'summary':{'master':len(m),'target':len(t),'match':len(match),'missing':len(missing),'extra':len(extra)},'rows':rows,'truncated':m_trunc or t_trunc,'unchecked':unchecked,'rules_sync':({'state':sync['state'],'new':sync['new'],'fixes':fixes} if sync else None)}
 
 @app.get('/api/admin/categories/skus')
 def category_skus(master:str,store:str):
@@ -3782,7 +3810,7 @@ def category_skus_csv(master:str,store:str=''):
     for r in results:
         if not r['ok']: w.writerow([category_csv_cell(title),r['store'],'','Error',category_csv_cell(r['error'])]); continue
         for row in r['data']['rows']:
-            if row['result']!='MATCH': w.writerow([category_csv_cell(title),r['store'],category_csv_cell(row['sku']),CATEGORY_CSV_RESULT[row['result']],row['detail']])
+            if row['result']!='MATCH': w.writerow([category_csv_cell(title),r['store'],category_csv_cell(row['sku']),CATEGORY_CSV_RESULT[row['result']],row['detail']+(' · Lo resolvería sincronizar las condiciones' if row.get('rules_fix') else '')])
     import unicodedata
     name=re.sub(r'[^A-Za-z0-9_-]+','_',unicodedata.normalize('NFKD',title).encode('ascii','ignore').decode()).strip('_') or 'categoria'
     return Response('\ufeff'+out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="incidencias_sku_{name}.csv"'})
