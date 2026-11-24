@@ -1000,12 +1000,63 @@ def translate_cell(x:CellTranslateRequest,user=Depends(operator)):
             result=translate_cell(leaf,user)
             memory_hits+=bool(result.get('memory_hit')); glossary_terms+=int(result.get('glossary_terms',0)); translated_nodes+=1
             return result['translation']
+        import html as rt_html
+        from html.parser import HTMLParser
+        def is_text(n): return isinstance(n,dict) and n.get('type')=='text' and isinstance(n.get('value'),str)
+        def is_inline(n): return is_text(n) or (isinstance(n,dict) and n.get('type')=='link' and isinstance(n.get('children'),list) and all(is_text(c) for c in n['children']))
+        def inline_html(children):
+            def wrap(t):
+                out=rt_html.escape(t['value'],quote=False)
+                if t.get('italic'): out='<i>'+out+'</i>'
+                if t.get('bold'): out='<b>'+out+'</b>'
+                return out
+            return ''.join(wrap(c) if is_text(c) else '<a>'+''.join(wrap(t) for t in c['children'])+'</a>' for c in children)
+        def parse_inline(markup,links):
+            """HTML traducido -> nodos inline de Shopify; None si las etiquetas no cuadran (se usa el modo por fragmentos)."""
+            out=[]; flags=[]; state={'link':None,'n':0,'ok':True}
+            class P(HTMLParser):
+                def handle_starttag(self,tag,attrs):
+                    if tag in ('b','strong'): flags.append('bold')
+                    elif tag in ('i','em'): flags.append('italic')
+                    elif tag=='a':
+                        if state['link'] is not None or state['n']>=len(links): state['ok']=False; return
+                        state['link']={**{k:v for k,v in links[state['n']].items() if k!='children'},'children':[]}; state['n']+=1; flags.append('a')
+                    else: state['ok']=False
+                def handle_endtag(self,tag):
+                    want={'b':'bold','strong':'bold','i':'italic','em':'italic','a':'a'}.get(tag)
+                    if not want or not flags or flags[-1]!=want: state['ok']=False; return
+                    flags.pop()
+                    if want=='a': out.append(state['link']); state['link']=None
+                def handle_data(self,data):
+                    if not data: return
+                    node={'type':'text','value':data}
+                    if 'bold' in flags: node['bold']=True
+                    if 'italic' in flags: node['italic']=True
+                    (state['link']['children'] if state['link'] is not None else out).append(node)
+            parser=P(convert_charrefs=True); parser.feed(markup); parser.close()
+            if not state['ok'] or flags or state['n']!=len(links): return None
+            return out
+        def translate_inline(children):
+            links=[c for c in children if not is_text(c)]
+            if not any(t['value'].strip() for t in ([c for c in children if is_text(c)]+[t for l in links for t in l['children']])): return children
+            nonlocal memory_hits,glossary_terms,translated_nodes
+            req=CellTranslateRequest(source_text=inline_html(children),source_store=x.source_store,source_locale=x.source_locale,target_store=x.target_store,target_locale=x.target_locale,field_key='metafield_text',html=True)
+            result=translate_cell(req,user)
+            parsed=parse_inline(result['translation'],links)
+            if parsed is None: return None
+            memory_hits+=bool(result.get('memory_hit')); glossary_terms+=int(result.get('glossary_terms',0)); translated_nodes+=1
+            return parsed
         def walk_text_nodes(node):
             if isinstance(node,dict):
-                if node.get('type')=='text' and isinstance(node.get('value'),str):
+                if is_text(node):
                     node['value']=translate_leaf(node['value'])
-                else:
-                    for child in node.values(): walk_text_nodes(child)
+                    return
+                kids=node.get('children')
+                if isinstance(kids,list) and kids and all(is_inline(c) for c in kids) and node.get('type')!='link':
+                    # Se traduce el párrafo entero (con negritas, cursivas y enlaces como etiquetas) para que DeepL vea la frase completa.
+                    new=translate_inline(kids)
+                    if new is not None: node['children']=new; return
+                for child in node.values(): walk_text_nodes(child)
             elif isinstance(node,list):
                 for child in node: walk_text_nodes(child)
         if x.metafield_type=='rich_text_field':
