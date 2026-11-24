@@ -2367,6 +2367,10 @@ class CollectionTranslate(BaseModel):
         if bad: raise ValueError('Campo no válido: '+', '.join(bad))
         return list(dict.fromkeys(value))
 
+def mf_key_variants(key:str)->list[str]:
+    """La misma clave con y sin guion bajo final: en algunas tiendas (p. ej. UK) el metacampo se llama «seo_text_collections_page_»."""
+    return [key,key[:-1] if key.endswith('_') else key+'_']
+
 def collection_value(collection:dict,key:str)->str:
     if key.startswith('seo.'): return (collection.get('seo') or {}).get(key[4:]) or ''
     return collection.get(key) or ''
@@ -2468,17 +2472,19 @@ def collections_translate(x:CollectionTranslate,user=Depends(operator)):
     # Metacampos: se traducen primero todos (si algo falla en DeepL no se escribe nada a medias).
     src_mf={f"{m['namespace']}.{m['key']}":m for m in (src.get('metafields') or {}).get('nodes',[])}
     dst_mf={f"{m['namespace']}.{m['key']}":m for m in (dst.get('metafields') or {}).get('nodes',[])}
-    mf_translated={}; mf_notes=[]
+    mf_translated={}; mf_notes=[]; dst_key={}
     for key in x.metafields:
         m=src_mf.get(key)
         if not m or not (m.get('value') or '').strip(): mf_notes.append({'key':key,'reason':'Sin valor en la colección de origen'}); continue
         if m['type'] not in COLLECTION_MF_TEXT_TYPES: mf_notes.append({'key':key,'reason':f'Tipo «{m["type"]}» no traducible'}); continue
         req=CellTranslateRequest(source_text=m['value'],source_store=x.source_store,source_locale=source_locale,target_store=x.target_store,target_locale=target_locale,field_key='metafield_text',metafield_type=m['type'],html=False)
         mf_translated[key]=(m,translate_cell(req,user)['translation'])
+        dst_key[key]=next((k for k in mf_key_variants(key) if k in dst_mf),key)
     if not translated and not mf_translated: raise HTTPException(400,'La colección origen no tiene contenido en los campos elegidos')
     gid=dst['id']; primary=bool(locale_info.get('primary')); mode='base' if primary else 'translation'
     def check(result):
         errors=(result or {}).get('userErrors',[])
+        if errors: logging.getLogger('hub.collections').warning('userErrors en %s: %s',x.target_store,errors)
         if errors: raise HTTPException(400,'Shopify: '+'; '.join(e.get('message','error') for e in errors)[:500])
     if translated and primary:
         collection={'id':gid}
@@ -2507,12 +2513,14 @@ def collections_translate(x:CollectionTranslate,user=Depends(operator)):
         defs={(d['namespace'],d['key']):(d.get('type') or {}).get('name') for d in (shopify_graphql(target['domain'],target['token'],'query{metafieldDefinitions(ownerType:COLLECTION,first:100){nodes{namespace key type{name}}}}').get('metafieldDefinitions') or {}).get('nodes',[])}
         entries=[]
         for key,(m,value) in mf_translated.items():
-            if defs.get((m['namespace'],m['key']))!=m['type']: mf_notes.append({'key':key,'reason':f'La tienda {x.target_store} no tiene el metacampo definido como «{m["type"]}»'}); continue
-            entries.append({'ownerId':gid,'namespace':m['namespace'],'key':m['key'],'type':m['type'],'value':value}); mf_done.append(key)
+            dk=next((k for k in [dst_key[key]]+mf_key_variants(key) if defs.get(tuple(k.split('.',1)))==m['type']),None)
+            if not dk: mf_notes.append({'key':key,'reason':f'La tienda {x.target_store} no tiene el metacampo definido como «{m["type"]}»'}); continue
+            ns,kk=dk.split('.',1)
+            entries.append({'ownerId':gid,'namespace':ns,'key':kk,'type':m['type'],'value':value}); mf_done.append(key)
         if entries: check(shopify_graphql(target['domain'],target['token'],'mutation($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){metafields{id} userErrors{field message}}}',{'m':entries}).get('metafieldsSet'))
     elif mf_translated:
         for key,(m,value) in mf_translated.items():
-            mid=(dst_mf.get(key) or {}).get('id')
+            mid=(dst_mf.get(dst_key[key]) or {}).get('id')
             if not mid: mf_notes.append({'key':key,'reason':'La colección destino no tiene este metacampo en su idioma base'}); continue
             res=shopify_graphql(target['domain'],target['token'],'query($id:ID!){translatableResource(resourceId:$id){translatableContent{key digest}}}',{'id':mid}).get('translatableResource') or {}
             digest=next((i['digest'] for i in res.get('translatableContent',[]) if i['key']=='value'),None)
@@ -2523,7 +2531,7 @@ def collections_translate(x:CollectionTranslate,user=Depends(operator)):
     logging.getLogger('hub.collections').info('Colección %s/%s -> %s/%s (%s, %s): campos=%s metacampos=%s',x.source_store,x.source_collection_id,x.target_store,x.target_collection_id,target_locale,mode,list(translated),mf_done)
     return {'saved':True,'mode':mode,'target_locale':target_locale,'source_title':src['title'],'target_title_before':dst['title'],
         'fields':[{'key':k,'label':COLLECTION_FIELDS[k],'before':collection_value(dst,k),'source':collection_value(src,k),'after':v} for k,v in translated.items()],
-        'metafields':[{'key':k,'label':k,'before':(dst_mf.get(k) or {}).get('value') or '','source':mf_translated[k][0]['value'],'after':mf_translated[k][1]} for k in mf_done],
+        'metafields':[{'key':k,'label':k,'before':(dst_mf.get(dst_key.get(k,k)) or {}).get('value') or '','source':mf_translated[k][0]['value'],'after':mf_translated[k][1]} for k in mf_done],
         'metafield_notes':mf_notes,
         'skipped':[COLLECTION_FIELDS[k] for k in skipped]}
 
