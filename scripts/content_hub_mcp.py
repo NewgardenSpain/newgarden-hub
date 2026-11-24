@@ -172,7 +172,7 @@ def handle(msg):
     if method == "tools/call":
         try:
             result = call_tool(params.get("name"), params.get("arguments") or {})
-            response={"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, default=str)}], "structuredContent": result}
+            response={"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, default=str)}], "structuredContent": result if isinstance(result, dict) else {"result": result}}
             if has_shopify_errors(result): response["isError"]=True
             return response
         except Exception as exc:
