@@ -3315,6 +3315,125 @@ def admin_duplicates_apply(x:AdminDupApply):
         else: results+=[{'store':r['store'],'variant_id':c.variant_id,'status':'FAILED','error':r['error']} for c in by_store[r['store']]]
     return {'results':results,'ok':sum(1 for r in results if r['status']=='OK'),'failed':sum(1 for r in results if r['status']=='FAILED')}
 
+# --- Rejilla multitienda: referencias y productos en una tabla editable (SKU, títulos, estado, peso…) ---
+GRID_MAX_ROWS=1500
+GRID_VARIANT_GQL='id sku barcode title taxable inventoryPolicy selectedOptions{name value} inventoryItem{tracked requiresShipping measurement{weight{value unit}}} product{id title status vendor productType}'
+ADMIN_GRID_QUERY='query($q:String!,$after:String){productVariants(first:100,query:$q,after:$after){nodes{'+GRID_VARIANT_GQL+'} pageInfo{hasNextPage endCursor}}}'
+ADMIN_GRID_PRODUCT='query($id:ID!,$after:String){product(id:$id){variants(first:100,after:$after){nodes{'+GRID_VARIANT_GQL+'} pageInfo{hasNextPage endCursor}}}}'
+GRID_VARIANT_FIELDS={'sku','barcode','weight','weightUnit','taxable','inventoryPolicy','tracked','requiresShipping'}
+GRID_PRODUCT_FIELDS={'title','vendor','productType','status'}
+
+def admin_grid_row(n,matched):
+    item=n.get('inventoryItem') or {}; weight=((item.get('measurement') or {}).get('weight')) or {}; p=n.get('product') or {}
+    return {'variant_id':n['id'],'product_id':p.get('id'),'matched':matched,'sku':(n.get('sku') or '').strip(),'barcode':n.get('barcode') or '','variant_title':n.get('title') or '',
+            'options':len(n.get('selectedOptions') or []),'product_title':p.get('title') or '','status':p.get('status') or '','vendor':p.get('vendor') or '','product_type':p.get('productType') or '',
+            'weight':_dec(weight.get('value')),'weightUnit':weight.get('unit') or 'KILOGRAMS','taxable':bool(n.get('taxable')),'inventoryPolicy':n.get('inventoryPolicy') or 'DENY',
+            'tracked':bool(item.get('tracked')),'requiresShipping':bool(item.get('requiresShipping'))}
+
+def admin_grid_store(st,skus,whole):
+    wanted={s.lower() for s in skus}; rows={}; products=[]
+    for i in range(0,len(skus),10):
+        q=' OR '.join('sku:"%s"'%s.replace('\\','\\\\').replace('"','\\"') for s in skus[i:i+10]); after=None
+        while True:
+            data=admin_gql(st,ADMIN_GRID_QUERY,{'q':q,'after':after}).get('productVariants') or {}
+            for n in data.get('nodes',[]):
+                if (n.get('sku') or '').strip().lower() in wanted:
+                    rows[n['id']]=admin_grid_row(n,True)
+                    pid=(n.get('product') or {}).get('id')
+                    if pid and pid not in products: products.append(pid)
+            info=data.get('pageInfo') or {}
+            if not info.get('hasNextPage') or not info.get('endCursor'): break
+            after=info['endCursor']
+    truncated=False
+    if whole:
+        for pid in products:
+            after=None
+            while True:
+                page=((admin_gql(st,ADMIN_GRID_PRODUCT,{'id':pid,'after':after}).get('product') or {}).get('variants')) or {}
+                for n in page.get('nodes',[]):
+                    if n['id'] not in rows: rows[n['id']]=admin_grid_row(n,False)
+                info=page.get('pageInfo') or {}
+                if not info.get('hasNextPage') or not info.get('endCursor'): break
+                after=info['endCursor']
+            if len(rows)>=GRID_MAX_ROWS: truncated=True; break
+    order=lambda r:(r['product_title'].lower(),r['product_id'] or '',r['sku'].lower())
+    out=sorted(rows.values(),key=order)
+    if len(out)>GRID_MAX_ROWS: out=out[:GRID_MAX_ROWS]; truncated=True
+    return {'rows':out,'truncated':truncated}
+
+class AdminGridSearch(BaseModel):
+    skus:list[str]
+    stores:list[str]=[]
+    whole_products:bool=False
+
+@app.post('/api/admin/grid/search')
+def admin_grid_search(x:AdminGridSearch):
+    skus=list(dict.fromkeys(s.strip() for s in x.skus if s.strip()))
+    if not skus: raise HTTPException(400,'Indica al menos un SKU')
+    if len(skus)>GLOBAL_MAX_SKUS: raise HTTPException(400,f'Máximo {GLOBAL_MAX_SKUS} SKU por búsqueda')
+    stores=admin_stores_from(x.stores)
+    results=run_per_store(stores,lambda st:admin_grid_store(st,skus,x.whole_products))
+    return {'skus':skus,'stores':[{'store':r['store'],**r['data']} if r['ok'] else {'store':r['store'],'rows':[],'error':r['error']} for r in results]}
+
+class AdminGridChange(BaseModel):
+    store:str
+    variant_id:str
+    product_id:str
+    variant:dict={}
+    variant_title:str|None=None
+    product:dict={}
+
+class AdminGridApply(BaseModel):
+    changes:list[AdminGridChange]
+
+def admin_grid_apply_store(st,rows):
+    """Aplica en una tienda los cambios de la rejilla. Cada producto se actualiza una sola vez; un fallo no detiene el resto."""
+    out=[]; product_state={}
+    for r in rows:
+        try:
+            changed=[]
+            if r.product:
+                if r.product_id not in product_state:
+                    merged={}
+                    for o in rows:
+                        if o.product_id==r.product_id: merged.update(o.product)
+                    try: product_state[r.product_id]=admin_product_update(AdminEntityUpdate(store=st['code'],id=r.product_id,fields=merged))['changed']
+                    except HTTPException as exc: product_state[r.product_id]=exc
+                res=product_state[r.product_id]
+                if isinstance(res,HTTPException): raise res
+                changed+=['product_'+k for k in res]
+            if r.variant:
+                changed+=admin_variant_update(AdminVariantUpdate(store=st['code'],id=r.variant_id,fields=r.variant))['changed']
+            if r.variant_title is not None: changed+=admin_variant_title_update(st,r.variant_id,r.variant_title)
+            out.append({'store':st['code'],'variant_id':r.variant_id,'status':'OK' if changed else 'UNCHANGED','changed':changed})
+        except HTTPException as exc:
+            out.append({'store':st['code'],'variant_id':r.variant_id,'status':'FAILED','error':str(exc.detail)[:300]})
+    return out
+
+@app.post('/api/admin/grid/apply')
+def admin_grid_apply(x:AdminGridApply):
+    if not x.changes: raise HTTPException(400,'No hay cambios que guardar')
+    if len(x.changes)>DUP_MAX_CHANGES: raise HTTPException(400,f'Máximo {DUP_MAX_CHANGES} filas por operación')
+    for r in x.changes:
+        if not r.variant_id.startswith('gid://shopify/ProductVariant/'): raise HTTPException(400,'Identificador de variante no válido')
+        if not r.product_id.startswith('gid://shopify/Product/'): raise HTTPException(400,'Identificador de producto no válido')
+        if not (r.variant or r.product or r.variant_title is not None): raise HTTPException(400,'Cambio vacío')
+        bad=[k for k in r.variant if k not in GRID_VARIANT_FIELDS]+[k for k in r.product if k not in GRID_PRODUCT_FIELDS]
+        if bad: raise HTTPException(400,'Campos no editables en la rejilla: '+', '.join(bad))
+        if 'sku' in r.variant and not _text(r.variant['sku']).strip(): raise HTTPException(400,'El SKU no puede quedar vacío')
+        if 'weight' in r.variant and _dec(r.variant['weight'])=='': raise HTTPException(400,'El peso no puede quedar vacío')
+        if 'title' in r.product and not _text(r.product['title']).strip(): raise HTTPException(400,'El título del producto no puede estar vacío')
+    by_store={}
+    for r in x.changes: by_store.setdefault(r.store.strip().upper(),[]).append(r)
+    stores=admin_stores_from(list(by_store))
+    missing=[c for c in by_store if c not in {s['code'] for s in stores}]
+    if missing: raise HTTPException(400,'Tienda inactiva o sin credenciales: '+', '.join(missing))
+    results=[]
+    for r in run_per_store(stores,lambda st:admin_grid_apply_store(st,by_store[st['code']])):
+        if r['ok']: results+=r['data']
+        else: results+=[{'store':r['store'],'variant_id':c.variant_id,'status':'FAILED','error':r['error']} for c in by_store[r['store']]]
+    return {'results':results,'ok':sum(1 for r in results if r['status']=='OK'),'failed':sum(1 for r in results if r['status']=='FAILED')}
+
 # --- Precios: variantes de un producto en todas las tiendas, precio base y tarifas (listas de precios por mercado/catálogo) ---
 PRICE_MAX_CHANGES=2000
 PRICE_CHUNK=100

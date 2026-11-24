@@ -178,3 +178,8 @@ ul.plain { margin: 0; padding-left: 1.1em; }
 .pg thead tr:nth-child(1) th.pg-sep > span { position: sticky; left: 400px; display: inline-block; padding: 0 10px; }
 .pg thead th small { font: 400 10px var(--mono); color: var(--muted); }
 .pg thead tr:nth-child(2) th { top: 33px; }
+.pg.tx td.c { text-align: left; min-width: 80px; }
+.pg.tx td.c.num { text-align: right; }
+.pg.tx td.c.errrow { background: #fbe3e1; }
+.pg.tx td.c.sel { background: #dbe9ff; }
+.pg.tx thead th { top: 0; }

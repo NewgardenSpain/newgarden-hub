@@ -627,7 +627,7 @@ function setScope(s) {
 }
 function parseSkus() { return [...new Set($('#g-skus').value.split(/[\n,;]+/).map(x => x.trim()).filter(Boolean))]; }
 function goMulti(owner, namespace, key) {
-  showTab('varias'); setScope(owner === 'PRODUCT' ? 'product' : 'variant');
+  showTab('varias'); setScope(owner === 'PRODUCT' ? 'product' : 'variant'); $('#g-legacy').open = true;
   const id = `m:${namespace}.${key}`;
   const go = () => { $('#g-changes').innerHTML = ''; addChange(id); $('#g-skus').focus(); };
   state.defs ? go() : loadDefs().then(go);
@@ -643,7 +643,7 @@ function initMulti() {
   $('#g-add').onclick = () => { const r = addChange(); $('input', r).focus(); };
   $('#g-preview').onclick = e => runGlobal('/api/admin/global/preview', e.target, false);
   $('#g-apply').onclick = e => runGlobal('/api/admin/global/apply', e.target, true);
-  setScope('product'); loadDefs().catch(() => {});
+  setScope('product'); loadDefs().catch(() => {}); initGrid();
 }
 /* Búsqueda por nombre y control de SKU repetidos */
 const gStores = () => $$('#g-stores input:checked').map(i => i.value);
@@ -1218,6 +1218,176 @@ async function priceSave() {
     $('#p-result').innerHTML = `<div class="callout ${d.failed ? 'err' : 'ok'}"><strong>${d.ok} ${d.ok === 1 ? 'celda guardada' : 'celdas guardadas'}${d.failed ? `, ${d.failed} fallidas` : ''}.</strong></div>`
       + (fails.length ? table(['Tienda', 'Columna', 'SKU', 'Error'], fails.map(f => `<tr><td class="nw">${esc(f.store)}</td><td class="nw">${esc(f.col)}</td><td class="nw">${esc(f.sku)}</td><td>${esc(f.err)}</td></tr>`).join('')) : '');
     st.textContent = ''; priceRender();
+  } catch (err) { st.textContent = err.message; b.disabled = false; }
+}
+
+/* ---------- REJILLA MULTITIENDA (Varias tiendas, tipo Excel) ---------- */
+const BOOL_COL = [[true, 'Sí'], [false, 'No']];
+const XCOLS = [
+  { k: 'sku', label: 'SKU', t: 'text', req: true, w: 150 },
+  { k: 'barcode', label: 'Código de barras', t: 'text', w: 140 },
+  { k: 'variant_title', label: 'Variante', t: 'text', req: true, w: 150 },
+  { k: 'product_title', label: 'Producto', t: 'text', req: true, prod: 'title', w: 260 },
+  { k: 'status', label: 'Estado', t: 'enum', prod: 'status', opts: [['ACTIVE', 'Activo'], ['DRAFT', 'Borrador'], ['ARCHIVED', 'Archivado']], w: 100 },
+  { k: 'vendor', label: 'Proveedor', t: 'text', prod: 'vendor', w: 130 },
+  { k: 'product_type', label: 'Tipo de producto', t: 'text', prod: 'productType', w: 150 },
+  { k: 'weight', label: 'Peso', t: 'num', req: true, w: 80 },
+  { k: 'weightUnit', label: 'Unidad', t: 'enum', opts: [['KILOGRAMS', 'kg'], ['GRAMS', 'g'], ['POUNDS', 'lb'], ['OUNCES', 'oz']], w: 80 },
+  { k: 'taxable', label: 'Impuestos', t: 'bool', opts: BOOL_COL, w: 90 },
+  { k: 'inventoryPolicy', label: 'Si no hay stock', t: 'enum', opts: [['DENY', 'Dejar de vender'], ['CONTINUE', 'Seguir vendiendo']], w: 140 },
+  { k: 'tracked', label: 'Seguimiento', t: 'bool', opts: BOOL_COL, w: 100 },
+  { k: 'requiresShipping', label: 'Envío', t: 'bool', opts: BOOL_COL, w: 80 },
+];
+const X = { inited: false, rows: [], anchor: null, focus: null, drag: false, edit: null };
+const xShow = (c, v) => c.opts ? ((c.opts.find(o => o[0] === v) || [])[1] ?? String(v ?? '')) : String(v ?? '');
+const xDirty = (r, c) => r.v[c.k] !== r.v0[c.k];
+const xRowDirty = r => XCOLS.some(c => xDirty(r, c));
+const xDirtyRows = () => X.rows.filter(xRowDirty);
+/* Convierte el texto escrito al valor de la columna. Devuelve undefined si no es válido. */
+function xParse(c, text) {
+  const t = String(text ?? '').trim();
+  if (c.t === 'text') return c.req && t === '' ? undefined : t;
+  if (c.t === 'num') { const n = pNum(t); return n === null || n === '' ? undefined : n; }
+  const q = norm(t);
+  if (c.t === 'bool') { if (['si', 's', 'true', '1', 'yes', 'y'].includes(q)) return true; if (['no', 'n', 'false', '0'].includes(q)) return false; return undefined; }
+  const o = c.opts.find(o => norm(o[0]) === q || norm(o[1]) === q); return o ? o[0] : undefined;
+}
+function xSet(r, ci, text) {
+  const row = X.rows[r], c = XCOLS[ci]; if (!row) return false;
+  const v = xParse(c, text); if (v === undefined) return false;
+  const apply = x => { x.v[c.k] = v; x.err = null; };
+  if (c.prod) X.rows.forEach(x => { if (x.store === row.store && x.product_id === row.product_id) apply(x); }); else apply(row);
+  return true;
+}
+function xRect() { return X.anchor && X.focus ? { r0: Math.min(X.anchor.r, X.focus.r), r1: Math.max(X.anchor.r, X.focus.r), c0: Math.min(X.anchor.c, X.focus.c), c1: Math.max(X.anchor.c, X.focus.c) } : null; }
+function xApply(text) {
+  const rect = xRect(); if (!rect) return; let bad = 0;
+  for (let r = rect.r0; r <= rect.r1; r++) for (let c = rect.c0; c <= rect.c1; c++) if (!xSet(r, c, text)) bad++;
+  xRender(); $('#x-save-status').textContent = bad ? `${bad} celdas no se modificaron (valor no válido o campo obligatorio vacío).` : '';
+}
+function xRender() {
+  let h = `<table class="pg tx" tabindex="0" aria-label="Rejilla de variantes: usa las flechas y escribe para editar"><thead><tr><th class="pg-key pg-k1">Tienda</th>${XCOLS.map((c, i) => `<th data-xc="${i}" style="min-width:${c.w}px" title="Clic para seleccionar la columna">${esc(c.label)}${c.prod ? '<br><small>producto</small>' : ''}</th>`).join('')}</tr></thead><tbody>`;
+  X.rows.forEach((row, r) => {
+    h += `<tr><td class="pg-key pg-k1" data-xr="${r}" title="${esc(row.matched ? 'Seleccionar toda la fila' : 'Variante del mismo producto (no estaba en la lista de SKU). Clic para seleccionar la fila')}">${esc(row.store)}${row.matched ? '' : ' <small>+</small>'}</td>`;
+    XCOLS.forEach((c, ci) => {
+      let cls = 'c' + (c.t === 'num' ? ' num' : ''); if (xDirty(row, c)) cls += ' dirty'; if (row.err) cls += ' errrow';
+      h += `<td class="${cls}" data-r="${r}" data-c="${ci}"${row.err ? ` title="${esc(row.err)}"` : ''}>${esc(xShow(c, row.v[c.k]))}</td>`;
+    });
+    h += '</tr>';
+  });
+  $('#x-grid').innerHTML = h + '</tbody></table>'; xSelPaint(); xCount();
+}
+function xSelPaint() {
+  const rect = xRect(); let n = 0;
+  $$('#x-grid td.c').forEach(td => { const r = +td.dataset.r, c = +td.dataset.c, on = rect && r >= rect.r0 && r <= rect.r1 && c >= rect.c0 && c <= rect.c1; td.classList.toggle('sel', !!on); td.classList.toggle('cur', !!(X.focus && X.focus.r === r && X.focus.c === c)); if (on) n++; });
+  $('#x-sel').textContent = n ? `${n} ${n === 1 ? 'celda seleccionada' : 'celdas seleccionadas'}` : '';
+}
+function xCount() { const n = xDirtyRows().length; $('#x-save').disabled = !n; $('#x-save-status').textContent = n ? `${n} ${n === 1 ? 'variante modificada' : 'variantes modificadas'}.` : 'Sin cambios.'; }
+function xOpenEdit(first) {
+  if (!X.focus) return; const td = $(`#x-grid td.c[data-r="${X.focus.r}"][data-c="${X.focus.c}"]`); if (!td) return;
+  const wrap = $('#x-grid'), tb = td.getBoundingClientRect(), wb = wrap.getBoundingClientRect(), c = XCOLS[X.focus.c], row = X.rows[X.focus.r];
+  const inp = document.createElement('input'); inp.className = 'pg-edit'; inp.autocomplete = 'off'; inp.spellcheck = false; inp.setAttribute('aria-label', 'Nuevo valor para las celdas seleccionadas');
+  if (c.opts) inp.placeholder = c.opts.map(o => o[1]).join(' / ');
+  inp.style.left = (tb.left - wb.left + wrap.scrollLeft) + 'px'; inp.style.top = (tb.top - wb.top + wrap.scrollTop) + 'px'; inp.style.width = Math.max(tb.width, 140) + 'px'; inp.style.height = tb.height + 'px'; inp.style.textAlign = 'left';
+  inp.value = first !== null ? first : xShow(c, row.v[c.k]);
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); xCommit(true, e.key === 'Enter' ? 'down' : 'right'); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); xCommit(false); }
+  });
+  inp.addEventListener('blur', () => { if (X.edit === inp) xCommit(true); });
+  wrap.appendChild(inp); X.edit = inp; inp.focus(); if (first === null) inp.select(); else inp.setSelectionRange(inp.value.length, inp.value.length);
+}
+function xCommit(apply = true, move) {
+  const inp = X.edit; if (!inp) return; X.edit = null; const text = inp.value; inp.remove();
+  if (apply) xApply(text);
+  if (move && X.focus) { const r = Math.min(X.rows.length - 1, X.focus.r + (move === 'down' ? 1 : 0)), c = Math.min(XCOLS.length - 1, X.focus.c + (move === 'right' ? 1 : 0)); X.anchor = X.focus = { r, c }; xSelPaint(); }
+  $('#x-grid table')?.focus({ preventScroll: true });
+}
+function xSelectAll() { if (!X.rows.length) return; xCommit(false); X.anchor = { r: 0, c: 0 }; X.focus = { r: X.rows.length - 1, c: XCOLS.length - 1 }; xSelPaint(); $('#x-grid table')?.focus({ preventScroll: true }); }
+function xKey(e) {
+  if (e.target.classList.contains('pg-edit')) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') { e.preventDefault(); xSelectAll(); return; }
+  const f = X.focus; if (!f) return;
+  const arrows = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] };
+  if (arrows[e.key]) {
+    e.preventDefault(); const [dr, dc] = arrows[e.key], n = { r: Math.max(0, Math.min(X.rows.length - 1, f.r + dr)), c: Math.max(0, Math.min(XCOLS.length - 1, f.c + dc)) };
+    X.focus = n; if (!e.shiftKey) X.anchor = n; xSelPaint(); $(`#x-grid td.c[data-r="${n.r}"][data-c="${n.c}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); return;
+  }
+  if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); xApply(''); return; }
+  if (e.key === 'Enter' || e.key === 'F2') { e.preventDefault(); xOpenEdit(null); return; }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key.length === 1) { e.preventDefault(); xOpenEdit(e.key); }
+}
+function initGrid() {
+  if (X.inited) return; X.inited = true;
+  $('#g-load').onclick = gridLoad;
+  $('#x-save').onclick = gridSave; $('#x-selall').onclick = xSelectAll;
+  $('#x-reset').onclick = () => { X.rows.forEach(r => { r.v = { ...r.v0 }; r.err = null; }); xRender(); };
+  const g = $('#x-grid');
+  g.addEventListener('mousedown', e => {
+    const td = e.target.closest('td.c, th[data-xc], td[data-xr]'); if (!td || e.target.closest('.pg-edit')) return;
+    xCommit(); g.querySelector('table')?.focus({ preventScroll: true });
+    if (td.matches('th[data-xc]')) { const c = +td.dataset.xc; X.anchor = { r: 0, c }; X.focus = { r: X.rows.length - 1, c }; }
+    else if (td.matches('td[data-xr]')) { const r = +td.dataset.xr; X.anchor = { r, c: 0 }; X.focus = { r, c: XCOLS.length - 1 }; }
+    else { const pos = { r: +td.dataset.r, c: +td.dataset.c }; if (e.shiftKey && X.anchor) X.focus = pos; else { X.anchor = pos; X.focus = pos; } X.drag = true; }
+    e.preventDefault(); xSelPaint();
+  });
+  g.addEventListener('mouseover', e => { if (!X.drag) return; const td = e.target.closest('td.c'); if (td) { X.focus = { r: +td.dataset.r, c: +td.dataset.c }; xSelPaint(); } });
+  document.addEventListener('mouseup', () => { X.drag = false; });
+  g.addEventListener('dblclick', e => { if (e.target.closest('td.c')) xOpenEdit(null); });
+  g.addEventListener('keydown', xKey);
+  g.addEventListener('copy', e => { const rect = xRect(); if (!rect) return; e.preventDefault(); const lines = []; for (let r = rect.r0; r <= rect.r1; r++) { const row = []; for (let c = rect.c0; c <= rect.c1; c++) row.push(xShow(XCOLS[c], X.rows[r].v[XCOLS[c].k])); lines.push(row.join('\t')); } e.clipboardData.setData('text/plain', lines.join('\n')); });
+  g.addEventListener('paste', e => {
+    const rect = xRect(); if (!rect) return; e.preventDefault();
+    const rows = (e.clipboardData.getData('text/plain') || '').replace(/\r/g, '').replace(/\n$/, '').split('\n').map(l => l.split('\t'));
+    if (rows.length === 1 && rows[0].length === 1) { xApply(rows[0][0]); return; }
+    let bad = 0; rows.forEach((cols, i) => cols.forEach((v, j) => { const r = rect.r0 + i, c = rect.c0 + j; if (r >= X.rows.length || c >= XCOLS.length) return; if (!xSet(r, c, v)) bad++; }));
+    xRender(); $('#x-save-status').textContent = bad ? `${bad} celdas no se pegaron (valor no válido o celda inexistente).` : '';
+  });
+  window.addEventListener('beforeunload', e => { if (xDirtyRows().length) { e.preventDefault(); e.returnValue = ''; } });
+}
+async function gridLoad() {
+  const skus = parseSkus(), stores = gStores(), st = $('#g-load-status'), b = $('#g-load');
+  if (!skus.length) { st.textContent = 'Paso 1: indica al menos un SKU.'; return; }
+  if (!stores.length) { st.textContent = 'Paso 2: elige al menos una tienda.'; return; }
+  if (xDirtyRows().length && !confirm('Hay cambios sin guardar. ¿Descartarlos y cargar de nuevo?')) return;
+  b.disabled = true; st.textContent = 'Cargando variantes de las tiendas…'; $('#x-result').innerHTML = '';
+  try {
+    const d = await post('/api/admin/grid/search', { skus, stores, whole_products: $('#g-whole').checked });
+    X.rows = []; const warns = [];
+    d.stores.forEach(s => {
+      if (s.error) { warns.push(`<div class="callout err"><strong>${esc(s.store)}</strong>: ${esc(s.error)}</div>`); return; }
+      if (s.truncated) warns.push(`<div class="callout"><strong>${esc(s.store)}</strong>: hay demasiadas variantes y solo se muestran las primeras.</div>`);
+      s.rows.forEach(r => { const v = { sku: r.sku, barcode: r.barcode, variant_title: r.variant_title, product_title: r.product_title, status: r.status, vendor: r.vendor, product_type: r.product_type, weight: r.weight, weightUnit: r.weightUnit, taxable: r.taxable, inventoryPolicy: r.inventoryPolicy, tracked: r.tracked, requiresShipping: r.requiresShipping }; X.rows.push({ store: s.store, variant_id: r.variant_id, product_id: r.product_id, matched: r.matched, v, v0: { ...v }, err: null }); });
+    });
+    const have = new Set(X.rows.filter(r => r.matched).map(r => r.v0.sku.toLowerCase())), none = skus.filter(k => !have.has(k.toLowerCase()));
+    if (none.length) warns.push(`<div class="callout"><strong>SKU sin resultados (${none.length}):</strong> ${esc(none.slice(0, 30).join(', '))}${none.length > 30 ? ' …' : ''}</div>`);
+    const per = {}; X.rows.forEach(r => { const k = r.store + '|' + r.v0.sku.toLowerCase(); if (r.v0.sku) per[k] = (per[k] || 0) + 1; });
+    const rep = Object.entries(per).filter(([, n]) => n > 1);
+    if (rep.length) warns.push(`<div class="callout"><strong>SKU repetidos (${rep.length}):</strong> ${esc(rep.slice(0, 15).map(([k, n]) => k.replace('|', ' · ') + ' ×' + n).join(', '))}${rep.length > 15 ? ' …' : ''}. Cada variante repetida sale en su propia fila.</div>`);
+    X.anchor = X.focus = null;
+    st.textContent = X.rows.length ? `${dupPlural(X.rows.length, 'variante', 'variantes')} en ${dupPlural(new Set(X.rows.map(r => r.store)).size, 'tienda', 'tiendas')}.` : 'No se encontró ninguna variante con esos SKU.';
+    $('#x-warn').innerHTML = warns.join(''); $('#x-work').hidden = !X.rows.length; $('#x-bar').hidden = !X.rows.length;
+    xRender();
+  } catch (err) { st.textContent = err.message; } finally { b.disabled = false; }
+}
+const X_VARIANT = ['sku', 'barcode', 'weight', 'weightUnit', 'taxable', 'inventoryPolicy', 'tracked', 'requiresShipping'];
+async function gridSave() {
+  xCommit(); const b = $('#x-save'), st = $('#x-save-status'), dirty = xDirtyRows(); if (!dirty.length) return;
+  const changes = dirty.map(r => {
+    const ch = { store: r.store, variant_id: r.variant_id, product_id: r.product_id, variant: {}, product: {} };
+    XCOLS.forEach(c => { if (!xDirty(r, c)) return; if (c.prod) ch.product[c.prod] = r.v[c.k]; else if (c.k === 'variant_title') ch.variant_title = r.v[c.k]; else if (X_VARIANT.includes(c.k)) ch.variant[c.k] = r.v[c.k]; });
+    return ch;
+  });
+  const products = new Set(dirty.filter(r => XCOLS.some(c => c.prod && xDirty(r, c))).map(r => r.store + r.product_id)).size;
+  if (!confirm(`Se van a escribir directamente en Shopify cambios en ${dupPlural(dirty.length, 'variante', 'variantes')}${products ? ` y ${dupPlural(products, 'producto', 'productos')}` : ''}. ¿Continuar?`)) return;
+  b.disabled = true; st.textContent = `Guardando ${dupPlural(changes.length, 'fila', 'filas')} en Shopify…`;
+  try {
+    const d = await post('/api/admin/grid/apply', { changes }), res = new Map(d.results.map(r => [r.store + '|' + r.variant_id, r])), fails = [];
+    dirty.forEach(r => { const x = res.get(r.store + '|' + r.variant_id); if (x && x.status !== 'FAILED') { r.v0 = { ...r.v }; r.err = null; } else { r.err = (x && x.error) || 'Sin respuesta'; fails.push(r); } });
+    $('#x-result').innerHTML = `<div class="callout ${d.failed ? 'err' : 'ok'}"><strong>${dupPlural(d.ok, 'variante guardada', 'variantes guardadas')}${d.failed ? `, ${d.failed} con error` : ''}.</strong></div>`
+      + (fails.length ? table(['Tienda', 'SKU', 'Error'], fails.map(r => `<tr><td class="nw">${esc(r.store)}</td><td class="nw">${esc(r.v0.sku)}</td><td>${esc(r.err)}</td></tr>`).join('')) : '');
+    shown.historial = false; st.textContent = ''; xRender();
   } catch (err) { st.textContent = err.message; b.disabled = false; }
 }
 

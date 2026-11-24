@@ -45,12 +45,10 @@
 
 <!-- VARIAS TIENDAS -->
 <section id="panel-varias" role="tabpanel" aria-labelledby="tab-varias" hidden>
-  <p class="adm-intro">Los elementos se emparejan por <strong>SKU exacto</strong>. «Previsualizar» no escribe nada: te dice qué cambiaría en cada tienda y qué excepciones hay. «Aplicar» escribe directamente en Shopify.</p>
+  <p class="adm-intro">Indica los <strong>SKU</strong> (o búscalos por nombre), elige las tiendas y pulsa «Cargar en la rejilla»: verás una fila por variante y tienda, con el <strong>SKU, el código de barras, los títulos, el estado, el proveedor, el tipo y los datos de envío y stock</strong> editables como en Excel. Los SKU se emparejan por <strong>coincidencia exacta</strong>. «Guardar» escribe directamente en Shopify y solo envía las filas modificadas.</p>
 
   <div class="step">
     <div class="step-head"><span class="step-n">1</span><h2>¿Qué elementos?</h2></div>
-    <div class="seg" role="group" aria-label="Ámbito"><button type="button" data-scope="product" aria-pressed="true">Productos</button><button type="button" data-scope="variant" aria-pressed="false">Variantes</button><button type="button" data-scope="product_variants" aria-pressed="false">Todas las variantes de un producto</button></div>
-    <p class="step-hint" id="scope-hint"></p>
     <div class="field"><label for="g-skus">SKU <span class="muted">(uno por línea o separados por comas)</span></label><textarea id="g-skus" rows="4" spellcheck="false"></textarea><p class="muted" id="sku-count">0 SKU</p></div>
     <div class="finder">
       <label for="g-find-q">O búscalos por nombre <span class="muted">(se busca en las tiendas marcadas en el paso 2)</span></label>
@@ -67,19 +65,43 @@
   </div>
 
   <div class="step">
-    <div class="step-head"><span class="step-n">3</span><h2>¿Qué quieres cambiar?</h2></div>
-    <p class="step-hint">Elige un campo (escribe para buscar) y el valor nuevo. Puedes añadir varios cambios.</p>
-    <div id="g-changes"></div>
-    <div class="actions"><button type="button" class="button secondary" id="g-add">+ Añadir otro cambio</button></div>
+    <div class="step-head"><span class="step-n">3</span><h2>Edita en la rejilla</h2></div>
+    <p class="step-hint">Selecciona celdas arrastrando con el ratón (o con Mayús + flechas), <strong>escribe el valor</strong> y pulsa Intro: se aplica a todas las celdas seleccionadas. Supr vacía los textos opcionales y se puede copiar y pegar desde Excel. En las columnas de sí/no y de lista escribe el valor (Sí, No, Activo…). El título, estado, proveedor y tipo son del <strong>producto</strong>: al cambiarlos se actualizan todas sus variantes de esa tienda.</p>
+    <div class="actions"><button type="button" class="button primary" id="g-load">Cargar en la rejilla</button><label class="adm-check"><input type="checkbox" id="g-whole"> <span>Incluir todas las variantes de cada producto</span></label></div>
+    <p id="g-load-status" class="muted" role="status" aria-live="polite"></p>
   </div>
 
-  <div class="actionbar">
-    <button type="button" class="button secondary" id="g-preview">Previsualizar</button>
-    <button type="button" class="button primary" id="g-apply">Aplicar en Shopify</button>
-    <span id="g-status" class="muted" role="status" aria-live="polite"></span>
+  <div id="x-work" hidden>
+    <div class="adm-bar">
+      <button type="button" class="button secondary" id="x-selall" title="Ctrl + A">Seleccionar todo</button>
+      <button type="button" class="button secondary" id="x-reset">Deshacer cambios</button>
+      <span id="x-sel" class="muted" role="status" aria-live="polite"></span>
+    </div>
+    <div id="x-warn"></div>
+    <div id="x-grid" class="pg-wrap"></div>
   </div>
+  <div class="actionbar" id="x-bar" hidden>
+    <button type="button" class="button primary" id="x-save" disabled>Guardar en Shopify</button>
+    <span id="x-save-status" class="muted" role="status" aria-live="polite"></span>
+  </div>
+  <div id="x-result" aria-live="polite"></div>
 
-  <div id="g-result" aria-live="polite"></div>
+  <details class="res-store" id="g-legacy" style="margin-top:20px">
+    <summary><strong>Cambiar un solo campo o metacampo en bloque</strong> <span class="muted">(selector de campos y metacampos)</span></summary>
+    <div>
+      <p class="step-hint">Se aplica a los SKU del paso 1 en las tiendas del paso 2. «Previsualizar» no escribe nada; «Aplicar» escribe directamente en Shopify.</p>
+    <div class="seg" role="group" aria-label="Ámbito"><button type="button" data-scope="product" aria-pressed="true">Productos</button><button type="button" data-scope="variant" aria-pressed="false">Variantes</button><button type="button" data-scope="product_variants" aria-pressed="false">Todas las variantes de un producto</button></div>
+    <p class="step-hint" id="scope-hint"></p>
+      <div id="g-changes"></div>
+      <div class="actions"><button type="button" class="button secondary" id="g-add">+ Añadir otro cambio</button></div>
+      <div class="actionbar">
+        <button type="button" class="button secondary" id="g-preview">Previsualizar</button>
+        <button type="button" class="button primary" id="g-apply">Aplicar en Shopify</button>
+        <span id="g-status" class="muted" role="status" aria-live="polite"></span>
+      </div>
+      <div id="g-result" aria-live="polite"></div>
+    </div>
+  </details>
 </section>
 
 <!-- DUPLICADOS -->
