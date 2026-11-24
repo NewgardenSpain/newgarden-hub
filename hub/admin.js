@@ -823,7 +823,7 @@ function catDetail() {
   }).join(''));
 }
 
-const CAT_FIELDS = [['image', 'Imagen de portada'], ['icon', 'Icono de categoría'], ['parent', 'Miga de pan / colección padre'], ['related', 'Categorías relacionadas'], ['inspiration', '«Necesitas más inspiración»'], ['rules', 'Condiciones (se añaden reglas de etiqueta y tipo)']];
+const CAT_FIELDS = [['image', 'Imagen de portada'], ['icon', 'Icono de categoría'], ['parent', 'Miga de pan / colección padre'], ['related', 'Categorías relacionadas'], ['inspiration', '«Necesitas más inspiración»'], ['rules', 'Condiciones (sustituyen a las de la homóloga)']];
 const EDIT_STATE = { CHANGE: ['Se cambiará', 'warn'], SAME: ['Ya está igual', 'ok'], BLOCKED: ['Bloqueado', 'err'] };
 const RES_STATE = { OK: ['Actualizado', 'ok'], FAILED: ['Con incidencia', 'err'], SKIPPED: ['No actualizado', 'muted'] };
 const showVal = v => v == null ? '<span class="muted">—</span>' : Array.isArray(v) ? (v.length ? '<ul class="plain">' + v.map(x => `<li>${esc(x)}</li>`).join('') + '</ul>' : '<span class="muted">(vacío)</span>') : esc(v);
@@ -892,9 +892,9 @@ function catRulesSyncNote(rs, store) {
   const msg = {
     NO_RULES: 'La categoría de ES es manual: no hay condiciones que sincronizar.',
     MANUAL_TARGET: `La homóloga de ${store} es manual: la sincronización de condiciones no se puede aplicar.`,
-    NOTHING_NEW: 'Las condiciones de etiqueta y tipo ya coinciden con las de ES: sincronizar no cambiaría nada.',
-    ALL: `Sincronizar condiciones añadiría ${rs.new.length} regla(s) (${rs.new.join('; ')}), pero la homóloga combina las reglas con «todas»: solo restringiría la colección, no añadiría productos.`,
-    ANY: rs.fixes ? `Sincronizar condiciones (${rs.new.join('; ')}) haría entrar ${rs.fixes} de los SKU que faltan (marcados abajo). Revisa la vista previa de «Condiciones» antes de aplicar.` : `Sincronizar condiciones añadiría ${rs.new.length} regla(s) (${rs.new.join('; ')}), pero ninguno de los SKU que faltan las cumple.`,
+    NO_COPYABLE: 'ES no tiene condiciones de etiqueta o tipo que copiar: la sincronización de condiciones quedaría bloqueada.',
+    SAME: 'Las condiciones de la homóloga ya son las de ES: sincronizar no cambiaría nada.',
+    REPLACE: `Sustituir las condiciones por las de ES (${(rs.rules || []).join('; ')}) haría entrar ${rs.fixes} de los SKU que faltan y salir ${rs.leaves} de los que sobran (marcados abajo; solo cuenta etiquetas y tipos). Revisa la vista previa de «Condiciones» antes de aplicar.`,
   }[rs.state];
   return msg ? `<div class="callout">${esc(msg)}</div>` : '';
 }
@@ -916,7 +916,7 @@ async function catSkus(store) {
       const f = $('#c-sf').value, rows = d.rows.filter(r => f === 'issues' ? r.result !== 'MATCH' : !f || r.result === f);
       $('#c-sku-table').innerHTML = rows.length ? table(['SKU', 'ES', esc(store), 'Resultado', 'Detalle'], rows.map(r => {
         const [label, cls] = SKU_RES[r.result];
-        return `<tr><td>${esc(r.sku)}</td><td>${r.result === 'EXTRA' ? 'No' : 'Sí'}</td><td>${r.result === 'MISSING' ? 'No' : 'Sí'}</td><td>${tag(label, cls)}</td><td>${esc(r.detail)}${r.rules_fix ? ' ' + tag('Lo resolvería sincronizar condiciones', 'ok') : ''}</td></tr>`;
+        return `<tr><td>${esc(r.sku)}</td><td>${r.result === 'EXTRA' ? 'No' : 'Sí'}</td><td>${r.result === 'MISSING' ? 'No' : 'Sí'}</td><td>${tag(label, cls)}</td><td>${esc(r.detail)}${r.rules_fix ? ' ' + tag('Lo resolvería sustituir condiciones', 'ok') : ''}</td></tr>`;
       }).join('')) : '<p class="muted">Sin filas para este filtro.</p>';
     };
     $('#c-sf').onchange = draw; draw();

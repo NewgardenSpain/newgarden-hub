@@ -2338,7 +2338,11 @@ const b=$('#apply-button');b.disabled=true;st.textContent='Aplicando en '+(1+tar
 COLLECTION_FIELDS={'title':'Título','descriptionHtml':'Descripción','seo.title':'Título SEO','seo.description':'Descripción SEO','handle':'URL (handle)'}
 COLLECTION_DEFAULT_FIELDS=['title','descriptionHtml','seo.title','seo.description']
 COLLECTION_TRANSLATION_KEY={'title':'title','descriptionHtml':'body_html','seo.title':'meta_title','seo.description':'meta_description','handle':'handle'}
-COLLECTION_QUERY='''query CollectionForTranslation($id:ID!) { collection(id:$id) { id title handle descriptionHtml seo { title description } } }'''
+COLLECTION_QUERY='''query CollectionForTranslation($id:ID!) { collection(id:$id) { id title handle descriptionHtml seo { title description } metafields(first:100) { nodes { id namespace key type value } } } }'''
+COLLECTION_PLAN_QUERY='''query($id:ID!){collection(id:$id){id title handle metafields(first:100){nodes{namespace key type value}}} metafieldDefinitions(ownerType:COLLECTION,first:100){nodes{namespace key name type{name}}}}'''
+# Tipos de metacampo con texto traducible; el resto (referencias, archivos, números, JSON…) no se traduce.
+COLLECTION_MF_TEXT_TYPES={'single_line_text_field','multi_line_text_field','rich_text_field','list.single_line_text_field','list.multi_line_text_field'}
+COLLECTION_MF_KEY_RE=re.compile(r'^[A-Za-z0-9_-]{2,255}\.[A-Za-z0-9_-]{1,64}$')
 
 class CollectionTranslate(BaseModel):
     source_store:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
@@ -2346,7 +2350,15 @@ class CollectionTranslate(BaseModel):
     target_store:str=Field(pattern=r'^[A-Z0-9_-]{2,12}$')
     target_collection_id:str=Field(pattern=r'^\d{1,20}$')
     target_locale:str|None=Field(default=None,min_length=2,max_length=20)
-    fields:list[str]=Field(default_factory=lambda:list(COLLECTION_DEFAULT_FIELDS),min_length=1,max_length=10)
+    fields:list[str]=Field(default_factory=lambda:list(COLLECTION_DEFAULT_FIELDS),max_length=10)
+    metafields:list[str]=Field(default_factory=list,max_length=100)   # «namespace.key» de metacampos de la colección de origen
+
+    @field_validator('metafields')
+    @classmethod
+    def check_metafields(cls,value):
+        bad=[f for f in value if not COLLECTION_MF_KEY_RE.match(f)]
+        if bad: raise ValueError('Metacampo no válido: '+', '.join(bad))
+        return list(dict.fromkeys(value))
 
     @field_validator('fields')
     @classmethod
@@ -2368,23 +2380,84 @@ def load_collection(store:dict,numeric_id:str)->dict:
 def collections_search(store:str,q:str=''):
     return tags_collections(store,q)
 
+def collection_mf_preview(mtype,value):
+    """Texto plano de un metacampo (rich text y listas vienen como JSON) para mostrarlo como pista."""
+    if mtype=='rich_text_field' or mtype.startswith('list.'):
+        try: data=json.loads(value)
+        except ValueError: return value
+        parts=[]
+        def walk(n):
+            if isinstance(n,dict):
+                if n.get('type')=='text' and isinstance(n.get('value'),str): parts.append(n['value'])
+                else: [walk(c) for c in n.values() if not isinstance(c,str)]
+            elif isinstance(n,list): [walk(c) for c in n]
+            elif isinstance(n,str): parts.append(n)
+        walk(data); return re.sub(r'\s+',' ',' '.join(parts)).strip()
+    return re.sub(r'\s+',' ',value).strip()
+
+@app.get('/api/collections/plan')
+def collections_plan(collection:str):
+    """Una colección de ES con sus metacampos y todos los destinos de traducción (tienda + idioma con perfil activo).
+    Cada destino trae por defecto la homóloga vinculada en esa tienda, si existe."""
+    if not collection.strip().isdigit(): raise HTTPException(400,'Colección no válida')
+    gid=f'gid://shopify/Collection/{collection.strip()}'
+    ms=shopify_store_by_code(CATEGORY_MASTER)
+    if not ms or not ms['domain'] or not ms['token']: raise HTTPException(404,'La tienda maestra no está activa')
+    data=shopify_graphql(ms['domain'],ms['token'],COLLECTION_PLAN_QUERY,{'id':gid})
+    node=data.get('collection')
+    if not node: raise HTTPException(404,'La colección no existe en '+CATEGORY_MASTER)
+    names={(d['namespace'],d['key']):d.get('name') for d in (data.get('metafieldDefinitions') or {}).get('nodes',[])}
+    metafields=[]
+    for m in node['metafields']['nodes']:
+        if not (m.get('value') or '').strip(): continue
+        ok=m['type'] in COLLECTION_MF_TEXT_TYPES
+        metafields.append({'key':f"{m['namespace']}.{m['key']}",'name':names.get((m['namespace'],m['key'])) or m['key'],'type':m['type'],'translatable':ok,
+            'preview':(collection_mf_preview(m['type'],m['value']) if ok else '')[:140]})
+    metafields.sort(key=lambda m:(not m['translatable'],m['key']))
+    with pool.connection() as c:
+        links={r[0]:(r[1],r[2]) for r in c.execute("SELECT store_code,collection_gid,status FROM category_links WHERE master_gid=%s",(node['id'],)).fetchall()}
+    def per_store(st):
+        locales=[l for l in shopify_shop_locales(st) if target_profile(st['code'],l['locale'])]
+        if st['code']==CATEGORY_MASTER: locales=[l for l in locales if not l.get('primary')]
+        if not locales: return None
+        linked={'status':'SAME'} if st['code']==CATEGORY_MASTER else {'status':'PENDING'}
+        link=links.get(st['code'])
+        if st['code']!=CATEGORY_MASTER and link:
+            if link[1]=='NONE': linked={'status':'NONE'}
+            else:
+                found=shopify_graphql(st['domain'],st['token'],'query($id:ID!){collection(id:$id){id title handle}}',{'id':link[0]}).get('collection')
+                linked={'status':'LINKED','id':found['id'].rsplit('/',1)[-1],'title':found['title'],'handle':found['handle']} if found else {'status':'BROKEN'}
+        return {'locales':[{'locale':l['locale'],'name':l.get('name'),'primary':bool(l.get('primary'))} for l in locales],'linked':linked}
+    stores=[s for s in shopify_stores() if s['domain'] and s['token']]
+    targets=[]
+    for r in run_per_store(stores,per_store):
+        if not r['ok']: targets.append({'store':r['store'],'error':r['error'],'locales':[]}); continue
+        if r['data']: targets.append({'store':r['store'],**r['data']})
+    targets.sort(key=lambda t:(t['store']!=CATEGORY_MASTER,t['store']))
+    return {'collection':{'id':node['id'].rsplit('/',1)[-1],'title':node['title'],'handle':node['handle']},'metafields':metafields,'targets':targets}
+
 @app.post('/api/collections/translate')
 def collections_translate(x:CollectionTranslate,user=Depends(operator)):
     """Traduce una colección de la tienda origen y sustituye el contenido de otra colección ya existente en la tienda
-    destino. Solo se tocan los campos de texto elegidos: reglas, productos, orden, imagen y demás ajustes se conservan."""
-    if x.source_store==x.target_store: raise HTTPException(400,'La tienda origen y la destino deben ser distintas')
+    destino (o, en la tienda de origen, registra su traducción a otro idioma). Solo se tocan los campos y metacampos
+    elegidos: reglas, productos, orden, imagen y demás ajustes se conservan."""
+    same_store=x.source_store==x.target_store
+    if same_store and x.source_collection_id!=x.target_collection_id: raise HTTPException(400,'En la misma tienda solo se puede traducir la propia colección a otro idioma')
+    if not x.fields and not x.metafields: raise HTTPException(400,'Elige al menos un campo o metacampo')
     source=shopify_store_by_code(x.source_store); target=shopify_store_by_code(x.target_store)
     for st,code in ((source,x.source_store),(target,x.target_store)):
         if not st or not st['domain'] or not st['token']: raise HTTPException(404,'Tienda inactiva o sin credenciales: '+code)
     source_locales=shopify_shop_locales(source); target_locales=shopify_shop_locales(target)
     source_locale=next((l['locale'] for l in source_locales if l.get('primary')),None)
     if not source_locale: raise HTTPException(502,'No se pudo determinar el idioma base de la tienda origen')
+    if same_store and not x.target_locale: raise HTTPException(400,'Indica el idioma destino')
     locale_info=(next((l for l in target_locales if l.get('locale','').casefold()==x.target_locale.casefold()),None) if x.target_locale
                  else next((l for l in target_locales if l.get('primary')),None))
     if not locale_info: raise HTTPException(400,'El idioma destino no está habilitado en '+x.target_store)
+    if same_store and locale_info.get('primary'): raise HTTPException(400,'No se puede traducir una colección a su propio idioma base')
     target_locale=locale_info['locale']
     if not target_profile(x.target_store,target_locale): raise HTTPException(400,f'{x.target_store} · {target_locale} no tiene un perfil de traducción activo')
-    src=load_collection(source,x.source_collection_id); dst=load_collection(target,x.target_collection_id)
+    src=load_collection(source,x.source_collection_id); dst=src if same_store else load_collection(target,x.target_collection_id)
     translated={}; skipped=[]
     for key in x.fields:
         text=collection_value(src,key).strip()
@@ -2392,9 +2465,22 @@ def collections_translate(x:CollectionTranslate,user=Depends(operator)):
         req=CellTranslateRequest(source_text=text,source_store=x.source_store,source_locale=source_locale,target_store=x.target_store,target_locale=target_locale,
             field_key={'title':'title','descriptionHtml':'body_html','seo.title':'seo_title','seo.description':'seo_description','handle':'handle'}[key],html=key=='descriptionHtml')
         translated[key]=translate_cell(req,user)['translation']
-    if not translated: raise HTTPException(400,'La colección origen no tiene contenido en los campos elegidos')
-    gid=dst['id']
-    if locale_info.get('primary'):
+    # Metacampos: se traducen primero todos (si algo falla en DeepL no se escribe nada a medias).
+    src_mf={f"{m['namespace']}.{m['key']}":m for m in (src.get('metafields') or {}).get('nodes',[])}
+    dst_mf={f"{m['namespace']}.{m['key']}":m for m in (dst.get('metafields') or {}).get('nodes',[])}
+    mf_translated={}; mf_notes=[]
+    for key in x.metafields:
+        m=src_mf.get(key)
+        if not m or not (m.get('value') or '').strip(): mf_notes.append({'key':key,'reason':'Sin valor en la colección de origen'}); continue
+        if m['type'] not in COLLECTION_MF_TEXT_TYPES: mf_notes.append({'key':key,'reason':f'Tipo «{m["type"]}» no traducible'}); continue
+        req=CellTranslateRequest(source_text=m['value'],source_store=x.source_store,source_locale=source_locale,target_store=x.target_store,target_locale=target_locale,field_key='metafield_text',metafield_type=m['type'],html=False)
+        mf_translated[key]=(m,translate_cell(req,user)['translation'])
+    if not translated and not mf_translated: raise HTTPException(400,'La colección origen no tiene contenido en los campos elegidos')
+    gid=dst['id']; primary=bool(locale_info.get('primary')); mode='base' if primary else 'translation'
+    def check(result):
+        errors=(result or {}).get('userErrors',[])
+        if errors: raise HTTPException(400,'Shopify: '+'; '.join(e.get('message','error') for e in errors)[:500])
+    if translated and primary:
         collection={'id':gid}
         for key,value in translated.items():
             if not key.startswith('seo.'): collection[key]=value
@@ -2405,9 +2491,8 @@ def collections_translate(x:CollectionTranslate,user=Depends(operator)):
             collection['seo']=seo
         if 'handle' in translated: collection['redirectNewHandle']=True
         mutation='''mutation UpdateCollection($input:CollectionInput!) { collectionUpdate(input:$input) { userErrors { field message } } }'''
-        result=shopify_graphql(target['domain'],target['token'],mutation,{'input':collection}).get('collectionUpdate') or {}
-        mode='base'
-    else:
+        check(shopify_graphql(target['domain'],target['token'],mutation,{'input':collection}).get('collectionUpdate'))
+    elif translated:
         res=shopify_graphql(target['domain'],target['token'],'query($id:ID!){translatableResource(resourceId:$id){translatableContent{key digest}}}',{'id':gid}).get('translatableResource') or {}
         digests={i['key']:i['digest'] for i in res.get('translatableContent',[])}
         items=[]
@@ -2416,42 +2501,84 @@ def collections_translate(x:CollectionTranslate,user=Depends(operator)):
             if tk not in digests: raise HTTPException(409,f'Shopify no ofrece un digest traducible para «{COLLECTION_FIELDS[key]}» en la colección destino')
             items.append({'locale':target_locale,'key':tk,'value':value,'translatableContentDigest':digests[tk]})
         mutation='''mutation RegisterTranslation($id:ID!,$translations:[TranslationInput!]!) { translationsRegister(resourceId:$id,translations:$translations) { userErrors { field message } } }'''
-        result=shopify_graphql(target['domain'],target['token'],mutation,{'id':gid,'translations':items}).get('translationsRegister') or {}
-        mode='translation'
-    errors=result.get('userErrors',[])
-    if errors: raise HTTPException(400,'Shopify: '+'; '.join(e.get('message','error') for e in errors)[:500])
-    logging.getLogger('hub.collections').info('Colección %s/%s -> %s/%s (%s, %s): %s',x.source_store,x.source_collection_id,x.target_store,x.target_collection_id,target_locale,mode,list(translated))
+        check(shopify_graphql(target['domain'],target['token'],mutation,{'id':gid,'translations':items}).get('translationsRegister'))
+    mf_done=[]
+    if mf_translated and primary:
+        defs={(d['namespace'],d['key']):(d.get('type') or {}).get('name') for d in (shopify_graphql(target['domain'],target['token'],'query{metafieldDefinitions(ownerType:COLLECTION,first:100){nodes{namespace key type{name}}}}').get('metafieldDefinitions') or {}).get('nodes',[])}
+        entries=[]
+        for key,(m,value) in mf_translated.items():
+            if defs.get((m['namespace'],m['key']))!=m['type']: mf_notes.append({'key':key,'reason':f'La tienda {x.target_store} no tiene el metacampo definido como «{m["type"]}»'}); continue
+            entries.append({'ownerId':gid,'namespace':m['namespace'],'key':m['key'],'type':m['type'],'value':value}); mf_done.append(key)
+        if entries: check(shopify_graphql(target['domain'],target['token'],'mutation($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){metafields{id} userErrors{field message}}}',{'m':entries}).get('metafieldsSet'))
+    elif mf_translated:
+        for key,(m,value) in mf_translated.items():
+            mid=(dst_mf.get(key) or {}).get('id')
+            if not mid: mf_notes.append({'key':key,'reason':'La colección destino no tiene este metacampo en su idioma base'}); continue
+            res=shopify_graphql(target['domain'],target['token'],'query($id:ID!){translatableResource(resourceId:$id){translatableContent{key digest}}}',{'id':mid}).get('translatableResource') or {}
+            digest=next((i['digest'] for i in res.get('translatableContent',[]) if i['key']=='value'),None)
+            if not digest: mf_notes.append({'key':key,'reason':'Shopify no ofrece un digest traducible para este metacampo'}); continue
+            try: check(shopify_graphql(target['domain'],target['token'],'mutation($id:ID!,$t:[TranslationInput!]!){translationsRegister(resourceId:$id,translations:$t){userErrors{field message}}}',{'id':mid,'t':[{'locale':target_locale,'key':'value','value':value,'translatableContentDigest':digest}]}).get('translationsRegister'))
+            except HTTPException as exc: mf_notes.append({'key':key,'reason':str(exc.detail)[:300]}); continue
+            mf_done.append(key)
+    logging.getLogger('hub.collections').info('Colección %s/%s -> %s/%s (%s, %s): campos=%s metacampos=%s',x.source_store,x.source_collection_id,x.target_store,x.target_collection_id,target_locale,mode,list(translated),mf_done)
     return {'saved':True,'mode':mode,'target_locale':target_locale,'source_title':src['title'],'target_title_before':dst['title'],
         'fields':[{'key':k,'label':COLLECTION_FIELDS[k],'before':collection_value(dst,k),'source':collection_value(src,k),'after':v} for k,v in translated.items()],
+        'metafields':[{'key':k,'label':k,'before':(dst_mf.get(k) or {}).get('value') or '','source':mf_translated[k][0]['value'],'after':mf_translated[k][1]} for k in mf_done],
+        'metafield_notes':mf_notes,
         'skipped':[COLLECTION_FIELDS[k] for k in skipped]}
 
 @app.get('/collections',response_class=HTMLResponse)
 def collections_page():
-    body='''<main class="wrap"><h1>Traducir colecciones</h1><p class="lede">Elige una colección de una tienda y la colección equivalente de otra tienda (las dos ya deben existir). El contenido de texto de la segunda se sustituye por la traducción de la primera; reglas, productos, orden e imágenes de la colección destino no se tocan. Los cambios se escriben directamente en Shopify.</p>
-<section class="card"><form id="coll-form" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(18rem,1fr))">
-<fieldset class="field"><legend>Origen</legend><label for="s-store">Tienda</label><select id="s-store"></select><label for="s-coll" style="margin-top:.5rem">Colección</label><input id="s-coll" list="s-list" autocomplete="off" placeholder="Escribe para buscar…"><datalist id="s-list"></datalist></fieldset>
-<fieldset class="field"><legend>Destino (se sobrescribe)</legend><label for="t-store">Tienda</label><select id="t-store"></select><label for="t-coll" style="margin-top:.5rem">Colección equivalente</label><input id="t-coll" list="t-list" autocomplete="off" placeholder="Escribe para buscar…"><datalist id="t-list"></datalist><label for="t-locale" style="margin-top:.5rem">Idioma destino</label><select id="t-locale"></select></fieldset>
+    body='''<main class="wrap"><h1>Traducir colecciones</h1><p class="lede">Elige una colección de España. Verás cada tienda e idioma al que se puede traducir; al marcar uno aparece un selector con la colección vinculada en ese país (si la hay) y puedes cambiarla. El texto de la colección destino se sustituye por la traducción; reglas, productos, orden e imágenes no se tocan. En España, los idiomas distintos del base se guardan como traducción de la propia colección. Los cambios se escriben directamente en Shopify.</p>
+<section class="card"><div class="field"><label for="s-coll">Colección de España</label><input id="s-coll" list="s-list" autocomplete="off" placeholder="Escribe para buscar…" style="max-width:34rem"><datalist id="s-list"></datalist></div><p class="muted" id="plan-status" role="status" aria-live="polite"></p></section>
+<section class="card" id="plan" hidden>
+<h2 id="plan-title"></h2>
 <fieldset class="field"><legend>Campos a traducir</legend><div id="fields" style="display:flex;flex-direction:column;gap:.35rem"></div></fieldset>
-<div class="field"><label>&nbsp;</label><button class="button primary" id="go">Traducir y sustituir</button></div></form><p class="muted" id="status" role="status" aria-live="polite"></p></section>
+<fieldset class="field" style="margin-top:1rem"><legend>Metacampos de la colección</legend><div class="actions" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem"><button type="button" class="button" id="mf-all">Todos los traducibles</button><button type="button" class="button" id="mf-none">Ninguno</button></div><div id="mfs" style="display:flex;flex-direction:column;gap:.35rem"></div></fieldset>
+<fieldset class="field" style="margin-top:1rem"><legend>Destinos (tienda · idioma)</legend><div class="actions" style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem"><button type="button" class="button" id="tg-all">Todos</button><button type="button" class="button" id="tg-none">Ninguno</button></div><div id="targets" style="display:flex;flex-direction:column;gap:.6rem"></div></fieldset>
+<div style="margin-top:1rem"><button class="button primary" id="go">Traducir y sustituir</button></div><p class="muted" id="status" role="status" aria-live="polite"></p></section>
 <section class="card" id="result" hidden></section></main>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function fetchJSON(url,options){const r=await fetch(url,options);let data={};try{data=await r.json()}catch{}if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:'Error al procesar la solicitud');return data}
 const $=s=>document.querySelector(s);
 const FIELDS=[['title','Título',1],['descriptionHtml','Descripción',1],['seo.title','Título SEO',1],['seo.description','Descripción SEO',1],['handle','URL (handle): cambia la dirección de la colección',0]];
+const DEFAULT_MF='custom.seo_text_collections_page';
+let srcMap=new Map(),srcSeq=0,srcTimer=null,plan=null,loadedId='';
+function dupMap(list){const dup=new Set(list.map(c=>c.title).filter((t,i,a)=>a.indexOf(t)!==i));return new Map(list.map(c=>[dup.has(c.title)?c.title+' ('+c.handle+')':c.title,c.id]))}
+async function searchColl(store,q){const d=await fetchJSON('/api/collections/search?store='+encodeURIComponent(store)+'&q='+encodeURIComponent(q||''));return d.collections}
+async function loadSrc(q){const n=++srcSeq;try{const list=await searchColl('ES',q);if(n!==srcSeq)return;srcMap=dupMap(list);$('#s-list').innerHTML=[...srcMap.keys()].map(v=>'<option value="'+esc(v)+'"></option>').join('')}catch(e){$('#plan-status').textContent='No se pudieron cargar las colecciones: '+e.message}}
+function srcChanged(){const id=srcMap.get($('#s-coll').value.trim());if(id&&id!==loadedId)loadPlan(id)}
+$('#s-coll').addEventListener('input',()=>{clearTimeout(srcTimer);srcTimer=setTimeout(()=>loadSrc($('#s-coll').value),250);srcChanged()});
+$('#s-coll').addEventListener('change',srcChanged);
+async function loadPlan(id){loadedId=id;$('#plan').hidden=true;$('#result').hidden=true;$('#plan-status').textContent='Cargando idiomas, metacampos y colecciones vinculadas…';try{const d=await fetchJSON('/api/collections/plan?collection='+encodeURIComponent(id));if(loadedId!==id)return;plan=d;renderPlan();$('#plan-status').textContent=''}catch(e){loadedId='';$('#plan-status').textContent=e.message}}
+const LINK_NOTE={LINKED:'Vinculada en este país.',PENDING:'Sin colección vinculada en este país: elige una.',NONE:'Marcada como «sin homóloga»: elige una solo si quieres traducir igualmente.',BROKEN:'La colección vinculada ya no existe: elige otra.',SAME:'Se registra como traducción de la propia colección de España.'};
+function rowId(t,l){return 'dl-'+(t.store+'-'+l.locale).replace(/[^A-Za-z0-9_-]/g,'_')}
+function renderPlan(){
+$('#plan-title').textContent=plan.collection.title+' · '+plan.collection.handle;
 $('#fields').innerHTML=FIELDS.map(f=>'<label style="display:inline-flex;gap:.4rem;align-items:center"><input type="checkbox" class="fld" value="'+f[0]+'" style="width:auto"'+(f[2]?' checked':'')+'> '+esc(f[1])+'</label>').join('');
-const sides={s:{map:new Map(),seq:0,timer:null},t:{map:new Map(),seq:0,timer:null}};
-async function loadColl(k,q){const side=sides[k],n=++side.seq,store=$('#'+k+'-store').value;if(!store)return;try{const d=await fetchJSON('/api/collections/search?store='+encodeURIComponent(store)+'&q='+encodeURIComponent(q||''));if(n!==side.seq)return;const dup=new Set(d.collections.map(c=>c.title).filter((t,i,a)=>a.indexOf(t)!==i));side.map=new Map(d.collections.map(c=>[dup.has(c.title)?c.title+' ('+c.handle+')':c.title,c.id]));$('#'+k+'-list').innerHTML=[...side.map.keys()].map(v=>'<option value="'+esc(v)+'"></option>').join('')}catch(e){$('#status').textContent='No se pudieron cargar las colecciones: '+e.message}}
-for(const k of['s','t']){$('#'+k+'-coll').addEventListener('input',()=>{clearTimeout(sides[k].timer);sides[k].timer=setTimeout(()=>loadColl(k,$('#'+k+'-coll').value),250)});$('#'+k+'-store').addEventListener('change',()=>{$('#'+k+'-coll').value='';loadColl(k,'');if(k==='t')loadLocales()})}
-async function loadLocales(){const st=$('#t-store').value;if(!st)return;try{const d=await fetchJSON('/api/stores/'+encodeURIComponent(st)+'/shop-locales');$('#t-locale').innerHTML=d.map(l=>'<option value="'+esc(l.locale)+'">'+esc(l.name||l.locale)+' ('+esc(l.locale)+')'+(l.primary?' · principal':'')+'</option>').join('')}catch(e){$('#t-locale').innerHTML='';$('#status').textContent=e.message}}
-fetchJSON('/api/stores').then(d=>{const s=(Array.isArray(d)?d:(d.stores||[])).filter(x=>x.active&&x.has_token),o=s.map(x=>'<option value="'+esc(x.code)+'">'+esc(x.code)+'</option>').join('');$('#s-store').innerHTML=o;$('#t-store').innerHTML=o;if(s.length>1)$('#t-store').selectedIndex=1;loadColl('s','');loadColl('t','');loadLocales()}).catch(e=>$('#status').textContent=e.message);
-$('#coll-form').addEventListener('submit',async e=>{e.preventDefault();const st=$('#status'),res=$('#result'),sid=sides.s.map.get($('#s-coll').value.trim()),tid=sides.t.map.get($('#t-coll').value.trim()),fields=[...document.querySelectorAll('.fld:checked')].map(x=>x.value);
-if(!sid||!tid){st.textContent='Elige las dos colecciones de las listas.';return}if(!fields.length){st.textContent='Elige al menos un campo.';return}if($('#s-store').value===$('#t-store').value){st.textContent='Origen y destino deben ser tiendas distintas.';return}
-const b=$('#go');b.disabled=true;res.hidden=true;st.textContent='Traduciendo y escribiendo en Shopify…';
-try{const d=await fetchJSON('/api/collections/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_store:$('#s-store').value,source_collection_id:sid,target_store:$('#t-store').value,target_collection_id:tid,target_locale:$('#t-locale').value||null,fields})});
-st.textContent='Hecho: «'+d.target_title_before+'» ('+$('#t-store').value+', '+d.target_locale+') actualizada desde «'+d.source_title+'»'+(d.skipped.length?'. Sin contenido en origen: '+d.skipped.join(', '):'')+'.';
-res.innerHTML='<div class="table-wrap"><table><thead><tr><th>Campo</th><th>Antes (destino)</th><th>Origen</th><th>Ahora (destino)</th></tr></thead><tbody>'+d.fields.map(f=>'<tr><td>'+esc(f.label)+'</td><td style="white-space:normal;max-width:22rem">'+esc(f.before)+'</td><td style="white-space:normal;max-width:22rem">'+esc(f.source)+'</td><td style="white-space:normal;max-width:22rem">'+esc(f.after)+'</td></tr>').join('')+'</tbody></table></div>';res.hidden=false}
-catch(err){st.textContent=err.message}finally{b.disabled=false}});
+$('#mfs').innerHTML=plan.metafields.length?plan.metafields.map(m=>'<label style="display:flex;gap:.4rem;align-items:flex-start'+(m.translatable?'':';opacity:.55')+'"><input type="checkbox" class="mf" value="'+esc(m.key)+'" style="width:auto;margin-top:.25rem"'+(m.translatable?'':' disabled')+(m.key===DEFAULT_MF?' checked':'')+'><span>'+esc(m.name)+' <code>'+esc(m.key)+'</code> <span class="muted">· '+esc(m.type)+(m.translatable?'':' · no traducible')+(m.preview?' · '+esc(m.preview):'')+'</span></span></label>').join(''):'<p class="muted">Esta colección no tiene metacampos con valor.</p>';
+$('#targets').innerHTML=plan.targets.map(t=>t.error?'<div><strong>'+esc(t.store)+'</strong> <span class="muted">no disponible: '+esc(t.error)+'</span></div>':t.locales.map(l=>'<div class="trow" data-store="'+esc(t.store)+'" data-locale="'+esc(l.locale)+'" data-same="'+(t.linked.status==='SAME'?'1':'')+'" style="border:1px solid var(--line,#ddd);border-radius:.5rem;padding:.5rem .75rem"><label style="display:inline-flex;gap:.4rem;align-items:center"><input type="checkbox" class="tgt" style="width:auto"> <strong>'+esc(t.store)+'</strong> · '+esc(l.name||l.locale)+' ('+esc(l.locale)+')'+(l.primary?' <span class="muted">· idioma base de la tienda</span>':'')+'</label><div class="tsel" hidden style="margin-top:.5rem">'+(t.linked.status==='SAME'?'<p class="muted">'+LINK_NOTE.SAME+'</p>':'<label>Colección de '+esc(t.store)+' que se sobrescribe</label><input class="tcoll" list="'+rowId(t,l)+'" autocomplete="off" placeholder="Escribe para buscar…" value="'+esc(t.linked.title||'')+'" style="max-width:34rem"><datalist id="'+rowId(t,l)+'"></datalist><p class="muted tnote">'+esc(LINK_NOTE[t.linked.status]||'')+'</p>')+'<p class="muted trow-status" role="status"></p></div></div>').join('')).join('');
+for(const row of document.querySelectorAll('.trow')){const t=plan.targets.find(x=>x.store===row.dataset.store),inp=row.querySelector('.tcoll');row.dataset.id=t.linked.status==='LINKED'?t.linked.id:'';row._map=new Map(t.linked.status==='LINKED'?[[t.linked.title,t.linked.id]]:[]);row._seq=0;
+row.querySelector('.tgt').addEventListener('change',e=>{row.querySelector('.tsel').hidden=!e.target.checked});
+if(inp){const sync=()=>{row.dataset.id=row._map.get(inp.value.trim())||''};inp.addEventListener('input',()=>{sync();clearTimeout(row._t);row._t=setTimeout(async()=>{const n=++row._seq;try{const list=await searchColl(row.dataset.store,inp.value);if(n!==row._seq)return;const m=dupMap(list);for(const [k,v] of row._map)if(!m.has(k)&&v===t.linked.id)m.set(k,v);row._map=m;row.querySelector('datalist').innerHTML=[...m.keys()].map(v=>'<option value="'+esc(v)+'"></option>').join('');sync()}catch{}},250)});inp.addEventListener('change',sync)}}
+$('#plan').hidden=false}
+$('#mf-all').onclick=()=>document.querySelectorAll('.mf:not(:disabled)').forEach(x=>x.checked=true);
+$('#mf-none').onclick=()=>document.querySelectorAll('.mf').forEach(x=>x.checked=false);
+function setTargets(v){document.querySelectorAll('.trow').forEach(r=>{const c=r.querySelector('.tgt');c.checked=v;r.querySelector('.tsel').hidden=!v})}
+$('#tg-all').onclick=()=>setTargets(true);$('#tg-none').onclick=()=>setTargets(false);
+function resultTable(d){const rows=d.fields.map(f=>[f.label,f.before,f.source,f.after]).concat(d.metafields.map(f=>['Metacampo '+f.label,f.before,f.source,f.after]));return rows.length?'<div class="table-wrap"><table><thead><tr><th>Campo</th><th>Antes (destino)</th><th>Origen</th><th>Ahora (destino)</th></tr></thead><tbody>'+rows.map(r=>'<tr><td>'+esc(r[0])+'</td><td style="white-space:normal;max-width:22rem">'+esc(r[1])+'</td><td style="white-space:normal;max-width:22rem">'+esc(r[2])+'</td><td style="white-space:normal;max-width:22rem">'+esc(r[3])+'</td></tr>').join('')+'</tbody></table></div>':''}
+$('#go').addEventListener('click',async()=>{const st=$('#status'),res=$('#result'),fields=[...document.querySelectorAll('.fld:checked')].map(x=>x.value),metafields=[...document.querySelectorAll('.mf:checked')].map(x=>x.value),rows=[...document.querySelectorAll('.trow')].filter(r=>r.querySelector('.tgt').checked);
+if(!fields.length&&!metafields.length){st.textContent='Elige al menos un campo o metacampo.';return}if(!rows.length){st.textContent='Marca al menos un destino.';return}
+const bad=rows.filter(r=>!r.dataset.same&&!r.dataset.id);if(bad.length){bad.forEach(r=>r.querySelector('.trow-status').textContent='Elige una colección de la lista.');st.textContent='Falta elegir la colección en '+bad.length+' destino(s).';return}
+const b=$('#go');b.disabled=true;res.innerHTML='<h2>Resultado</h2>';res.hidden=false;let ok=0,fail=0;
+for(const r of rows){const store=r.dataset.store,locale=r.dataset.locale,label=store+' · '+locale,ps=r.querySelector('.trow-status');ps.textContent='Traduciendo…';st.textContent='Traduciendo '+label+' ('+(ok+fail+1)+' de '+rows.length+')…';
+try{const d=await fetchJSON('/api/collections/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_store:'ES',source_collection_id:plan.collection.id,target_store:store,target_collection_id:r.dataset.same?plan.collection.id:r.dataset.id,target_locale:locale,fields,metafields})});ok++;ps.textContent='Hecho.';
+const notes=d.metafield_notes.map(n=>'<li>'+esc(n.key)+': '+esc(n.reason)+'</li>').join('');
+res.insertAdjacentHTML('beforeend','<details open style="margin-bottom:.75rem"><summary><strong>'+esc(label)+'</strong> · «'+esc(d.target_title_before)+'» '+(d.mode==='translation'?'(traducción registrada)':'(contenido sustituido)')+(d.skipped.length?' · sin contenido en origen: '+esc(d.skipped.join(', ')):'')+'</summary>'+(notes?'<p class="muted">Metacampos no aplicados:</p><ul>'+notes+'</ul>':'')+resultTable(d)+'</details>')}
+catch(err){fail++;ps.textContent='Error: '+err.message;res.insertAdjacentHTML('beforeend','<p><strong>'+esc(label)+'</strong> · <span role="alert">Error: '+esc(err.message)+'</span></p>')}}
+st.textContent='Terminado: '+ok+' destino(s) correcto(s)'+(fail?' y '+fail+' con error':'')+'.';b.disabled=false});
+loadSrc('');
 </script>'''
     return shell('Traducir colecciones',body,'collections')
 
@@ -3732,22 +3859,32 @@ def category_sku_status(st,skus,details=None):
     return found
 
 def category_rules_sync_prediction(ms,master_gid,st,target_gid):
-    """Qué haría la sincronización de «Condiciones» (fase 3) en la homóloga, sin escribir: {state, new, disjunctive, positives}.
-    state: NO_RULES (ES manual) | MANUAL_TARGET (homóloga manual) | NOTHING_NEW | ALL (reglas «todas»: solo restringen) | ANY (reglas «cualquiera»: pueden añadir productos)."""
+    """Qué haría la sincronización de «Condiciones» (fase 3, sustituye las reglas de la homóloga por las de ES) sin escribir:
+    {state, rules, disjunctive, texts}. state: NO_RULES (ES manual) | MANUAL_TARGET (homóloga manual) | NO_COPYABLE | SAME (ya iguales) | REPLACE."""
     src=admin_gql(ms,CATEGORY_EDIT_READ,{'id':master_gid}).get('collection') or {}
     tgt=admin_gql(st,CATEGORY_EDIT_READ,{'id':target_gid}).get('collection') or {}
-    if not src.get('ruleSet'): return {'state':'NO_RULES','new':[],'positives':[]}
-    if not tgt.get('ruleSet'): return {'state':'MANUAL_TARGET','new':[],'positives':[]}
-    have={category_rule_key(r) for r in tgt['ruleSet']['rules']}
-    new=[r for r in src['ruleSet']['rules'] if r['column'] in CATEGORY_RULE_COLUMNS and (r.get('conditionObject') or {}).get('__typename')=='CollectionRuleTextCondition' and category_rule_key(r) not in have]
-    if not new: return {'state':'NOTHING_NEW','new':[],'positives':[]}
-    disj=bool(tgt['ruleSet']['appliedDisjunctively'])
-    positives=[r for r in new if r['relation']=='EQUALS' and r['column'] in ('TAG','TYPE')]
-    return {'state':'ANY' if disj else 'ALL','new':[category_rule_text(r) for r in new],'positives':positives}
+    if not src.get('ruleSet'): return {'state':'NO_RULES'}
+    if not tgt.get('ruleSet'): return {'state':'MANUAL_TARGET'}
+    want,disj,_=category_rules_from_master(src['ruleSet'])
+    if not want: return {'state':'NO_COPYABLE'}
+    if {category_rule_key(r) for r in want}=={category_rule_key(r) for r in tgt['ruleSet']['rules']} and disj==bool(tgt['ruleSet']['appliedDisjunctively']): return {'state':'SAME'}
+    return {'state':'REPLACE','rules':want,'disjunctive':disj,'texts':[category_rule_text(r) for r in want]}
 
-def category_rule_covers(rule,detail):
+def category_rule_verdict(rule,detail):
+    """True/False si el producto cumple la regla; None si no se puede saber con etiquetas y tipo."""
     cond=(rule.get('condition') or '').strip().lower()
-    return cond in detail['tags'] if rule['column']=='TAG' else detail['type']==cond
+    if rule['column']=='TAG': have=cond in detail['tags']
+    elif rule['column']=='TYPE': have=detail['type']==cond
+    else: return None
+    if rule['relation']=='EQUALS': return have
+    if rule['relation']=='NOT_EQUALS': return not have
+    return None
+
+def category_rules_verdict(sync,detail):
+    """True/False si las reglas de ES (combinadas como en ES) incluirían/excluirían el producto; None si es dudoso."""
+    v=[category_rule_verdict(r,detail) for r in sync['rules']]
+    if sync['disjunctive']: return True if True in v else (None if None in v else False)
+    return False if False in v else (None if None in v else True)
 
 def category_sku_diff(master_gid,store_code):
     """Compara los SKU de los productos activos de la categoría maestra con los de su homóloga vinculada."""
@@ -3772,16 +3909,22 @@ def category_sku_diff(master_gid,store_code):
         elif k not in in_store: code='NOT_IN_STORE'
         else: code='OUTSIDE_COLLECTION' if in_store[k]=='ACTIVE' else 'NOT_ACTIVE'
         row={'sku':m[k],'result':'MISSING','code':code,'detail':CATEGORY_DETAIL[code]}
-        if code=='OUTSIDE_COLLECTION' and sync and sync['state']=='ANY' and any(category_rule_covers(r,details[k]) for r in sync['positives']):
+        if code=='OUTSIDE_COLLECTION' and sync and sync['state']=='REPLACE' and category_rules_verdict(sync,details[k]) is True:
             row['rules_fix']=True; fixes+=1
         rows.append(row)
     in_es=category_sku_status(ms,[t[k] for k in extra[:CATEGORY_SKU_RESOLVE_MAX]])
+    leaves=0; extra_details={}
+    if sync and sync['state']=='REPLACE':
+        try: category_sku_status(st,[t[k] for k in extra[:CATEGORY_SKU_RESOLVE_MAX]],extra_details)
+        except Exception: logging.getLogger('hub.admin').exception('No se pudo evaluar los SKU sobrantes frente a las reglas'); extra_details={}
     for i,k in enumerate(extra):
         if i>=CATEGORY_SKU_RESOLVE_MAX: code='UNCHECKED'; unchecked+=1
         else: code='ELSEWHERE_IN_ES' if k in in_es else 'NOT_IN_ES'
-        rows.append({'sku':t[k],'result':'EXTRA','code':code,'detail':CATEGORY_DETAIL[code]})
+        row={'sku':t[k],'result':'EXTRA','code':code,'detail':CATEGORY_DETAIL[code]}
+        if k in extra_details and category_rules_verdict(sync,extra_details[k]) is False: row['rules_fix']=True; leaves+=1
+        rows.append(row)
     rows+=[{'sku':m[k],'result':'MATCH','code':'','detail':''} for k in match]
-    return {'store':st['code'],'summary':{'master':len(m),'target':len(t),'match':len(match),'missing':len(missing),'extra':len(extra)},'rows':rows,'truncated':m_trunc or t_trunc,'unchecked':unchecked,'rules_sync':({'state':sync['state'],'new':sync['new'],'fixes':fixes} if sync else None)}
+    return {'store':st['code'],'summary':{'master':len(m),'target':len(t),'match':len(match),'missing':len(missing),'extra':len(extra)},'rows':rows,'truncated':m_trunc or t_trunc,'unchecked':unchecked,'rules_sync':({'state':sync['state'],'rules':sync.get('texts',[]),'fixes':fixes,'leaves':leaves} if sync else None)}
 
 @app.get('/api/admin/categories/skus')
 def category_skus(master:str,store:str):
@@ -3810,7 +3953,7 @@ def category_skus_csv(master:str,store:str=''):
     for r in results:
         if not r['ok']: w.writerow([category_csv_cell(title),r['store'],'','Error',category_csv_cell(r['error'])]); continue
         for row in r['data']['rows']:
-            if row['result']!='MATCH': w.writerow([category_csv_cell(title),r['store'],category_csv_cell(row['sku']),CATEGORY_CSV_RESULT[row['result']],row['detail']+(' · Lo resolvería sincronizar las condiciones' if row.get('rules_fix') else '')])
+            if row['result']!='MATCH': w.writerow([category_csv_cell(title),r['store'],category_csv_cell(row['sku']),CATEGORY_CSV_RESULT[row['result']],row['detail']+(' · Lo resolvería sustituir las condiciones por las de ES' if row.get('rules_fix') else '')])
     import unicodedata
     name=re.sub(r'[^A-Za-z0-9_-]+','_',unicodedata.normalize('NFKD',title).encode('ascii','ignore').decode()).strip('_') or 'categoria'
     return Response('\ufeff'+out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename="incidencias_sku_{name}.csv"'})
@@ -3822,7 +3965,7 @@ CATEGORY_EDIT_FIELDS={
     'parent':{'label':'Miga de pan / colección padre','key':'miga_de_pan_colecci_n_padre','type':'collection_reference'},
     'related':{'label':'Categorías relacionadas','key':'colecciones_relacionadas','type':'list.collection_reference'},
     'inspiration':{'label':'«Necesitas más inspiración»','key':'necesitas_m_s_inspiraci_n','type':'list.collection_reference'},
-    'rules':{'label':'Condiciones (se añaden reglas de etiqueta y tipo)'},
+    'rules':{'label':'Condiciones (sustituyen a las de la homóloga)'},
 }
 CATEGORY_REF_FIELDS=('parent','related','inspiration')
 CATEGORY_RULE_COLUMNS={'TAG','TYPE'}  # las reglas por título dependen del idioma y no se copian
@@ -3866,15 +4009,24 @@ def category_rule_key(r):
 def category_rule_text(r):
     return f"{r['column']} {r['relation']} «{r.get('condition') or ''}»"
 
-def category_match_count(st,rules):
-    """Productos que cumplen A LA VEZ todas las reglas positivas (etiqueta o tipo igual a...). Cota superior de lo que quedaría en la colección."""
+def category_rules_exact(rules):
+    """True si todas las reglas son «etiqueta/tipo igual a», las únicas que se pueden contar con precisión."""
+    return bool(rules) and all(r['relation']=='EQUALS' and r['column'] in ('TAG','TYPE') for r in rules)
+
+def category_rules_from_master(rule_set):
+    """(reglas copiables, combinación «cualquiera», textos de las no copiables) de la colección maestra."""
+    copyable=[r for r in rule_set['rules'] if r['column'] in CATEGORY_RULE_COLUMNS and (r.get('conditionObject') or {}).get('__typename')=='CollectionRuleTextCondition']
+    return copyable,bool(rule_set['appliedDisjunctively']),[category_rule_text(r) for r in rule_set['rules'] if r not in copyable]
+
+def category_match_count(st,rules,disjunctive=False):
+    """Productos que cumplen las reglas de etiqueta/tipo (todas a la vez, o cualquiera si disjunctive). Solo fiable si category_rules_exact."""
     parts=[]
     for r in rules:
         if r['relation']!='EQUALS' or r['column'] not in ('TAG','TYPE'): continue
         safe=(r.get('condition') or '').replace('\\','\\\\').replace('"','\\"')
         parts.append(('tag' if r['column']=='TAG' else 'product_type')+f':"{safe}"')
     if not parts: return None
-    return (admin_gql(st,'query($q:String){productsCount(query:$q,limit:10000){count}}',{'q':' AND '.join(parts)}).get('productsCount') or {}).get('count') or 0
+    return (admin_gql(st,'query($q:String){productsCount(query:$q,limit:10000){count}}',{'q':(' OR ' if disjunctive else ' AND ').join(parts)}).get('productsCount') or {}).get('count') or 0
 
 def category_edit_plan_store(st,master_gid,src,src_titles,fields,partial):
     """Qué cambiaría en una tienda (solo lectura). Cada campo queda CHANGE (se aplicará), SAME (ya igual) o BLOCKED (con el motivo)."""
@@ -3925,35 +4077,21 @@ def category_edit_plan_store(st,master_gid,src,src_titles,fields,partial):
         elif field=='rules':
             if not src.get('ruleSet'): add(field,'BLOCKED',reason='La categoría de España es manual (no tiene condiciones)'); continue
             if not tgt.get('ruleSet'): add(field,'BLOCKED',reason='La homóloga es una colección manual (no admite condiciones)'); continue
-            trules=tgt['ruleSet']['rules']; have={category_rule_key(r) for r in trules}
-            copyable=[r for r in src['ruleSet']['rules'] if r['column'] in CATEGORY_RULE_COLUMNS and (r.get('conditionObject') or {}).get('__typename')=='CollectionRuleTextCondition']
-            skipped=[category_rule_text(r) for r in src['ruleSet']['rules'] if r not in copyable]
-            warn=['No se copia (depende del idioma): '+t for t in skipped]
-            if src['ruleSet']['appliedDisjunctively']!=tgt['ruleSet']['appliedDisjunctively']: warn.append('ES y la homóloga combinan las reglas de forma distinta (todas / cualquiera); no se cambia')
-            new=[r for r in copyable if category_rule_key(r) not in have]
-            if not new: add(field,'SAME',[category_rule_text(r) for r in trules],[],warn); continue
-            before_txt=[category_rule_text(r) for r in trules]
-            disj=tgt['ruleSet']['appliedDisjunctively']
-            positives=[r for r in new if r['relation']=='EQUALS' and r['column'] in ('TAG','TYPE')]
-            if positives and disj:
-                n=category_match_count(st,positives)
-                if n==0: add(field,'BLOCKED',before_txt,[category_rule_text(r) for r in new],warn,'Ningún producto de la tienda cumple la regla nueva: '+', '.join(category_rule_text(r) for r in positives)); continue
-                warn.append(f'Las reglas se combinan con «cualquiera»: la nueva añadiría hasta {n} productos a la colección')
-            elif positives:  # «todas»: cada regla positiva nueva restringe la colección
-                after_rules=[r for r in trules]+positives
-                n0=category_match_count(st,trules); n1=category_match_count(st,after_rules)
-                if n1==0: add(field,'BLOCKED',before_txt,[category_rule_text(r) for r in new],warn,f'La colección quedaría vacía: ningún producto cumple a la vez todas las etiquetas/tipos requeridos (con las reglas nuevas: {", ".join(category_rule_text(r) for r in positives)}). Probablemente las etiquetas aún no están unificadas en esta tienda'); continue
-                if n0 is not None and n1<n0: warn.append(f'Las reglas se combinan con «todas»: la colección se reduciría de {n0} a {n1} productos (sin contar las exclusiones)')
-            keep=[]; unsupported=False
-            for r in trules:
-                item={'column':r['column'],'relation':r['relation'],'condition':r.get('condition') or ''}
-                kind=(r.get('conditionObject') or {}).get('__typename')
-                if kind=='CollectionRuleMetafieldCondition': item['conditionObjectId']=((r['conditionObject'].get('metafieldDefinition')) or {}).get('id')
-                elif kind!='CollectionRuleTextCondition': unsupported=True
-                keep.append(item)
-            if unsupported: add(field,'BLOCKED',reason='La homóloga tiene condiciones de un tipo que esta herramienta no puede conservar'); continue
-            merged=keep+[{'column':r['column'],'relation':r['relation'],'condition':r['condition']} for r in new]
-            add(field,'CHANGE',[category_rule_text(r) for r in trules],[category_rule_text(r) for r in trules]+['+ '+category_rule_text(r) for r in new],warn,apply={'rules':merged,'disjunctive':tgt['ruleSet']['appliedDisjunctively']})
+            trules=tgt['ruleSet']['rules']; before_txt=[category_rule_text(r) for r in trules]
+            want,disj,skipped=category_rules_from_master(src['ruleSet'])
+            warn=['No se copia (depende del idioma o del tipo de condición): '+t for t in skipped]
+            if not want: add(field,'BLOCKED',before_txt,[],warn,'La categoría de España no tiene condiciones de etiqueta o tipo que copiar (la homóloga se quedaría sin reglas)'); continue
+            after_txt=[category_rule_text(r) for r in want]
+            if {category_rule_key(r) for r in want}=={category_rule_key(r) for r in trules} and disj==bool(tgt['ruleSet']['appliedDisjunctively']): add(field,'SAME',before_txt,after_txt,warn); continue
+            if disj!=bool(tgt['ruleSet']['appliedDisjunctively']): warn.append('Cambia la combinación de reglas: pasa a «'+('cualquiera' if disj else 'todas')+'» como en ES')
+            lost=[category_rule_text(r) for r in trules if category_rule_key(r) not in {category_rule_key(w) for w in want}]
+            if lost: warn.append('Se eliminan de la homóloga: '+'; '.join(lost))
+            if category_rules_exact(want):
+                n1=category_match_count(st,want,disj)
+                if n1==0: add(field,'BLOCKED',before_txt,after_txt,warn,'La colección quedaría vacía: ningún producto de la tienda cumple las condiciones de ES. Probablemente las etiquetas o tipos aún no están unificados en esta tienda'); continue
+                n0=category_match_count(st,trules,bool(tgt['ruleSet']['appliedDisjunctively'])) if category_rules_exact(trules) else None
+                warn.append(f'Con las condiciones de ES la colección tendría {n1} productos'+(f' (ahora {n0})' if n0 is not None else ''))
+            add(field,'CHANGE',before_txt,after_txt,warn,apply={'rules':[{'column':r['column'],'relation':r['relation'],'condition':r['condition']} for r in want],'disjunctive':disj})
     return {'store':st['code'],'status':'READY','collection':{'id':tgt['id'],'title':tgt['title'],'handle':tgt['handle']},'fields':out}
 
 def category_edit_plan(x):
