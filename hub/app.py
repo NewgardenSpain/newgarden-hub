@@ -4169,36 +4169,40 @@ def _basename(url):
     name=(url or '').split('?')[0].rsplit('/',1)[-1].lower()
     return re.sub(r'_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=\.[a-z0-9]+$)','',name)
 
-def _image_pixels_bytes(data):
-    """Píxeles decodificados de la imagen: Shopify recomprime sin pérdida (JPEG progresivo, EXIF/ICC) al guardar, así que el hash del archivo cambia aunque la foto sea la misma.
-    Si no se puede decodificar, se usa el archivo completo."""
-    try:
-        from PIL import Image
-        with Image.open(io.BytesIO(data)) as im:
-            im.load()
-            return f'{im.mode}{im.size}'.encode()+im.tobytes()
-    except Exception: return data
+_IMAGE_BYTES={}
 
-_IMAGE_HASHES={}
-
-def _image_hash(url):
-    """SHA-256 del contenido de la imagen (None si no se puede descargar). El nombre de archivo no sirve para compararlas: dos tiendas pueden tener «Interiores.jpg» con fotos distintas."""
+def _image_bytes(url):
+    """Archivo de la imagen (None si no se puede descargar). Con el ?v= : sin él la CDN puede servir la versión anterior en caché."""
     if not url: return None
-    key=url  # con el ?v= : sin él la CDN puede servir la versión anterior en caché
-    if key in _IMAGE_HASHES: return _IMAGE_HASHES[key]
+    if url in _IMAGE_BYTES: return _IMAGE_BYTES[url]
     try:
-        with urllib.request.urlopen(urllib.request.Request(key,headers={'User-Agent':'newgarden-content-hub'}),timeout=30) as r: digest=hashlib.sha256(_image_pixels_bytes(r.read())).hexdigest()
+        with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'newgarden-content-hub'}),timeout=30) as r: data=r.read()
     except Exception: return None
-    if len(_IMAGE_HASHES)>2000: _IMAGE_HASHES.clear()
-    _IMAGE_HASHES[key]=digest
-    return digest
+    if len(_IMAGE_BYTES)>40: _IMAGE_BYTES.clear()
+    _IMAGE_BYTES[url]=data
+    return data
+
+IMAGE_MAX_DIFF=8  # Shopify recomprime al guardar: la misma foto varía unos pocos niveles de 255 en alguna zona
+
+def _images_match(url_a,url_b):
+    """True si es la misma imagen. El nombre no sirve (dos tiendas pueden tener «Interiores.jpg» con fotos distintas) y el hash del archivo tampoco (Shopify lo reescribe).
+    Se comparan los píxeles decodificados con una tolerancia mínima; si no se puede descargar o decodificar, solo cuenta el archivo idéntico."""
+    da,db=_image_bytes(url_a),_image_bytes(url_b)
+    if not da or not db: return False
+    if da==db: return True
+    try:
+        from PIL import Image, ImageChops
+        with Image.open(io.BytesIO(da)) as ia, Image.open(io.BytesIO(db)) as ib:
+            if ia.size!=ib.size: return False
+            diff=ImageChops.difference(ia.convert('RGB'),ib.convert('RGB'))
+            return max(diff.getextrema(),key=lambda e:e[1])[1]<=IMAGE_MAX_DIFF
+    except Exception: return False
 
 def _image_state(src_url,cur_url):
     """(¿iguales?, etiqueta actual, etiqueta nueva). Iguales solo si el contenido coincide; si no se puede comprobar, se trata como distinta."""
     a,b=_basename(src_url),_basename(cur_url)
     if not cur_url: return False,'',a
-    ha,hb=_image_hash(src_url),_image_hash(cur_url)
-    if ha and ha==hb: return True,b,a
+    if _images_match(src_url,cur_url): return True,b,a
     if a==b: return False,b+' (otra imagen, mismo nombre)',a
     return False,b,a
 
@@ -4343,14 +4347,13 @@ def category_apply_field(st,gid,f):
             # Colecciones con funciones nuevas: Shopify exige el argumento `collection`
             admin_exec(st,'mutation($c:CollectionUpdateInput!){collectionUpdate(collection:$c){collection{id} userErrors{field message}}}',{'c':{'id':gid,'image':image}},'collectionUpdate')
         # Comprobación real: Shopify procesa la imagen y puede aceptar la mutación sin dejarla puesta
-        want=_image_hash(a['src']); got=None
-        # Shopify descarga y procesa la imagen de forma asíncrona: puede tardar más de 15 s en aparecer (la colección pasa por sin imagen / imagen anterior)
+        if not _image_bytes(a['src']): raise HTTPException(502,'No se pudo descargar la imagen de España para verificarla')
+        ok=False
         for _ in range(30):
-            got=_image_hash(((admin_gql(st,'query($id:ID!){collection(id:$id){image{url}}}',{'id':gid}).get('collection') or {}).get('image') or {}).get('url'))
-            if got and got==want: break
+            cur=((admin_gql(st,'query($id:ID!){collection(id:$id){image{url}}}',{'id':gid}).get('collection') or {}).get('image') or {}).get('url')
+            if cur and _images_match(a['src'],cur): ok=True; break
             time.sleep(2)
-        if not want: raise HTTPException(502,'No se pudo descargar la imagen de España para verificarla')
-        if got!=want: raise HTTPException(502,'Shopify aceptó el cambio pero tras 60 s la imagen de la colección sigue sin coincidir con la de España; revisa la colección en Shopify antes de reintentar (puede haberse aplicado con retraso)')
+        if not ok: raise HTTPException(502,'Shopify aceptó el cambio pero tras 60 s la imagen de la colección sigue sin coincidir con la de España; revisa la colección en Shopify antes de reintentar (puede haberse aplicado con retraso)')
     elif field=='icon':
         created=admin_exec(st,'mutation($files:[FileCreateInput!]!){fileCreate(files:$files){files{id} userErrors{field message}}}',{'files':[{'originalSource':a['src'],'contentType':'IMAGE'}]},'fileCreate')
         file_id=((created.get('files') or [{}])[0]).get('id')
