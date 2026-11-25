@@ -4334,11 +4334,13 @@ def category_apply_field(st,gid,f):
             admin_exec(st,'mutation($c:CollectionUpdateInput!){collectionUpdate(collection:$c){collection{id} userErrors{field message}}}',{'c':{'id':gid,'image':image}},'collectionUpdate')
         # Comprobación real: Shopify procesa la imagen y puede aceptar la mutación sin dejarla puesta
         want=_image_hash(a['src']); got=None
-        for _ in range(10):
+        # Shopify descarga y procesa la imagen de forma asíncrona: puede tardar más de 15 s en aparecer (la colección pasa por sin imagen / imagen anterior)
+        for _ in range(30):
             got=_image_hash(((admin_gql(st,'query($id:ID!){collection(id:$id){image{url}}}',{'id':gid}).get('collection') or {}).get('image') or {}).get('url'))
             if got and got==want: break
-            time.sleep(1.5)
-        if not want or got!=want: raise HTTPException(502,'Shopify aceptó el cambio pero la imagen de la colección no coincide con la de España al releerla')
+            time.sleep(2)
+        if not want: raise HTTPException(502,'No se pudo descargar la imagen de España para verificarla')
+        if got!=want: raise HTTPException(502,'Shopify aceptó el cambio pero tras 60 s la imagen de la colección sigue sin coincidir con la de España; revisa la colección en Shopify antes de reintentar (puede haberse aplicado con retraso)')
     elif field=='icon':
         created=admin_exec(st,'mutation($files:[FileCreateInput!]!){fileCreate(files:$files){files{id} userErrors{field message}}}',{'files':[{'originalSource':a['src'],'contentType':'IMAGE'}]},'fileCreate')
         file_id=((created.get('files') or [{}])[0]).get('id')
