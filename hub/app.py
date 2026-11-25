@@ -4327,7 +4327,11 @@ def category_apply_field(st,gid,f):
     if field=='image':
         image={'src':a['src']}
         if a.get('alt'): image['altText']=a['alt']
-        admin_exec(st,'mutation($input:CollectionInput!){collectionUpdate(input:$input){collection{id} userErrors{field message}}}',{'input':{'id':gid,'image':image}},'collectionUpdate')
+        try: admin_exec(st,'mutation($input:CollectionInput!){collectionUpdate(input:$input){collection{id} userErrors{field message}}}',{'input':{'id':gid,'image':image}},'collectionUpdate')
+        except HTTPException as exc:
+            if 'legacy collection API' not in str(exc.detail): raise
+            # Colecciones con funciones nuevas: Shopify exige el argumento `collection`
+            admin_exec(st,'mutation($c:CollectionUpdateInput!){collectionUpdate(collection:$c){collection{id} userErrors{field message}}}',{'c':{'id':gid,'image':image}},'collectionUpdate')
         # Comprobación real: Shopify procesa la imagen y puede aceptar la mutación sin dejarla puesta
         want=_image_hash(a['src']); got=None
         for _ in range(10):
