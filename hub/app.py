@@ -4169,6 +4169,29 @@ def _basename(url):
     name=(url or '').split('?')[0].rsplit('/',1)[-1].lower()
     return re.sub(r'_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=\.[a-z0-9]+$)','',name)
 
+_IMAGE_HASHES={}
+
+def _image_hash(url):
+    """SHA-256 del contenido de la imagen (None si no se puede descargar). El nombre de archivo no sirve para compararlas: dos tiendas pueden tener «Interiores.jpg» con fotos distintas."""
+    if not url: return None
+    key=url.split('?')[0]
+    if key in _IMAGE_HASHES: return _IMAGE_HASHES[key]
+    try:
+        with urllib.request.urlopen(urllib.request.Request(key,headers={'User-Agent':'newgarden-content-hub'}),timeout=30) as r: digest=hashlib.sha256(r.read()).hexdigest()
+    except Exception: return None
+    if len(_IMAGE_HASHES)>2000: _IMAGE_HASHES.clear()
+    _IMAGE_HASHES[key]=digest
+    return digest
+
+def _image_state(src_url,cur_url):
+    """(¿iguales?, etiqueta actual, etiqueta nueva). Iguales solo si el contenido coincide; si no se puede comprobar, se trata como distinta."""
+    a,b=_basename(src_url),_basename(cur_url)
+    if not cur_url: return False,'',a
+    ha,hb=_image_hash(src_url),_image_hash(cur_url)
+    if ha and ha==hb: return True,b,a
+    if a==b: return False,b+' (otra imagen, mismo nombre)',a
+    return False,b,a
+
 def _gid_list(value):
     try: data=json.loads(value) if value else []
     except ValueError: return []
@@ -4225,15 +4248,17 @@ def category_edit_plan_store(st,master_gid,src,src_titles,fields,partial):
         if field=='image':
             url=(src.get('image') or {}).get('url'); cur=(tgt.get('image') or {}).get('url')
             if not url: add(field,'BLOCKED',reason='La categoría de España no tiene imagen'); continue
-            if _basename(url)==_basename(cur): add(field,'SAME',_basename(cur),_basename(url)); continue
-            add(field,'CHANGE',_basename(cur) or '(sin imagen)',_basename(url),apply={'src':url,'alt':(tgt.get('image') or {}).get('altText')})
+            same,b_lbl,a_lbl=_image_state(url,cur)
+            if same: add(field,'SAME',b_lbl,a_lbl); continue
+            add(field,'CHANGE',b_lbl or '(sin imagen)',a_lbl,apply={'src':url,'alt':(tgt.get('image') or {}).get('altText')})
         elif field=='icon':
             ref=(src.get('icon') or {}).get('reference') or {}; url=(ref.get('image') or {}).get('url')
             if not url: add(field,'BLOCKED',reason='La categoría de España no tiene icono (imagen)'); continue
             if defs.get((CATEGORY_NS,spec['key']))!=spec['type']: add(field,'BLOCKED',reason=f'La tienda no tiene el metacampo {CATEGORY_NS}.{spec["key"]} ({spec["type"]})'); continue
             cur=((((tgt.get('icon') or {}).get('reference') or {}).get('image')) or {}).get('url')
-            if _basename(url)==_basename(cur): add(field,'SAME',_basename(cur),_basename(url)); continue
-            add(field,'CHANGE',_basename(cur) or '(sin icono)',_basename(url),apply={'src':url})
+            same,b_lbl,a_lbl=_image_state(url,cur)
+            if same: add(field,'SAME',b_lbl,a_lbl); continue
+            add(field,'CHANGE',b_lbl or '(sin icono)',a_lbl,apply={'src':url})
         elif field in CATEGORY_REF_FIELDS:
             raw=(src.get(field) or {}).get('value')
             is_list=spec['type'].startswith('list.'); wanted=_gid_list(raw) if is_list else ([raw] if raw else [])
@@ -4303,6 +4328,13 @@ def category_apply_field(st,gid,f):
         image={'src':a['src']}
         if a.get('alt'): image['altText']=a['alt']
         admin_exec(st,'mutation($input:CollectionInput!){collectionUpdate(input:$input){collection{id} userErrors{field message}}}',{'input':{'id':gid,'image':image}},'collectionUpdate')
+        # Comprobación real: Shopify procesa la imagen y puede aceptar la mutación sin dejarla puesta
+        want=_image_hash(a['src']); got=None
+        for _ in range(10):
+            got=_image_hash(((admin_gql(st,'query($id:ID!){collection(id:$id){image{url}}}',{'id':gid}).get('collection') or {}).get('image') or {}).get('url'))
+            if got and got==want: break
+            time.sleep(1.5)
+        if not want or got!=want: raise HTTPException(502,'Shopify aceptó el cambio pero la imagen de la colección no coincide con la de España al releerla')
     elif field=='icon':
         created=admin_exec(st,'mutation($files:[FileCreateInput!]!){fileCreate(files:$files){files{id} userErrors{field message}}}',{'files':[{'originalSource':a['src'],'contentType':'IMAGE'}]},'fileCreate')
         file_id=((created.get('files') or [{}])[0]).get('id')
