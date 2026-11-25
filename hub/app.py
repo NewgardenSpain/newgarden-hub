@@ -1,6 +1,6 @@
 from decimal import Decimal
 from typing import Any
-import hashlib, json, logging, os, html, re, threading, time, uuid
+import hashlib, io, json, logging, os, html, re, threading, time, uuid
 import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
@@ -4169,6 +4169,16 @@ def _basename(url):
     name=(url or '').split('?')[0].rsplit('/',1)[-1].lower()
     return re.sub(r'_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=\.[a-z0-9]+$)','',name)
 
+def _image_pixels_bytes(data):
+    """Píxeles decodificados de la imagen: Shopify recomprime sin pérdida (JPEG progresivo, EXIF/ICC) al guardar, así que el hash del archivo cambia aunque la foto sea la misma.
+    Si no se puede decodificar, se usa el archivo completo."""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            im.load()
+            return f'{im.mode}{im.size}'.encode()+im.tobytes()
+    except Exception: return data
+
 _IMAGE_HASHES={}
 
 def _image_hash(url):
@@ -4177,7 +4187,7 @@ def _image_hash(url):
     key=url  # con el ?v= : sin él la CDN puede servir la versión anterior en caché
     if key in _IMAGE_HASHES: return _IMAGE_HASHES[key]
     try:
-        with urllib.request.urlopen(urllib.request.Request(key,headers={'User-Agent':'newgarden-content-hub'}),timeout=30) as r: digest=hashlib.sha256(r.read()).hexdigest()
+        with urllib.request.urlopen(urllib.request.Request(key,headers={'User-Agent':'newgarden-content-hub'}),timeout=30) as r: digest=hashlib.sha256(_image_pixels_bytes(r.read())).hexdigest()
     except Exception: return None
     if len(_IMAGE_HASHES)>2000: _IMAGE_HASHES.clear()
     _IMAGE_HASHES[key]=digest
