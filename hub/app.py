@@ -4174,7 +4174,7 @@ _IMAGE_HASHES={}
 def _image_hash(url):
     """SHA-256 del contenido de la imagen (None si no se puede descargar). El nombre de archivo no sirve para compararlas: dos tiendas pueden tener «Interiores.jpg» con fotos distintas."""
     if not url: return None
-    key=url.split('?')[0]
+    key=url  # con el ?v= : sin él la CDN puede servir la versión anterior en caché
     if key in _IMAGE_HASHES: return _IMAGE_HASHES[key]
     try:
         with urllib.request.urlopen(urllib.request.Request(key,headers={'User-Agent':'newgarden-content-hub'}),timeout=30) as r: digest=hashlib.sha256(r.read()).hexdigest()
