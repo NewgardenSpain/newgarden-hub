@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 import psycopg.errors
 from psycopg.types.json import Jsonb
 from .db import pool, initialize
+from .skumatch import bc_sku
 from .skufile import extract_skus
 from .quality import assess_translation, strip_added_quotes
 from .profiles import active_profiles, list_active_profiles, target_profile
@@ -617,7 +618,9 @@ def list_sku_candidates(status:str|None=None,kind:str|None=None,conf:str|None=No
         counts=dict(c.execute('SELECT status,count(*) FROM sku_link_candidates GROUP BY status').fetchall())
         high=c.execute("SELECT count(*),count(*) FILTER (WHERE mx_status='ACTIVE') FROM sku_link_candidates WHERE status='pending' AND score>=0.9 AND es_sku IS NOT NULL AND kind<>'none'").fetchone()
     keys=('id','mx_sku','mx_barcode','mx_title','mx_variant_title','mx_status','kind','es_sku','es_title','components','score','reasons','alternatives','status')
-    return {'candidates':[dict(zip(keys,r)) for r in rows],'total':total,'counts':counts,'high_pending':high[0],'high_pending_active':high[1],'running':SKU_LINK_STATE['running']}
+    cands=[dict(zip(keys,r)) for r in rows]
+    for k in cands: k['bc_sku']=bc_sku(k['es_sku']) if k['es_sku'] else None
+    return {'candidates':cands,'total':total,'counts':counts,'high_pending':high[0],'high_pending_active':high[1],'running':SKU_LINK_STATE['running']}
 
 def _es_variant_by_sku(sku,cache):
     if sku in cache: return cache[sku]
@@ -702,30 +705,39 @@ def resolve_sku(store:str,sku:str,user=Depends(operator)):
 
     `store` es la tienda del SKU recibido (MX o ES). Con MX también se busca por EAN. Devuelve `links`
     (vacío si aún no está vinculado), cada uno con `es_sku`, `kind` (single|pack|bundle|refurb|none),
-    `components` (`[{sku_es, qty}]` en packs y kits) y `status` (CONFIRMED | NONE = sin equivalente en ES).
+    `bc_sku` (el SKU sin sufijo organizativo XMAS/IND/ACC/NG1-3: el que existe en Business Central), `components` (`[{sku_es, bc_sku, qty}]` en packs y kits) y `status` (CONFIRMED | NONE = sin equivalente en ES).
     """
     store=store.upper(); sku=sku.strip()
+    base=bc_sku(sku)
+    cols="mx_variant_gid,mx_sku,mx_barcode,es_sku,kind,components,status"
     with pool.connection() as c:
         if store=='MX':
-            rows=c.execute("SELECT mx_variant_gid,mx_sku,mx_barcode,es_sku,kind,components,status FROM sku_links WHERE mx_sku=%s OR mx_barcode=%s",(sku,sku)).fetchall()
+            rows=c.execute(f"SELECT {cols} FROM sku_links WHERE mx_sku=%s OR mx_barcode=%s",(sku,sku)).fetchall()
         elif store=='ES':
-            rows=c.execute("SELECT mx_variant_gid,mx_sku,mx_barcode,es_sku,kind,components,status FROM sku_links WHERE es_sku=%s OR components @> %s",(sku,Jsonb([{'sku_es':sku}]))).fetchall()
+            # El SKU de ES puede llevar sufijo organizativo (IND, XMAS…): se busca por código BC.
+            like='%'+base.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+            rows=c.execute(f"SELECT {cols} FROM sku_links WHERE es_sku LIKE %s OR components::text LIKE %s",(like,like)).fetchall()
+            rows=[r for r in rows if (r[3] and bc_sku(r[3])==base) or any(bc_sku(k.get('sku_es',''))==base for k in r[5])]
         else: raise HTTPException(400,'store debe ser MX o ES')
     keys=('mx_variant_gid','mx_sku','mx_barcode','es_sku','kind','components','status')
-    return {'store':store,'sku':sku,'links':[dict(zip(keys,r)) for r in rows]}
+    links=[dict(zip(keys,r)) for r in rows]
+    for k in links:
+        k['bc_sku']=bc_sku(k['es_sku']) if k['es_sku'] else None
+        k['components']=[{**comp,'bc_sku':bc_sku(comp.get('sku_es',''))} for comp in k['components']]
+    return {'store':store,'sku':sku,'bc_sku':base,'links':links}
 
 @app.get('/api/sku-links/export',tags=['Emparejar SKU MX↔ES'],summary='Exportar el mapa MX→ES',
-    responses={200:{'description':'CSV por defecto; JSON con format=json','content':{'text/csv':{'schema':{'type':'string','example':'mx_sku,mx_ean,es_sku,qty,kind,status'}},'application/json':{'schema':{'type':'object','properties':{'links':{'type':'array','items':{'type':'object'}}}}}}}})
+    responses={200:{'description':'CSV por defecto; JSON con format=json','content':{'text/csv':{'schema':{'type':'string','example':'mx_sku,mx_ean,es_sku,es_shopify_sku,qty,kind,status'}},'application/json':{'schema':{'type':'object','properties':{'links':{'type':'array','items':{'type':'object'}}}}}}}})
 def export_sku_links(format:str='csv',user=Depends(operator)):
-    """Mapa plano MX→ES para Business Central / n8n: una fila por componente (`qty` = unidades de ES). `format=csv` (por defecto) o `format=json`."""
+    """Mapa plano MX→ES para Business Central / n8n: una fila por componente (`qty` = unidades de ES). `es_sku` es el código de BC (sin sufijos XMAS/IND/ACC/NG1-3) y `es_shopify_sku` el SKU exacto de la variante en Shopify. `format=csv` (por defecto) o `format=json`."""
     with pool.connection() as c:
         rows=c.execute("SELECT mx_sku,mx_barcode,es_sku,kind,components,status FROM sku_links ORDER BY mx_sku").fetchall()
     flat=[]
     for mx_sku,mx_barcode,es_sku,kind,components,status in rows:
-        if components: flat+= [{'mx_sku':mx_sku,'mx_ean':mx_barcode,'es_sku':k['sku_es'],'qty':k.get('qty',1),'kind':kind,'status':status} for k in components]
-        else: flat.append({'mx_sku':mx_sku,'mx_ean':mx_barcode,'es_sku':es_sku,'qty':1 if es_sku else 0,'kind':kind,'status':status})
+        if components: flat+= [{'mx_sku':mx_sku,'mx_ean':mx_barcode,'es_sku':bc_sku(k['sku_es']),'es_shopify_sku':k['sku_es'],'qty':k.get('qty',1),'kind':kind,'status':status} for k in components]
+        else: flat.append({'mx_sku':mx_sku,'mx_ean':mx_barcode,'es_sku':bc_sku(es_sku) if es_sku else None,'es_shopify_sku':es_sku,'qty':1 if es_sku else 0,'kind':kind,'status':status})
     if format=='json': return {'links':flat}
-    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=['mx_sku','mx_ean','es_sku','qty','kind','status']); w.writeheader(); w.writerows(flat)
+    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=['mx_sku','mx_ean','es_sku','es_shopify_sku','qty','kind','status']); w.writeheader(); w.writerows(flat)
     return Response(out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="sku_links_mx_es.csv"'})
 
 @app.get('/sku-links',response_class=HTMLResponse,tags=['Emparejar SKU MX↔ES'],summary='Pantalla de revisión de emparejamientos')
@@ -780,7 +792,7 @@ async function load(){const q=new URLSearchParams();for(const [k,id] of [['statu
   const comps=c.components.length?'<span class="sku-sub">'+c.components.map(k=>esc(k.qty+'× '+k.sku_es)).join(' + ')+'</span>':'';
   const alts=locked||!c.alternatives.length?'<small class="muted">—</small>':'<div class="alts">'+c.alternatives.map(a=>`<button type="button" class="secondary pick" data-sku="${esc(a.sku)}" title="${esc(a.title)}">${esc(a.sku)} <small>${Math.round(a.score*100)}%</small></button>`).join('')+'</div>';
   return `<tr data-id="${c.id}"><td><span class="sku-code">${esc(c.mx_sku||'(sin SKU)')}</span>${c.mx_barcode?'<span class="sku-sub">EAN '+esc(c.mx_barcode)+'</span>':''}<strong class="sku-title">${esc(c.mx_title)}</strong>${c.mx_variant_title&&c.mx_variant_title!=='Default Title'?'<span class="sku-sub">'+esc(c.mx_variant_title)+'</span>':''}<div class="sku-badges"><span class="badge">${c.mx_status==='ACTIVE'?'Activo':esc(c.mx_status)}</span></div></td>
-  <td><input class="canon" value="${esc(c.es_sku||'')}" aria-label="SKU de ES para ${esc(c.mx_sku||c.mx_title)}" ${locked?'disabled':''}><span class="sku-sub es-title">${esc(c.es_title)}</span>${comps}</td>
+  <td><input class="canon" value="${esc(c.es_sku||'')}" aria-label="SKU de ES para ${esc(c.mx_sku||c.mx_title)}" ${locked?'disabled':''}>${c.bc_sku&&c.bc_sku!==c.es_sku?'<span class="sku-sub">Código BC: <strong class="bc-code">'+esc(c.bc_sku)+'</strong> (sin sufijo)</span>':''}<span class="sku-sub es-title">${esc(c.es_title)}</span>${comps}</td>
   <td>${alts}</td><td><div class="evidence"><span class="badge">${esc(kindLabel[c.kind]||c.kind)}</span><span class="score">${Math.round(c.score*100)}%</span></div>${c.reasons.length?'<span class="sku-sub">'+c.reasons.map(esc).join(' · ')+'</span>':''}</td>
   <td><span class="badge">${esc(badge[c.status]||c.status)}</span>${c.status==='approved'&&c.kind==='none'?'<span class="sku-sub">Sin equivalente</span>':''}</td>
   <td><div class="row-actions">${c.status==='pending'?'<button type="button" class="approve">Aprobar</button><button type="button" class="secondary none">Sin equivalente</button><button type="button" class="secondary reject">Rechazar</button>':'<button type="button" class="secondary reopen">Reabrir</button>'}</div><span class="status" role="status"></span></td></tr>`}).join('')+'</tbody></table>'}
