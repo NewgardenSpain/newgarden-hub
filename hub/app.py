@@ -1,6 +1,6 @@
 from decimal import Decimal
 from typing import Any
-import hashlib, io, json, logging, os, html, re, threading, time, uuid
+import csv, hashlib, io, json, logging, os, html, re, threading, time, uuid
 import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
@@ -344,6 +344,7 @@ def shell(title, body, active=''):
         'campaigns': '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
         'review': '<path d="M4 4h16v16H4zM8 9h8M8 13h5"/><path d="m14 17 2 2 4-4"/>',
         'glossary': '<path d="M12 5v16M12 5C8 2 4 3 2 4v15c3-1 6-1 10 2 4-3 7-3 10-2V4c-3-1-6-2-10 1Z"/>',
+        'skulinks': '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
         'stores': '<path d="M3 10v11h18V10M2 10l2-7h16l2 7M2 10h20M9 21v-7h6v7"/>',
         'stock': '<path d="M3 7h18v13H3zM3 7l3-4h12l3 4M9 12h6"/>',
         'tags': '<path d="M3 12V3h9l9 9-9 9-9-9Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',        'collections': '<rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/>',
@@ -351,7 +352,7 @@ def shell(title, body, active=''):
     }
     items = [('home','/','Resumen'),('admin','/admin','Administración'),('products','/products','Gestión de productos'),
              ('gallery','http://192.168.1.202:5678/webhook/panel-galeria','Panel de galería'),
-             ('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('stores','/stores','Tiendas')]
+             ('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('skulinks','/sku-links','Emparejar SKU'),('stores','/stores','Tiendas')]
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
@@ -525,6 +526,255 @@ def reopen_glossary_candidate(candidate_id:int,x:CandidateDecision|None=None,use
             c.execute("DELETE FROM translation_glossary WHERE source_store='ES' AND target_store=%s AND target_locale=%s AND lower(source_term)=lower(%s) AND origin='historical_review'",(store,locale,source_term))
         c.execute("UPDATE glossary_candidates SET status='pending' WHERE id=%s",(candidate_id,))
     return {'reopened':True}
+
+# ---------------------------------------------------------------------------
+# Emparejamiento de variantes MX con SKU de ES (revisión humana, como el glosario)
+# ---------------------------------------------------------------------------
+SKU_LINK_STATE={'running':False,'started':None,'finished':None,'error':None,'counts':None}
+SKU_LINK_LOCK=threading.Lock()
+SKU_VARIANTS_QUERY='''query SkuVariants($after:String) { products(first:100,after:$after) { pageInfo { hasNextPage endCursor } nodes { id handle title status variants(first:100) { nodes { id sku barcode title selectedOptions { value } } } } } }'''
+
+class SkuApprove(BaseModel):
+    es_sku:str|None=Field(default=None,max_length=255)
+    components:list[dict]|None=None
+
+class SkuBulk(BaseModel):
+    active_only:bool=True
+
+def _fetch_store_variants(code):
+    st=shopify_store_by_code(code)
+    if not st or not st['domain'] or not st['token']: raise HTTPException(502,f'La tienda {code} no está configurada')
+    out=[]; after=None
+    while True:
+        data=graphql_with_retry(shopify_graphql_payload,st['domain'],st['token'],SKU_VARIANTS_QUERY,{'after':after})['products']
+        for p in data['nodes']:
+            for v in p['variants']['nodes']:
+                out.append({'product_gid':p['id'],'handle':p['handle'],'product_title':p['title'],'status':p['status'],'variant_gid':v['id'],
+                            'sku':(v['sku'] or '').strip() or None,'barcode':(v['barcode'] or '').strip() or None,'variant_title':v['title'] or '',
+                            'options':[o['value'] for o in v['selectedOptions']]})
+        if not data['pageInfo']['hasNextPage']: return out
+        after=data['pageInfo']['endCursor']
+
+def _sku_recompute():
+    from .skumatch import match
+    try:
+        es=_fetch_store_variants('ES'); mx=_fetch_store_variants('MX')
+        cands=match(es,mx)
+        with pool.connection() as c:
+            c.execute("DELETE FROM sku_link_candidates WHERE status='pending'")
+            for k in cands:
+                c.execute("""INSERT INTO sku_link_candidates(mx_variant_gid,mx_product_gid,mx_sku,mx_barcode,mx_title,mx_variant_title,mx_status,kind,es_sku,es_variant_gid,es_title,components,score,reasons,alternatives)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(mx_variant_gid) DO NOTHING""",
+                    (k['mx_variant_gid'],k['mx_product_gid'],k['mx_sku'],k['mx_barcode'],k['mx_title'],k['mx_variant_title'],k['mx_status'],k['kind'],k['es_sku'],k['es_variant_gid'],k['es_title'],
+                     Jsonb(k['components']),k['score'],Jsonb(k['reasons']),Jsonb(k['alternatives'])))
+            counts=dict(c.execute('SELECT status,count(*) FROM sku_link_candidates GROUP BY status').fetchall())
+        SKU_LINK_STATE.update(error=None,counts=counts)
+    except Exception as exc:
+        logging.getLogger('hub.skulinks').exception('Error calculando candidatos SKU')
+        SKU_LINK_STATE.update(error=(str(exc.detail) if isinstance(exc,HTTPException) else f'{type(exc).__name__}: {exc}')[:400])
+    finally:
+        SKU_LINK_STATE.update(running=False,finished=time.time())
+
+@app.post('/api/sku-candidates/recompute',tags=['Emparejar SKU MX↔ES'],summary='Recalcular propuestas',response_description='started=false si ya hay un cálculo en curso')
+def sku_recompute(user=Depends(operator)):
+    """Descarga ES y MX (solo lectura en Shopify) y recalcula los candidatos pendientes; no toca los ya revisados."""
+    with SKU_LINK_LOCK:
+        if SKU_LINK_STATE['running']: return {'started':False,**SKU_LINK_STATE}
+        SKU_LINK_STATE.update(running=True,started=time.time(),finished=None,error=None)
+    threading.Thread(target=_sku_recompute,name='sku-match',daemon=True).start()
+    return {'started':True,**SKU_LINK_STATE}
+
+@app.get('/api/sku-candidates/recompute-status',tags=['Emparejar SKU MX↔ES'],summary='Estado del cálculo de propuestas')
+def sku_recompute_status(user=Depends(operator)): return SKU_LINK_STATE
+
+SKU_CONF_SQL={'high':'c.score>=0.9 AND c.es_sku IS NOT NULL','medium':'c.score>=0.6 AND c.score<0.9 AND c.es_sku IS NOT NULL','low':'c.score<0.6 AND c.es_sku IS NOT NULL','none':'c.es_sku IS NULL'}
+
+@app.get('/api/sku-candidates',tags=['Emparejar SKU MX↔ES'],summary='Listar propuestas de emparejamiento')
+def list_sku_candidates(status:str|None=None,kind:str|None=None,conf:str|None=None,active:str|None=None,dup:str|None=None,q:str|None=None,limit:int=300,user=Depends(operator)):
+    """Propuestas de SKU de ES para cada variante de MX, ordenadas por activas primero y mayor confianza.
+
+    - status: pending | approved | rejected
+    - kind: single | pack | bundle | refurb | none
+    - conf: high (>=0.9, reglas exactas) | medium (0.6-0.9) | low (<0.6) | none (sin propuesta)
+    - active=1: solo productos activos en MX; dup=1: solo SKU de ES propuestos para varias variantes MX
+    - q: busca en SKU, EAN y títulos de ambas tiendas; limit: 1-1000
+    """
+    where=[]; params=[]
+    if status: where.append('c.status=%s'); params.append(status)
+    if kind: where.append('c.kind=%s'); params.append(kind)
+    if conf in SKU_CONF_SQL: where.append(SKU_CONF_SQL[conf])
+    if active=='1': where.append("c.mx_status='ACTIVE'")
+    if dup=='1': where.append("c.es_sku IS NOT NULL AND c.kind='single' AND c.es_sku IN (SELECT es_sku FROM sku_link_candidates WHERE es_sku IS NOT NULL AND kind='single' GROUP BY es_sku HAVING count(*)>1)")
+    if q and q.strip():
+        like='%'+q.strip().replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
+        where.append('(c.mx_sku ILIKE %s OR c.mx_barcode ILIKE %s OR c.mx_title ILIKE %s OR c.es_sku ILIKE %s OR c.es_title ILIKE %s)'); params+=[like]*5
+    clause=('WHERE '+' AND '.join(where)) if where else ''
+    limit=max(1,min(limit,1000))
+    with pool.connection() as c:
+        total=c.execute(f'SELECT count(*) FROM sku_link_candidates c {clause}',params).fetchone()[0]
+        rows=c.execute(f"""SELECT c.id,c.mx_sku,c.mx_barcode,c.mx_title,c.mx_variant_title,c.mx_status,c.kind,c.es_sku,c.es_title,c.components,c.score,c.reasons,c.alternatives,c.status
+            FROM sku_link_candidates c {clause} ORDER BY (c.mx_status='ACTIVE') DESC,c.score DESC,c.id LIMIT %s""",params+[limit]).fetchall()
+        counts=dict(c.execute('SELECT status,count(*) FROM sku_link_candidates GROUP BY status').fetchall())
+        high=c.execute("SELECT count(*),count(*) FILTER (WHERE mx_status='ACTIVE') FROM sku_link_candidates WHERE status='pending' AND score>=0.9 AND es_sku IS NOT NULL AND kind<>'none'").fetchone()
+    keys=('id','mx_sku','mx_barcode','mx_title','mx_variant_title','mx_status','kind','es_sku','es_title','components','score','reasons','alternatives','status')
+    return {'candidates':[dict(zip(keys,r)) for r in rows],'total':total,'counts':counts,'high_pending':high[0],'high_pending_active':high[1],'running':SKU_LINK_STATE['running']}
+
+def _es_variant_by_sku(sku,cache):
+    if sku in cache: return cache[sku]
+    st=shopify_store_by_code('ES')
+    safe=sku.replace('\\','\\\\').replace('"','\\"')
+    data=graphql_with_retry(shopify_graphql_payload,st['domain'],st['token'],'query($q:String!){productVariants(first:5,query:$q){nodes{id sku}}}',{'q':f'sku:"{safe}"'})
+    cache[sku]=next((n for n in data['productVariants']['nodes'] if (n['sku'] or '').strip()==sku),None)
+    return cache[sku]
+
+def _sku_candidate_or_404(c,candidate_id):
+    row=c.execute('SELECT id,mx_variant_gid,mx_sku,mx_barcode,kind,es_sku,es_variant_gid,components,status FROM sku_link_candidates WHERE id=%s FOR UPDATE',(candidate_id,)).fetchone()
+    if not row: raise HTTPException(404,'Candidato no encontrado')
+    return row
+
+def _confirm_sku_link(c,cid,mx_gid,mx_sku,mx_barcode,kind,es_sku,es_gid,components):
+    c.execute("""INSERT INTO sku_links(mx_variant_gid,mx_sku,mx_barcode,es_sku,es_variant_gid,kind,components,status,linked_by)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,'CONFIRMED',%s) ON CONFLICT(mx_variant_gid) DO UPDATE SET mx_sku=EXCLUDED.mx_sku,mx_barcode=EXCLUDED.mx_barcode,es_sku=EXCLUDED.es_sku,
+        es_variant_gid=EXCLUDED.es_variant_gid,kind=EXCLUDED.kind,components=EXCLUDED.components,status='CONFIRMED',linked_by=EXCLUDED.linked_by,linked_at=now()""",
+        (mx_gid,mx_sku,mx_barcode,es_sku,es_gid,kind,Jsonb(components),operator()))
+    c.execute("UPDATE sku_link_candidates SET status='approved',es_sku=%s,es_variant_gid=%s,kind=%s,components=%s WHERE id=%s",(es_sku,es_gid,kind,Jsonb(components),cid))
+
+@app.post('/api/sku-candidates/{candidate_id}/approve',tags=['Emparejar SKU MX↔ES'],summary='Aprobar un emparejamiento',responses={400:{'description':'SKU vacío o inexistente en ES'},404:{'description':'Candidato no encontrado'}})
+def approve_sku_candidate(candidate_id:int,x:SkuApprove,user=Depends(operator)):
+    """Confirma el vínculo en `sku_links`. `es_sku` sustituye al propuesto (se valida en ES); `components` fija los
+    componentes de un pack o kit como `[{"sku_es":"…","qty":2}]`. Solo escribe en la base del hub, no en Shopify."""
+    with pool.connection() as c:
+        _,mx_gid,mx_sku,mx_barcode,kind,es_sku,es_gid,components,_status=_sku_candidate_or_404(c,candidate_id)
+        new_sku=(x.es_sku or es_sku or '').strip()
+        if not new_sku: raise HTTPException(400,'Indica el SKU de ES')
+        cache={}
+        if x.components is not None:
+            components=[{'sku_es':str(k.get('sku_es','')).strip(),'qty':max(1,int(k.get('qty',1)))} for k in x.components if str(k.get('sku_es','')).strip()]
+        elif new_sku!=es_sku:
+            kind,components=('single',[])
+        for code in dict.fromkeys([new_sku]+[k['sku_es'] for k in components]):
+            if not _es_variant_by_sku(code,cache): raise HTTPException(400,f'El SKU {code} no existe en ES')
+        _confirm_sku_link(c,candidate_id,mx_gid,mx_sku,mx_barcode,kind if kind!='none' else 'single',new_sku,cache[new_sku]['id'],components)
+    return {'approved':True}
+
+@app.post('/api/sku-candidates/{candidate_id}/none',tags=['Emparejar SKU MX↔ES'],summary='Marcar sin equivalente en ES',responses={404:{'description':'Candidato no encontrado'}})
+def none_sku_candidate(candidate_id:int,user=Depends(operator)):
+    """La variante MX no tiene equivalente en ES (se guarda de forma explícita, como en las categorías)."""
+    with pool.connection() as c:
+        _,mx_gid,mx_sku,mx_barcode,*_rest=_sku_candidate_or_404(c,candidate_id)
+        c.execute("""INSERT INTO sku_links(mx_variant_gid,mx_sku,mx_barcode,es_sku,es_variant_gid,kind,components,status,linked_by)
+            VALUES(%s,%s,%s,NULL,NULL,'none','[]','NONE',%s) ON CONFLICT(mx_variant_gid) DO UPDATE SET es_sku=NULL,es_variant_gid=NULL,kind='none',components='[]',status='NONE',linked_by=EXCLUDED.linked_by,linked_at=now()""",(mx_gid,mx_sku,mx_barcode,operator()))
+        c.execute("UPDATE sku_link_candidates SET status='approved',kind='none' WHERE id=%s",(candidate_id,))
+    return {'none':True}
+
+@app.post('/api/sku-candidates/{candidate_id}/reject',tags=['Emparejar SKU MX↔ES'],summary='Rechazar la propuesta',responses={404:{'description':'Candidato no encontrado'}})
+def reject_sku_candidate(candidate_id:int,user=Depends(operator)):
+    """Descarta la propuesta y borra cualquier vínculo confirmado de esa variante MX."""
+    with pool.connection() as c:
+        _,mx_gid,*_rest=_sku_candidate_or_404(c,candidate_id)
+        c.execute("DELETE FROM sku_links WHERE mx_variant_gid=%s",(mx_gid,))
+        c.execute("UPDATE sku_link_candidates SET status='rejected' WHERE id=%s",(candidate_id,))
+    return {'rejected':True}
+
+@app.post('/api/sku-candidates/{candidate_id}/reopen',tags=['Emparejar SKU MX↔ES'],summary='Reabrir un candidato',responses={404:{'description':'Candidato no encontrado'}})
+def reopen_sku_candidate(candidate_id:int,user=Depends(operator)):
+    """Vuelve a pendiente y borra el vínculo confirmado de esa variante MX."""
+    with pool.connection() as c:
+        _,mx_gid,*_rest=_sku_candidate_or_404(c,candidate_id)
+        c.execute("DELETE FROM sku_links WHERE mx_variant_gid=%s",(mx_gid,))
+        c.execute("UPDATE sku_link_candidates SET status='pending' WHERE id=%s",(candidate_id,))
+    return {'reopened':True}
+
+@app.post('/api/sku-candidates/apply-high',tags=['Emparejar SKU MX↔ES'],summary='Aprobar en bloque la confianza alta')
+def apply_high_sku_candidates(x:SkuBulk,user=Depends(operator)):
+    """Aprueba en bloque los pendientes de confianza alta (reglas exactas: SKU/EAN idénticos, packs y kits resueltos)."""
+    n=0
+    with pool.connection() as c:
+        rows=c.execute(f"""SELECT id,mx_variant_gid,mx_sku,mx_barcode,kind,es_sku,es_variant_gid,components FROM sku_link_candidates
+            WHERE status='pending' AND score>=0.9 AND es_sku IS NOT NULL AND kind<>'none' {"AND mx_status='ACTIVE'" if x.active_only else ''} FOR UPDATE""").fetchall()
+        for cid,gid,sku,bar,kind,es_sku,es_gid,comps in rows:
+            _confirm_sku_link(c,cid,gid,sku,bar,kind,es_sku,es_gid,comps); n+=1
+    return {'approved':n}
+
+@app.get('/api/sku-links/resolve',tags=['Emparejar SKU MX↔ES'],summary='Traducir un SKU entre MX y ES',responses={400:{'description':'store debe ser MX o ES'}})
+def resolve_sku(store:str,sku:str,user=Depends(operator)):
+    """Traduce un SKU entre MX y ES con los vínculos confirmados.
+
+    `store` es la tienda del SKU recibido (MX o ES). Con MX también se busca por EAN. Devuelve `links`
+    (vacío si aún no está vinculado), cada uno con `es_sku`, `kind` (single|pack|bundle|refurb|none),
+    `components` (`[{sku_es, qty}]` en packs y kits) y `status` (CONFIRMED | NONE = sin equivalente en ES).
+    """
+    store=store.upper(); sku=sku.strip()
+    with pool.connection() as c:
+        if store=='MX':
+            rows=c.execute("SELECT mx_variant_gid,mx_sku,mx_barcode,es_sku,kind,components,status FROM sku_links WHERE mx_sku=%s OR mx_barcode=%s",(sku,sku)).fetchall()
+        elif store=='ES':
+            rows=c.execute("SELECT mx_variant_gid,mx_sku,mx_barcode,es_sku,kind,components,status FROM sku_links WHERE es_sku=%s OR components @> %s",(sku,Jsonb([{'sku_es':sku}]))).fetchall()
+        else: raise HTTPException(400,'store debe ser MX o ES')
+    keys=('mx_variant_gid','mx_sku','mx_barcode','es_sku','kind','components','status')
+    return {'store':store,'sku':sku,'links':[dict(zip(keys,r)) for r in rows]}
+
+@app.get('/api/sku-links/export',tags=['Emparejar SKU MX↔ES'],summary='Exportar el mapa MX→ES',
+    responses={200:{'description':'CSV por defecto; JSON con format=json','content':{'text/csv':{'schema':{'type':'string','example':'mx_sku,mx_ean,es_sku,qty,kind,status'}},'application/json':{'schema':{'type':'object','properties':{'links':{'type':'array','items':{'type':'object'}}}}}}}})
+def export_sku_links(format:str='csv',user=Depends(operator)):
+    """Mapa plano MX→ES para Business Central / n8n: una fila por componente (`qty` = unidades de ES). `format=csv` (por defecto) o `format=json`."""
+    with pool.connection() as c:
+        rows=c.execute("SELECT mx_sku,mx_barcode,es_sku,kind,components,status FROM sku_links ORDER BY mx_sku").fetchall()
+    flat=[]
+    for mx_sku,mx_barcode,es_sku,kind,components,status in rows:
+        if components: flat+= [{'mx_sku':mx_sku,'mx_ean':mx_barcode,'es_sku':k['sku_es'],'qty':k.get('qty',1),'kind':kind,'status':status} for k in components]
+        else: flat.append({'mx_sku':mx_sku,'mx_ean':mx_barcode,'es_sku':es_sku,'qty':1 if es_sku else 0,'kind':kind,'status':status})
+    if format=='json': return {'links':flat}
+    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=['mx_sku','mx_ean','es_sku','qty','kind','status']); w.writeheader(); w.writerows(flat)
+    return Response(out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="sku_links_mx_es.csv"'})
+
+@app.get('/sku-links',response_class=HTMLResponse,tags=['Emparejar SKU MX↔ES'],summary='Pantalla de revisión de emparejamientos')
+def sku_links_page():
+    body=SKU_LINKS_BODY
+    return shell('Emparejar SKU',body,'skulinks')
+
+SKU_LINKS_BODY=r"""<main class="wrap"><h1>Emparejar SKU de MX con ES</h1><p class="lede">MX usa SKU y EAN propios. Aquí se propone el SKU de ES equivalente a cada variante de MX; elige o escribe el correcto y apruébalo. Nada se aplica hasta aprobarlo. Esta pantalla solo lee de Shopify.</p>
+<section class="card"><form id="filters"><div class="grid">
+<div class="field"><label for="f-status">Estado</label><select id="f-status"><option value="pending">Pendientes</option><option value="approved">Aprobados</option><option value="rejected">Rechazados</option><option value="">Todos</option></select></div>
+<div class="field"><label for="f-active">Producto en MX</label><select id="f-active"><option value="1">Solo activos</option><option value="">Activos y borradores</option></select></div>
+<div class="field"><label for="f-conf">Confianza</label><select id="f-conf"><option value="">Todas</option><option value="high">Alta (reglas exactas)</option><option value="medium">Media</option><option value="low">Baja</option><option value="none">Sin propuesta</option></select></div>
+<div class="field"><label for="f-kind">Tipo</label><select id="f-kind"><option value="">Todos</option><option value="single">Individual</option><option value="pack">Pack (N×)</option><option value="bundle">Kit</option><option value="refurb">Reacondicionado</option></select></div>
+<div class="field"><label for="f-dup">SKU de ES repetido</label><select id="f-dup"><option value="">Todos</option><option value="1">Solo repetidos</option></select></div>
+<div class="field"><label for="f-q">Buscar</label><input id="f-q" type="search" placeholder="SKU, EAN o título" autocomplete="off"></div></div></form>
+<p id="summary" class="muted" role="status"></p>
+<div class="toolbar"><button type="button" id="apply-high">Aprobar confianza alta</button> <button type="button" class="secondary" id="recompute">Recalcular propuestas</button> <a class="button secondary" href="/api/sku-links/export">Exportar CSV</a> <span id="top-status" class="status" role="status"></span></div></section>
+<section class="card"><div id="candidates" tabindex="0" role="region" aria-label="Candidatos de emparejamiento">Cargando…</div></section></main><script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const box=document.querySelector('#candidates'),summary=document.querySelector('#summary'),topStatus=document.querySelector('#top-status');
+const badge={pending:'Pendiente',approved:'Aprobado',rejected:'Rechazado'};
+const kindLabel={single:'Individual',pack:'Pack',bundle:'Kit',refurb:'Reacondicionado',none:'Sin propuesta'};
+const post=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'La petición falló');return d};
+let busy=false,qTimer;
+const v=id=>document.querySelector(id).value;
+async function load(){const q=new URLSearchParams();for(const [k,id] of [['status','#f-status'],['kind','#f-kind'],['conf','#f-conf'],['active','#f-active'],['dup','#f-dup']])if(v(id))q.set(k,v(id));if(v('#f-q').trim())q.set('q',v('#f-q').trim());
+ let d;try{const r=await fetch('/api/sku-candidates?'+q);d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudieron cargar los candidatos')}catch(e){box.textContent=e.message;return}
+ summary.textContent=d.total+' candidatos con estos filtros · '+Object.entries(d.counts).map(([k,n])=>(badge[k]||k)+': '+n).join(' · ')+' · confianza alta pendientes: '+d.high_pending+' ('+d.high_pending_active+' activos)'+(d.total>d.candidates.length?' · mostrando '+d.candidates.length:'');
+ if(!d.candidates.length){box.innerHTML='<p class="muted">'+(Object.keys(d.counts).length?'No hay candidatos con estos filtros.':'Aún no hay propuestas: pulsa «Recalcular propuestas».')+'</p>';return}
+ box.innerHTML='<table><tr><th>Variante en MX</th><th>SKU de ES propuesto</th><th>Alternativas</th><th>Evidencia</th><th>Estado</th><th>Acciones</th></tr>'+d.candidates.map(c=>{
+  const locked=c.status!=='pending';
+  const comps=c.components.length?'<br><small class="muted">'+c.components.map(k=>esc(k.qty+'× '+k.sku_es)).join(' + ')+'</small>':'';
+  const alts=locked?'':c.alternatives.map(a=>`<button type="button" class="secondary pick" data-sku="${esc(a.sku)}" title="${esc(a.title)}">${esc(a.sku)} <small>(${Math.round(a.score*100)}%)</small></button>`).join(' ');
+  return `<tr data-id="${c.id}"><td><strong>${esc(c.mx_sku||'(sin SKU)')}</strong>${c.mx_barcode?'<br><small class="muted">EAN '+esc(c.mx_barcode)+'</small>':''}<br>${esc(c.mx_title)}${c.mx_variant_title&&c.mx_variant_title!=='Default Title'?'<br><small class="muted">'+esc(c.mx_variant_title)+'</small>':''}<br><span class="badge">${c.mx_status==='ACTIVE'?'Activo':esc(c.mx_status)}</span></td>
+  <td><input class="canon" value="${esc(c.es_sku||'')}" aria-label="SKU de ES para ${esc(c.mx_sku||c.mx_title)}" ${locked?'disabled':''}><br><small class="muted es-title">${esc(c.es_title)}</small>${comps}</td>
+  <td>${alts}</td><td><span class="badge">${esc(kindLabel[c.kind]||c.kind)}</span> ${Math.round(c.score*100)}%<br><small class="muted">${c.reasons.map(esc).join(' · ')}</small></td>
+  <td><span class="badge">${esc(badge[c.status]||c.status)}</span>${c.status==='approved'&&c.kind==='none'?'<br><small class="muted">Sin equivalente</small>':''}</td>
+  <td class="actions">${c.status==='pending'?'<button type="button" class="approve">Aprobar</button> <button type="button" class="secondary none">Sin equivalente</button> <button type="button" class="secondary reject">Rechazar</button>':'<button type="button" class="secondary reopen">Reabrir</button>'}<span class="status" role="status"></span></td></tr>`}).join('')+'</table>'}
+box.addEventListener('click',async e=>{const row=e.target.closest('tr[data-id]');if(!row)return;const status=row.querySelector('.status'),input=row.querySelector('.canon');
+ const pick=e.target.closest('.pick');if(pick){input.value=pick.dataset.sku;row.querySelector('.es-title').textContent=pick.title;return}
+ const action=['approve','none','reject','reopen'].find(a=>e.target.classList.contains(a));if(!action)return;
+ const button=e.target;button.disabled=true;status.textContent='';
+ try{await post(`/api/sku-candidates/${row.dataset.id}/${action}`,action==='approve'?{es_sku:input.value.trim()}:{});load()}catch(err){status.textContent=err.message;button.disabled=false}});
+document.querySelector('#apply-high').addEventListener('click',async()=>{if(busy)return;const act=v('#f-active')==='1';if(!confirm('¿Aprobar en bloque los pendientes de confianza alta ('+(act?'solo productos activos':'activos y borradores')+')? Son coincidencias exactas de SKU/EAN y packs o kits resueltos.'))return;busy=true;try{const d=await post('/api/sku-candidates/apply-high',{active_only:act});topStatus.textContent='Aprobados: '+d.approved}catch(err){topStatus.textContent=err.message}busy=false;load()});
+async function poll(){const s=await (await fetch('/api/sku-candidates/recompute-status')).json();if(s.running){topStatus.textContent='Calculando propuestas (descarga de ES y MX)…';setTimeout(poll,3000)}else{topStatus.textContent=s.error?('Error: '+s.error):(s.finished?'Propuestas actualizadas':'');document.querySelector('#recompute').disabled=false;busy=false;load()}}
+document.querySelector('#recompute').addEventListener('click',async()=>{if(busy)return;if(!confirm('Se recalculan las propuestas pendientes con los datos actuales de Shopify. Lo ya aprobado o rechazado no cambia. ¿Continuar?'))return;busy=true;document.querySelector('#recompute').disabled=true;try{await post('/api/sku-candidates/recompute');poll()}catch(err){topStatus.textContent=err.message;busy=false;document.querySelector('#recompute').disabled=false}});
+document.querySelector('#filters').addEventListener('submit',e=>e.preventDefault());for(const id of ['#f-status','#f-active','#f-conf','#f-kind','#f-dup'])document.querySelector(id).addEventListener('change',load);
+document.querySelector('#f-q').addEventListener('input',()=>{clearTimeout(qTimer);qTimer=setTimeout(load,300)});load();
+</script>"""
 
 @app.get('/api/stores')
 def list_stores():
