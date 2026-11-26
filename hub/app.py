@@ -733,7 +733,27 @@ def sku_links_page():
     body=SKU_LINKS_BODY
     return shell('Emparejar SKU',body,'skulinks')
 
-SKU_LINKS_BODY=r"""<main class="wrap"><h1>Emparejar SKU de MX con ES</h1><p class="lede">MX usa SKU y EAN propios. Aquí se propone el SKU de ES equivalente a cada variante de MX; elige o escribe el correcto y apruébalo. Nada se aplica hasta aprobarlo. Esta pantalla solo lee de Shopify.</p>
+SKU_LINKS_BODY=r"""<style>
+#candidates{overflow-x:auto}
+#candidates table{table-layout:fixed;min-width:1040px;width:100%}
+#candidates th,#candidates td{padding:14px 12px;overflow-wrap:break-word;word-break:normal}
+#candidates th{white-space:nowrap}
+#candidates td{line-height:1.45}
+#candidates .sku-code{display:block;font:600 13px/1.4 var(--mono);overflow-wrap:anywhere}
+#candidates .sku-title{display:block;margin-top:6px}
+#candidates .sku-sub{display:block;margin-top:4px;font-size:12.5px;color:var(--muted)}
+#candidates .sku-badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+#candidates input.canon{font:13px/1.4 var(--mono);min-height:40px;padding:8px 10px}
+#candidates .es-title{display:block;margin-top:8px;font-size:12.5px;line-height:1.45}
+#candidates .alts{display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+#candidates .alts .pick{width:100%;min-height:34px;padding:6px 8px;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:2px 8px;text-align:left;font:11.5px/1.3 var(--mono);overflow-wrap:anywhere}
+#candidates .evidence{display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+#candidates .score{font:600 13px/1 var(--mono)}
+#candidates .row-actions{display:flex;flex-direction:column;gap:8px;margin:0}
+#candidates .row-actions button{width:100%;min-height:38px;padding:8px 12px;white-space:nowrap}
+#candidates .status{display:block;margin-top:8px;font-size:12.5px;color:var(--accent)}
+</style>
+<main class="wrap"><h1>Emparejar SKU de MX con ES</h1><p class="lede">MX usa SKU y EAN propios. Aquí se propone el SKU de ES equivalente a cada variante de MX; elige o escribe el correcto y apruébalo. Nada se aplica hasta aprobarlo. Esta pantalla solo lee de Shopify.</p>
 <section class="card"><form id="filters"><div class="grid">
 <div class="field"><label for="f-status">Estado</label><select id="f-status"><option value="pending">Pendientes</option><option value="approved">Aprobados</option><option value="rejected">Rechazados</option><option value="">Todos</option></select></div>
 <div class="field"><label for="f-active">Producto en MX</label><select id="f-active"><option value="1">Solo activos</option><option value="">Activos y borradores</option></select></div>
@@ -755,15 +775,15 @@ async function load(){const q=new URLSearchParams();for(const [k,id] of [['statu
  let d;try{const r=await fetch('/api/sku-candidates?'+q);d=await r.json();if(!r.ok)throw new Error(d.detail||'No se pudieron cargar los candidatos')}catch(e){box.textContent=e.message;return}
  summary.textContent=d.total+' candidatos con estos filtros · '+Object.entries(d.counts).map(([k,n])=>(badge[k]||k)+': '+n).join(' · ')+' · confianza alta pendientes: '+d.high_pending+' ('+d.high_pending_active+' activos)'+(d.total>d.candidates.length?' · mostrando '+d.candidates.length:'');
  if(!d.candidates.length){box.innerHTML='<p class="muted">'+(Object.keys(d.counts).length?'No hay candidatos con estos filtros.':'Aún no hay propuestas: pulsa «Recalcular propuestas».')+'</p>';return}
- box.innerHTML='<table><tr><th>Variante en MX</th><th>SKU de ES propuesto</th><th>Alternativas</th><th>Evidencia</th><th>Estado</th><th>Acciones</th></tr>'+d.candidates.map(c=>{
+ box.innerHTML='<table><caption class="sr-only">Candidatos de emparejamiento MX con ES</caption><colgroup><col style="width:25%"><col style="width:22%"><col style="width:17%"><col style="width:14%"><col style="width:8%"><col style="width:14%"></colgroup><thead><tr><th scope="col">Variante en MX</th><th scope="col">SKU de ES propuesto</th><th scope="col">Alternativas</th><th scope="col">Evidencia</th><th scope="col">Estado</th><th scope="col">Acciones</th></tr></thead><tbody>'+d.candidates.map(c=>{
   const locked=c.status!=='pending';
-  const comps=c.components.length?'<br><small class="muted">'+c.components.map(k=>esc(k.qty+'× '+k.sku_es)).join(' + ')+'</small>':'';
-  const alts=locked?'':c.alternatives.map(a=>`<button type="button" class="secondary pick" data-sku="${esc(a.sku)}" title="${esc(a.title)}">${esc(a.sku)} <small>(${Math.round(a.score*100)}%)</small></button>`).join(' ');
-  return `<tr data-id="${c.id}"><td><strong>${esc(c.mx_sku||'(sin SKU)')}</strong>${c.mx_barcode?'<br><small class="muted">EAN '+esc(c.mx_barcode)+'</small>':''}<br>${esc(c.mx_title)}${c.mx_variant_title&&c.mx_variant_title!=='Default Title'?'<br><small class="muted">'+esc(c.mx_variant_title)+'</small>':''}<br><span class="badge">${c.mx_status==='ACTIVE'?'Activo':esc(c.mx_status)}</span></td>
-  <td><input class="canon" value="${esc(c.es_sku||'')}" aria-label="SKU de ES para ${esc(c.mx_sku||c.mx_title)}" ${locked?'disabled':''}><br><small class="muted es-title">${esc(c.es_title)}</small>${comps}</td>
-  <td>${alts}</td><td><span class="badge">${esc(kindLabel[c.kind]||c.kind)}</span> ${Math.round(c.score*100)}%<br><small class="muted">${c.reasons.map(esc).join(' · ')}</small></td>
-  <td><span class="badge">${esc(badge[c.status]||c.status)}</span>${c.status==='approved'&&c.kind==='none'?'<br><small class="muted">Sin equivalente</small>':''}</td>
-  <td class="actions">${c.status==='pending'?'<button type="button" class="approve">Aprobar</button> <button type="button" class="secondary none">Sin equivalente</button> <button type="button" class="secondary reject">Rechazar</button>':'<button type="button" class="secondary reopen">Reabrir</button>'}<span class="status" role="status"></span></td></tr>`}).join('')+'</table>'}
+  const comps=c.components.length?'<span class="sku-sub">'+c.components.map(k=>esc(k.qty+'× '+k.sku_es)).join(' + ')+'</span>':'';
+  const alts=locked||!c.alternatives.length?'<small class="muted">—</small>':'<div class="alts">'+c.alternatives.map(a=>`<button type="button" class="secondary pick" data-sku="${esc(a.sku)}" title="${esc(a.title)}">${esc(a.sku)} <small>${Math.round(a.score*100)}%</small></button>`).join('')+'</div>';
+  return `<tr data-id="${c.id}"><td><span class="sku-code">${esc(c.mx_sku||'(sin SKU)')}</span>${c.mx_barcode?'<span class="sku-sub">EAN '+esc(c.mx_barcode)+'</span>':''}<strong class="sku-title">${esc(c.mx_title)}</strong>${c.mx_variant_title&&c.mx_variant_title!=='Default Title'?'<span class="sku-sub">'+esc(c.mx_variant_title)+'</span>':''}<div class="sku-badges"><span class="badge">${c.mx_status==='ACTIVE'?'Activo':esc(c.mx_status)}</span></div></td>
+  <td><input class="canon" value="${esc(c.es_sku||'')}" aria-label="SKU de ES para ${esc(c.mx_sku||c.mx_title)}" ${locked?'disabled':''}><span class="sku-sub es-title">${esc(c.es_title)}</span>${comps}</td>
+  <td>${alts}</td><td><div class="evidence"><span class="badge">${esc(kindLabel[c.kind]||c.kind)}</span><span class="score">${Math.round(c.score*100)}%</span></div>${c.reasons.length?'<span class="sku-sub">'+c.reasons.map(esc).join(' · ')+'</span>':''}</td>
+  <td><span class="badge">${esc(badge[c.status]||c.status)}</span>${c.status==='approved'&&c.kind==='none'?'<span class="sku-sub">Sin equivalente</span>':''}</td>
+  <td><div class="row-actions">${c.status==='pending'?'<button type="button" class="approve">Aprobar</button><button type="button" class="secondary none">Sin equivalente</button><button type="button" class="secondary reject">Rechazar</button>':'<button type="button" class="secondary reopen">Reabrir</button>'}</div><span class="status" role="status"></span></td></tr>`}).join('')+'</tbody></table>'}
 box.addEventListener('click',async e=>{const row=e.target.closest('tr[data-id]');if(!row)return;const status=row.querySelector('.status'),input=row.querySelector('.canon');
  const pick=e.target.closest('.pick');if(pick){input.value=pick.dataset.sku;row.querySelector('.es-title').textContent=pick.title;return}
  const action=['approve','none','reject','reopen'].find(a=>e.target.classList.contains(a));if(!action)return;
