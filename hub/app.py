@@ -5,13 +5,15 @@ import urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Query
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field, field_validator
 import psycopg.errors
 from psycopg.types.json import Jsonb
 from .db import pool, initialize
 from .skumatch import bc_sku
+from . import apidocs
 from .skufile import extract_skus
 from .quality import assess_translation, strip_added_quotes
 from .profiles import active_profiles, list_active_profiles, target_profile
@@ -35,7 +37,7 @@ async def lifespan(app):
     threading.Thread(target=_stock_runner,name='stock-runner',daemon=True).start()
     yield
 
-app=FastAPI(title='Newgarden Content Hub',version='0.1.0',lifespan=lifespan)
+app=FastAPI(title='Newgarden Content Hub',version='0.1.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 class ImportProduct(BaseModel):
     product_key:str=Field(min_length=1,max_length=120)
     source:dict
@@ -346,6 +348,7 @@ def shell(title, body, active=''):
         'review': '<path d="M4 4h16v16H4zM8 9h8M8 13h5"/><path d="m14 17 2 2 4-4"/>',
         'glossary': '<path d="M12 5v16M12 5C8 2 4 3 2 4v15c3-1 6-1 10 2 4-3 7-3 10-2V4c-3-1-6-2-10 1Z"/>',
         'skulinks': '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+        'apidocs': '<path d="m8 8-5 4 5 4M16 8l5 4-5 4M14 4l-4 16"/>',
         'stores': '<path d="M3 10v11h18V10M2 10l2-7h16l2 7M2 10h20M9 21v-7h6v7"/>',
         'stock': '<path d="M3 7h18v13H3zM3 7l3-4h12l3 4M9 12h6"/>',
         'tags': '<path d="M3 12V3h9l9 9-9 9-9-9Z"/><circle cx="7.5" cy="7.5" r="1.5"/>',        'collections': '<rect x="3" y="3" width="13" height="13" rx="2"/><path d="M8 21h11a2 2 0 0 0 2-2V8"/>',
@@ -353,11 +356,25 @@ def shell(title, body, active=''):
     }
     items = [('home','/','Resumen'),('admin','/admin','Administración'),('products','/products','Gestión de productos'),
              ('gallery','http://192.168.1.202:5678/webhook/panel-galeria','Panel de galería'),
-             ('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('skulinks','/sku-links','Emparejar SKU'),('stores','/stores','Tiendas')]
+             ('batch','/products/batch','Traducción en lote'),('campaigns','/translation-campaigns','Campañas'),('review','/translation-batches','Revisión de lotes'),('stock','/stock','Control de stock'),('tags','/tags','Etiquetado masivo'),('collections','/collections','Traducir colecciones'),('glossary','/glossary','Glosario'),('skulinks','/sku-links','Emparejar SKU'),('stores','/stores','Tiendas'),('apidocs','/api-docs','Documentación API')]
     links = ''.join(f'<a class="nav-link {"active" if key==active else ""}" href="{url}" {"aria-current=page" if key==active else ""}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{icons[key]}</svg>{label}</a>' for key,url,label in items)
     mark = '<span class="dotmark" aria-hidden="true">' + '<i></i>' * 9 + '</span>'
     body = body.replace('<main class="wrap">', '<main class="wrap" id="main-content" tabindex="-1">', 1)
-    return f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#202121"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><title>{html.escape(title)} · Newgarden Hub</title>{STYLE}</head><body><a class="skip-link" href="#main-content">Saltar al contenido</a><aside class="sidebar"><a class="brand" href="/" aria-label="Newgarden Content Hub, inicio">{mark}<span><strong translate="no">newgarden</strong><small>CONTENT HUB</small></span></a><nav aria-label="Navegación principal">{links}</nav><div class="sidebar-foot"><p>Contenido global.<br>Control en cada palabra.</p><span>NEWGARDEN / WORKSPACE</span></div></aside><div class="workspace"><header class="workspace-bar"><div class="breadcrumb"><span>Content Hub</span><span aria-hidden="true">/</span>{html.escape(title)}</div><span class="workspace-label">Espacio de trabajo interno</span></header>{body}<footer class="workspace-footer"><span>NEWGARDEN · CONTENT OPERATIONS</span><a href="/docs">Documentación API ↗</a></footer></div></body></html>'''
+    return f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#202121"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><title>{html.escape(title)} · Newgarden Hub</title>{STYLE}</head><body><a class="skip-link" href="#main-content">Saltar al contenido</a><aside class="sidebar"><a class="brand" href="/" aria-label="Newgarden Content Hub, inicio">{mark}<span><strong translate="no">newgarden</strong><small>CONTENT HUB</small></span></a><nav aria-label="Navegación principal">{links}</nav><div class="sidebar-foot"><p>Contenido global.<br>Control en cada palabra.</p><span>NEWGARDEN / WORKSPACE</span></div></aside><div class="workspace"><header class="workspace-bar"><div class="breadcrumb"><span>Content Hub</span><span aria-hidden="true">/</span>{html.escape(title)}</div><span class="workspace-label">Espacio de trabajo interno</span></header>{body}<footer class="workspace-footer"><span>NEWGARDEN · CONTENT OPERATIONS</span><a href="/api-docs">Documentación API ↗</a></footer></div></body></html>'''
+
+def _openapi():
+    if not app.openapi_schema:
+        app.openapi_schema=apidocs.enrich(get_openapi(title=app.title,version=app.version,routes=app.routes))
+    return app.openapi_schema
+app.openapi=_openapi
+
+@app.get('/docs',response_class=HTMLResponse,include_in_schema=False)
+def docs_plain():
+    return apidocs.plain_page(app.openapi())
+
+@app.get('/api-docs',response_class=HTMLResponse,include_in_schema=False)
+def api_docs_page():
+    return shell('Documentación API',apidocs.page_body(),'apidocs')
 
 @app.get('/health')
 def health():
@@ -536,8 +553,8 @@ SKU_LINK_LOCK=threading.Lock()
 SKU_VARIANTS_QUERY='''query SkuVariants($after:String) { products(first:100,after:$after) { pageInfo { hasNextPage endCursor } nodes { id handle title status variants(first:100) { nodes { id sku barcode title selectedOptions { value } } } } } }'''
 
 class SkuApprove(BaseModel):
-    es_sku:str|None=Field(default=None,max_length=255)
-    components:list[dict]|None=None
+    es_sku:str|None=Field(default=None,max_length=255,description='SKU exacto de ES (con sufijo si lo lleva). Vacío = el propuesto.',examples=['LUMAM040ICNWIND'])
+    components:list[dict]|None=Field(default=None,description='Solo packs y kits: componentes de ES con cantidad.',examples=[[{'sku_es':'MOBCP110TWLNW','qty':1},{'sku_es':'MOBCF074SSNW','qty':2}]])
 
 class SkuBulk(BaseModel):
     active_only:bool=True
@@ -700,7 +717,7 @@ def apply_high_sku_candidates(x:SkuBulk,user=Depends(operator)):
     return {'approved':n}
 
 @app.get('/api/sku-links/resolve',tags=['Emparejar SKU MX↔ES'],summary='Traducir un SKU entre MX y ES',responses={400:{'description':'store debe ser MX o ES'}})
-def resolve_sku(store:str,sku:str,user=Depends(operator)):
+def resolve_sku(store:str=Query(description='Tienda del SKU que se envía: MX o ES.',examples=['MX']),sku:str=Query(description='SKU (o EAN, si store=MX) a traducir. En ES vale con o sin sufijo.',examples=['LUMAM040ICNW']),user=Depends(operator)):
     """Traduce un SKU entre MX y ES con los vínculos confirmados.
 
     `store` es la tienda del SKU recibido (MX o ES). Con MX también se busca por EAN. Devuelve `links`
