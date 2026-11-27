@@ -2883,6 +2883,21 @@ def collections_translate(x:CollectionTranslate,user=Depends(operator)):
     elif translated:
         res=shopify_graphql(target['domain'],target['token'],'query($id:ID!){translatableResource(resourceId:$id){translatableContent{key digest}}}',{'id':gid}).get('translatableResource') or {}
         digests={i['key']:i['digest'] for i in res.get('translatableContent',[])}
+        # Si el destino no tiene valor base en un campo, Shopify no publica su digest. Se rellena el idioma base
+        # con el mismo texto traducido (placeholder) y se registra la misma traducción en el locale secundario.
+        fill={k:v for k,v in translated.items() if COLLECTION_TRANSLATION_KEY[k] not in digests and k!='handle'}
+        if fill:
+            collection={'id':gid}
+            for key,value in fill.items():
+                if not key.startswith('seo.'): collection[key]=value
+            if any(k.startswith('seo.') for k in fill):
+                seo={k:v for k,v in (dst.get('seo') or {}).items() if v is not None}
+                seo.update({k[4:]:v for k,v in fill.items() if k.startswith('seo.')})
+                collection['seo']=seo
+            logging.getLogger('hub.collections').info('Relleno base de %s en %s con el texto traducido: %s',gid,x.target_store,list(fill))
+            check(shopify_graphql(target['domain'],target['token'],'''mutation UpdateCollection($input:CollectionInput!) { collectionUpdate(input:$input) { userErrors { field message } } }''',{'input':collection}).get('collectionUpdate'))
+            res=shopify_graphql(target['domain'],target['token'],'query($id:ID!){translatableResource(resourceId:$id){translatableContent{key digest}}}',{'id':gid}).get('translatableResource') or {}
+            digests={i['key']:i['digest'] for i in res.get('translatableContent',[])}
         items=[]
         for key,value in translated.items():
             tk=COLLECTION_TRANSLATION_KEY[key]
