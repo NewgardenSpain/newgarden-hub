@@ -757,6 +757,16 @@ def export_sku_links(format:str='csv',user=Depends(operator)):
     out=io.StringIO(); w=csv.DictWriter(out,fieldnames=['mx_sku','mx_ean','es_sku','es_shopify_sku','qty','kind','status']); w.writeheader(); w.writerows(flat)
     return Response(out.getvalue(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="sku_links_mx_es.csv"'})
 
+@app.get('/api/sku-links/admin-url',tags=['Emparejar SKU MX↔ES'],summary='URL del admin de Shopify para un SKU',responses={400:{'description':'store debe ser MX o ES'},404:{'description':'SKU no encontrado'}})
+def sku_admin_url(store:str=Query(description='MX o ES.',examples=['MX']),sku:str=Query(description='SKU exacto en esa tienda.',examples=['LUMAM040ICNW']),user=Depends(operator)):
+    """Devuelve la URL del producto en el admin de Shopify de la tienda indicada (solo lectura)."""
+    store=store.strip().upper(); sku=sku.strip()
+    if store not in ('MX','ES'): raise HTTPException(400,'store debe ser MX o ES')
+    found=get_shopify_product_by_sku(store,sku)['product']
+    shop=shopify_store_by_code(store)
+    pid=found['id'].rsplit('/',1)[-1]
+    return {'store':store,'sku':sku,'title':found.get('title'),'url':f"https://{shop['domain']}/admin/products/{pid}"}
+
 @app.get('/sku-links',response_class=HTMLResponse,tags=['Emparejar SKU MX↔ES'],summary='Pantalla de revisión de emparejamientos')
 def sku_links_page():
     body=SKU_LINKS_BODY
@@ -781,6 +791,18 @@ SKU_LINKS_BODY=r"""<style>
 #candidates .row-actions{display:flex;flex-direction:column;gap:8px;margin:0}
 #candidates .row-actions button{width:100%;min-height:38px;padding:8px 12px;white-space:nowrap}
 #candidates .status{display:block;margin-top:8px;font-size:12.5px;color:var(--accent)}
+#quick-open{position:fixed;right:20px;bottom:20px;z-index:50}
+#quick-open>button.fab{min-height:44px;padding:10px 16px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+#quick-form{display:none;position:absolute;right:0;bottom:56px;width:280px;padding:16px;background:var(--card,#fff);color:inherit;border:1px solid var(--line,#ccc);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+#quick-open.open #quick-form{display:block}
+#quick-form .seg{display:flex;gap:6px;margin-bottom:10px}
+#quick-form .seg label{flex:1;text-align:center;border:1px solid var(--line,#ccc);border-radius:8px;padding:8px;cursor:pointer}
+#quick-form .seg input{position:absolute;opacity:0}
+#quick-form .seg input:checked+span{font-weight:700;color:var(--accent)}
+#quick-form .seg label:has(input:checked){border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+#quick-form .seg label:has(input:focus-visible){outline:2px solid var(--accent)}
+#quick-form input.q-sku{width:100%;margin-bottom:10px;font:13px/1.4 var(--mono)}
+#quick-form .status{display:block;margin-top:8px;font-size:12.5px}
 </style>
 <main class="wrap"><h1>Emparejar SKU de MX con ES</h1><p class="lede">MX usa SKU y EAN propios. Aquí se propone el SKU de ES equivalente a cada variante de MX; elige o escribe el correcto y apruébalo. Nada se aplica hasta aprobarlo. Esta pantalla solo lee de Shopify.</p>
 <section class="card"><form id="filters"><div class="grid">
@@ -792,7 +814,17 @@ SKU_LINKS_BODY=r"""<style>
 <div class="field"><label for="f-q">Buscar</label><input id="f-q" type="search" placeholder="SKU, EAN o título" autocomplete="off"></div></div></form>
 <p id="summary" class="muted" role="status"></p>
 <div class="toolbar"><button type="button" id="apply-high">Aprobar confianza alta</button> <button type="button" class="secondary" id="recompute">Recalcular propuestas</button> <a class="button secondary" href="/api/sku-links/export">Exportar CSV</a> <span id="top-status" class="status" role="status"></span></div></section>
-<section class="card"><div id="candidates" tabindex="0" role="region" aria-label="Candidatos de emparejamiento">Cargando…</div></section></main><script>
+<section class="card"><div id="candidates" tabindex="0" role="region" aria-label="Candidatos de emparejamiento">Cargando…</div></section></main>
+<div id="quick-open"><form id="quick-form" aria-label="Abrir SKU en el admin de Shopify"><div class="seg" role="radiogroup" aria-label="Tienda"><label><input type="radio" name="q-store" value="ES" checked><span>ES</span></label><label><input type="radio" name="q-store" value="MX"><span>MX</span></label></div><input class="q-sku" id="q-sku" placeholder="SKU" autocomplete="off" aria-label="SKU" required><button type="submit">Abrir en Shopify</button><span class="status" id="q-status" role="status"></span></form><button type="button" class="fab" id="q-toggle" aria-expanded="false">Ir a SKU</button></div><script>
+(()=>{const w=document.querySelector('#quick-open'),t=document.querySelector('#q-toggle'),f=document.querySelector('#quick-form'),st=document.querySelector('#q-status'),inp=document.querySelector('#q-sku');
+const setOpen=o=>{w.classList.toggle('open',o);t.setAttribute('aria-expanded',o);if(o)inp.focus()};
+t.addEventListener('click',()=>setOpen(!w.classList.contains('open')));
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&w.classList.contains('open')){setOpen(false);t.focus()}});
+f.addEventListener('submit',async e=>{e.preventDefault();const sku=inp.value.trim();if(!sku)return;const store=f.querySelector('input[name=q-store]:checked').value;
+ const win=window.open('','_blank');st.textContent='Buscando…';
+ try{const r=await fetch('/api/sku-links/admin-url?'+new URLSearchParams({store,sku}));const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||'No se pudo encontrar el SKU');
+  st.textContent=d.title||'';if(win)win.location=d.url;else location.href=d.url}catch(err){if(win)win.close();st.textContent=err.message}});})();
+</script><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const box=document.querySelector('#candidates'),summary=document.querySelector('#summary'),topStatus=document.querySelector('#top-status');
 const badge={pending:'Pendiente',approved:'Aprobado',rejected:'Rechazado'};
